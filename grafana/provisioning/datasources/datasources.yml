@@ -1,0 +1,23 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+
+  - name: InfluxDB
+    uid: influxdb
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    editable: false
+    jsonData:
+      version: Flux
+      organization: fasttrader
+      defaultBucket: market_raw
+      tlsSkipVerify: true
+    secureJsonData:
+      token: ftg-super-secret-token-change-me

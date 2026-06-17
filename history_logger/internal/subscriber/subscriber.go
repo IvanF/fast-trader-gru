@@ -1,0 +1,124 @@
+package subscriber
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/fast-trader-gru/history_logger/internal/config"
+	"github.com/fast-trader-gru/history_logger/internal/influx"
+	"github.com/fast-trader-gru/history_logger/internal/lineproto"
+	"github.com/fast-trader-gru/history_logger/internal/metrics"
+	"github.com/fast-trader-gru/history_logger/internal/models"
+	"github.com/redis/go-redis/v9"
+	"github.com/vmihailenco/msgpack/v5"
+)
+
+type Service struct {
+	cfg    config.Config
+	rdb    *redis.Client
+	writer *influx.BatchWriter
+	logger *slog.Logger
+
+	obMsgs uint64
+	trMsgs uint64
+}
+
+func New(cfg config.Config, rdb *redis.Client, writer *influx.BatchWriter, logger *slog.Logger) *Service {
+	return &Service{cfg: cfg, rdb: rdb, writer: writer, logger: logger}
+}
+
+func (s *Service) Run(ctx context.Context) error {
+	go s.statsLoop(ctx)
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		pubsub := s.rdb.PSubscribe(ctx, "market:orderbook:*", "market:trades:*")
+		ch := pubsub.Channel()
+		s.logger.Info("subscribed to market channels")
+
+		for msg := range ch {
+			if ctx.Err() != nil {
+				pubsub.Close()
+				return ctx.Err()
+			}
+			s.handleMessage(msg.Channel, []byte(msg.Payload))
+		}
+
+		pubsub.Close()
+		s.logger.Warn("redis subscription dropped, reconnecting")
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func (s *Service) statsLoop(ctx context.Context) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	var lastOB, lastTR uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			ob := atomic.LoadUint64(&s.obMsgs)
+			tr := atomic.LoadUint64(&s.trMsgs)
+			s.logger.Info("history_logger stats",
+				"orderbook_msgs_1m", ob-lastOB,
+				"trade_msgs_1m", tr-lastTR,
+				"orderbook_total", ob,
+				"trade_total", tr,
+			)
+			lastOB, lastTR = ob, tr
+		}
+	}
+}
+
+func (s *Service) handleMessage(channel string, raw []byte) {
+	if strings.Contains(channel, "orderbook") {
+		atomic.AddUint64(&s.obMsgs, 1)
+		metrics.RedisMessages.WithLabelValues("orderbook").Inc()
+		var ob models.OrderbookPayload
+		if !decode(raw, &ob) {
+			return
+		}
+		if ob.Symbol == "" {
+			ob.Symbol = symbolFromChannel(channel)
+		}
+		for _, line := range lineproto.OrderbookDepthLines(ob, s.cfg.OrderbookDepth) {
+			s.writer.Enqueue(line)
+		}
+		return
+	}
+
+	if strings.Contains(channel, "trades") {
+		atomic.AddUint64(&s.trMsgs, 1)
+		metrics.RedisMessages.WithLabelValues("trade").Inc()
+		var trade models.TradePayload
+		if !decode(raw, &trade) {
+			return
+		}
+		if trade.Symbol == "" {
+			trade.Symbol = symbolFromChannel(channel)
+		}
+		s.writer.Enqueue(lineproto.TradeLine(trade))
+	}
+}
+
+func symbolFromChannel(channel string) string {
+	parts := strings.Split(channel, ":")
+	if len(parts) >= 3 {
+		return parts[2]
+	}
+	return ""
+}
+
+func decode(raw []byte, dest any) bool {
+	if err := msgpack.Unmarshal(raw, dest); err == nil {
+		return true
+	}
+	return json.Unmarshal(raw, dest) == nil
+}

@@ -1,0 +1,269 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Total PnL (USDT)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "oms_total_pnl_usdt", "legendFormat": "PnL" }],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "title": "Win/Loss Ratio",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [{ "expr": "oms_win_loss_ratio", "legendFormat": "W/L" }]
+    },
+    {
+      "title": "Active Positions",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [{ "expr": "oms_active_positions", "legendFormat": "Positions" }]
+    },
+    {
+      "title": "FAISS Index Size",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [{ "expr": "ml_faiss_index_size", "legendFormat": "Vectors" }]
+    },
+    {
+      "title": "Confidence Score",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [{ "expr": "ml_confidence_score", "legendFormat": "{{symbol}}" }]
+    },
+    {
+      "title": "Volatility Multiplier",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [{ "expr": "ml_volatility_multiplier", "legendFormat": "{{symbol}}" }]
+    },
+    {
+      "title": "Market Regime",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [{ "expr": "ml_regime_state", "legendFormat": "{{symbol}}" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "Choppy" }, "1": { "text": "Trending" }, "2": { "text": "Breakout" } } }
+          ]
+        }
+      }
+    },
+    {
+      "title": "BTC Correlation",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [{ "expr": "ml_btc_correlation", "legendFormat": "{{symbol}}" }]
+    },
+    {
+      "title": "Signal-to-Order Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, rate(oms_signal_to_order_latency_seconds_bucket[5m]))", "legendFormat": "OMS p95" },
+        { "expr": "histogram_quantile(0.95, rate(ml_tick_to_signal_latency_seconds_bucket[5m]))", "legendFormat": "ML p95" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Redis Pub/Sub Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, rate(ml_redis_pubsub_latency_seconds_bucket[5m]))", "legendFormat": "ML p95" },
+        { "expr": "histogram_quantile(0.95, rate(ingestion_redis_publish_latency_seconds_bucket[5m]))", "legendFormat": "Ingestion p95" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "GPU VRAM Utilization",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 28 },
+      "targets": [{ "expr": "ml_gpu_vram_utilization_percent", "legendFormat": "VRAM %" }],
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100, "min": 0 } }
+    },
+    {
+      "title": "CPU Utilization (ML)",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 28 },
+      "targets": [{ "expr": "ml_cpu_utilization_percent", "legendFormat": "CPU %" }],
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100, "min": 0 } }
+    },
+    {
+      "title": "Funding Rates",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 28 },
+      "targets": [{ "expr": "oms_funding_rate", "legendFormat": "{{symbol}}" }]
+    },
+    {
+      "title": "Per-Symbol PnL",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 34 },
+      "targets": [{ "expr": "oms_symbol_pnl_usdt", "legendFormat": "{{symbol}}" }],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "title": "WS Events / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 42 },
+      "targets": [{ "expr": "rate(ingestion_ws_events_total[1m])", "legendFormat": "{{type}}" }]
+    },
+    {
+      "title": "Grid Active Status",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 42 },
+      "targets": [{ "expr": "oms_grid_active", "legendFormat": "{{symbol}}" }]
+    },
+    {
+      "title": "Rolling Retrain — Last Training",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 48 },
+      "targets": [{ "expr": "last_training_timestamp", "legendFormat": "Last Train" }],
+      "fieldConfig": { "defaults": { "unit": "dateTimeFromNow" } }
+    },
+    {
+      "title": "Model Version ID",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 48 },
+      "targets": [{ "expr": "ml_model_version_info", "legendFormat": "{{version}}" }]
+    },
+    {
+      "title": "Loss Delta (last retrain)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 48 },
+      "targets": [{ "expr": "ml_loss_delta", "legendFormat": "Δ loss" }],
+      "fieldConfig": { "defaults": { "decimals": 4 } }
+    },
+    {
+      "title": "Retrain Running",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 48 },
+      "targets": [{ "expr": "ml_retrain_running", "legendFormat": "Active" }]
+    },
+    {
+      "title": "Retrain Duration",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 52 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, rate(ml_retrain_duration_seconds_bucket[1h]))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.50, rate(ml_retrain_duration_seconds_bucket[1h]))", "legendFormat": "p50" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "ONNX Hot-Swap Events",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 52 },
+      "targets": [
+        { "expr": "rate(onnx_hot_swap_success_total[5m])", "legendFormat": "success/s" },
+        { "expr": "rate(onnx_hot_swap_failures_total[5m])", "legendFormat": "fail/s" }
+      ]
+    },
+    {
+      "title": "Trades Since Last Retrain",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 60 },
+      "targets": [{ "expr": "ml_retrain_trades_since_last", "legendFormat": "trades" }]
+    },
+    {
+      "title": "Retrain Failures",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 60 },
+      "targets": [{ "expr": "rate(ml_retrain_failures_total[1h])", "legendFormat": "failures/s" }]
+    },
+    {
+      "title": "Recent Trades",
+      "type": "table",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 66 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "flux",
+          "query": "from(bucket: \"market_raw\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"trade_outcomes\")\n  |> filter(fn: (r) => r._field != \"state_vector_json\")\n  |> map(fn: (r) => ({ r with close_reason: if exists r.close_reason then r.close_reason else \"unknown\" }))\n  |> pivot(rowKey: [\"_time\", \"symbol\", \"direction\", \"regime\", \"signal_id\", \"close_reason\"], columnKey: [\"_field\"], valueColumn: \"_value\")\n  |> map(fn: (r) => ({ r with hold_sec: if exists r.holding_time_ms then float(v: r.holding_time_ms) / 1000.0 else 0.0 }))\n  |> sort(columns: [\"_time\"], desc: true)\n  |> limit(n: 30)\n  |> keep(columns: [\"_time\", \"symbol\", \"direction\", \"close_reason\", \"net_pnl\", \"entry_price\", \"exit_price\", \"hold_sec\", \"regime\", \"exchange_pnl\", \"partial_closed\"])"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "_time" },
+            "properties": [
+              { "id": "displayName", "value": "Time" },
+              { "id": "unit", "value": "dateTimeAsLocal" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "net_pnl" },
+            "properties": [
+              { "id": "displayName", "value": "PnL (USDT)" },
+              { "id": "unit", "value": "currencyUSD" },
+              { "id": "decimals", "value": 4 },
+              {
+                "id": "custom.cellOptions",
+                "value": { "type": "color-text" }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "green", "value": 0 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "entry_price" },
+            "properties": [{ "id": "displayName", "value": "Entry" }, { "id": "decimals", "value": 4 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "exit_price" },
+            "properties": [{ "id": "displayName", "value": "Exit" }, { "id": "decimals", "value": 4 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "hold_sec" },
+            "properties": [
+              { "id": "displayName", "value": "Hold (s)" },
+              { "id": "unit", "value": "s" },
+              { "id": "decimals", "value": 1 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "close_reason" },
+            "properties": [{ "id": "displayName", "value": "Reason" }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "exchange_pnl" },
+            "properties": [{ "id": "displayName", "value": "From Exchange" }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "partial_closed" },
+            "properties": [{ "id": "displayName", "value": "Partial" }]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "Time", "desc": true }]
+      }
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["trading", "bybit", "ml"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "title": "Fast Trader GRU — Live Dashboard",
+  "uid": "fast-trader-gru",
+  "version": 1
+}

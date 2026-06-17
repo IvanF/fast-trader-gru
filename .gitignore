@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+*.onnx
+/data/
+ml_engine/data/
+ml_engine/models/*.onnx
+go.sum
+/tmp/
+*.exe
+*.test

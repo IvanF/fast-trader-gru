@@ -1,0 +1,159 @@
+package models
+
+type TradeSignal struct {
+	Symbol               string    `json:"symbol"`
+	Direction            string    `json:"direction"`
+	Confidence           float64   `json:"confidence"`
+	VolatilityMultiplier float64   `json:"volatility_multiplier"`
+	StateVector          []float32 `json:"state_vector"`
+	FundingRate          float64   `json:"funding_rate"`
+	Regime               string    `json:"regime"`
+	BTCorrelation        float64   `json:"btc_correlation"`
+	PositionScale        float64   `json:"position_scale"`
+	EntryPrice           float64   `json:"entry_price"`
+	StopLoss             float64   `json:"stop_loss"`
+	TakeProfits          []float64 `json:"take_profits"`
+	TPPrices             []float64 `json:"tp_prices,omitempty"`
+	WallPrice            float64   `json:"wall_price"`
+	Timestamp            int64     `json:"timestamp"`
+	SignalID             string    `json:"signal_id"`
+	ExitReason           string    `json:"exit_reason,omitempty"`
+	SetupAction          string    `json:"setup_action,omitempty"`
+	AbortReason          string    `json:"abort_reason,omitempty"`
+	DecayReason          string    `json:"decay_reason,omitempty"`
+}
+
+// PendingOrderEvent notifies ML of pending entry lifecycle for alpha-decay abort.
+type PendingOrderEvent struct {
+	Event      string  `json:"event"`
+	Symbol     string  `json:"symbol"`
+	Direction  string  `json:"direction"`
+	OrderID    string  `json:"order_id"`
+	EntryPrice float64 `json:"entry_price"`
+	Confidence float64 `json:"confidence"`
+	SignalID   string  `json:"signal_id"`
+	Reason     string  `json:"reason,omitempty"`
+	Timestamp  int64   `json:"timestamp"`
+}
+
+// PositionEvent notifies ML of lifecycle changes for alpha-decay tracking.
+type PositionEvent struct {
+	Event      string  `json:"event"`
+	Symbol     string  `json:"symbol"`
+	Direction  string  `json:"direction"`
+	SignalID   string  `json:"signal_id"`
+	Confidence float64 `json:"confidence"`
+	EntryPrice float64 `json:"entry_price"`
+	Timestamp  int64   `json:"timestamp"`
+}
+
+type OrderbookLevel struct {
+	Price string `json:"price" msgpack:"price"`
+	Size  string `json:"size" msgpack:"size"`
+}
+
+type OrderbookSnapshot struct {
+	Symbol string           `json:"symbol" msgpack:"symbol"`
+	Ts     int64            `json:"ts" msgpack:"ts"`
+	Bids   []OrderbookLevel `json:"b" msgpack:"b"`
+	Asks   []OrderbookLevel `json:"a" msgpack:"a"`
+}
+
+type ExecutionResult struct {
+	SignalID      string    `json:"signal_id"`
+	Symbol        string    `json:"symbol"`
+	Direction     string    `json:"direction"`
+	StateVector   []float32 `json:"state_vector"`
+	FAISSVectorID int64     `json:"faiss_vector_id"`
+	EntryPrice    float64   `json:"entry_price"`
+	ExitPrice     float64   `json:"exit_price"`
+	NetPnL        float64   `json:"net_pnl"`
+	HoldingTimeMs int64     `json:"holding_time_ms"`
+	Regime        string    `json:"regime"`
+	ClosedAt      int64     `json:"closed_at"`
+	PartialClosed bool      `json:"partial_closed"`
+	GridLevels    int       `json:"grid_levels"`
+	CloseReason   string    `json:"close_reason"`
+	ExchangePnL   bool      `json:"exchange_pnl"`
+}
+
+type GridPlan struct {
+	Symbol       string
+	Direction    string
+	EntryPrice   float64
+	StopLoss     float64
+	TakeProfits  []float64
+	Qty          float64
+	TimeStopSec  int
+	Signal       TradeSignal
+	WallPrice    float64
+}
+
+type ExitOrder struct {
+	OrderID   string
+	Price     float64
+	Qty       float64
+	Kind      string // stop_loss | breakeven | wall | r_multiple | trend | time_stop | signal_exit | confidence_decay_exit
+	Filled    bool
+	FilledQty float64
+	FilledPx  float64
+}
+
+type ActivePosition struct {
+	Symbol          string
+	Direction       string
+	FillPrice       float64
+	PlannedEntry    float64
+	PlannedSL       float64
+	InitialQty      float64
+	TargetQty       float64
+	RemainingQty    float64
+	StopLoss        float64
+	StopLossOrder   *ExitOrder
+	TakeProfitOrders []ExitOrder
+	PartialTaken    bool
+	BreakevenSet    bool
+	EntryTime       int64
+	TimeStopSec     int
+	QtyStep         float64
+	MinOrderQty     float64
+	TickSize        float64
+	MarginUSD       float64
+	NotionalUSD     float64
+	Leverage        int
+	Signal          TradeSignal
+	OrderID         string
+	FilledAt        int64
+	ExitGridReady    bool
+	TimeStopPlaced   bool
+	LastGridDeployAt int64
+	EmergencySizeHandled bool
+}
+
+type PendingEntryState string
+
+const (
+	PendingEntryStateActive     PendingEntryState = "active"
+	PendingEntryStateCancelling PendingEntryState = "cancelling"
+)
+
+type PendingEntry struct {
+	Symbol       string
+	OrderID      string
+	State        PendingEntryState
+	Direction    string
+	EntryPrice   float64
+	StopLoss     float64
+	TakeProfits  []float64
+	Qty          float64
+	TimeStopSec  int
+	QtyStep      float64
+	MinOrderQty  float64
+	TickSize     float64
+	MarginUSD    float64
+	NotionalUSD  float64
+	Leverage     int
+	Signal       TradeSignal
+	PlacedAt     int64
+	Orderbook    OrderbookSnapshot
+}
