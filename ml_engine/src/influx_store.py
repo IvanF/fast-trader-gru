@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 TRADE_MEASUREMENT = "trade_outcomes"
 TELEMETRY_MEASUREMENT = "market_microstructure"
 EVENT_MEASUREMENT = "pattern_events"
+MOVEMENT_MEASUREMENT = "movement_probability"
 
 
 class InfluxStore:
@@ -115,6 +116,22 @@ class InfluxStore:
             .field("detail", str(detail)[:256])
             .time(ts, WritePrecision.MS)
         )
+        self._write_api.write(bucket=self.bucket_features, org=self.org, record=point)
+
+    def write_movement_probability(
+        self, symbol: str, fields: dict[str, float], ts_ms: Optional[int] = None
+    ) -> None:
+        """P(Short|X), P(Neutral|X), P(Long|X) and state vector x1..x5."""
+        if self._write_api is None:
+            self.connect()
+        assert self._write_api is not None
+        ts = datetime.fromtimestamp((ts_ms or int(time.time() * 1000)) / 1000.0, tz=timezone.utc)
+        point = Point(MOVEMENT_MEASUREMENT).tag("symbol", symbol)
+        for key, val in fields.items():
+            if val is None or (isinstance(val, float) and not (val == val)):
+                continue
+            point = point.field(key, float(val))
+        point = point.time(ts, WritePrecision.MS)
         self._write_api.write(bucket=self.bucket_features, org=self.org, record=point)
 
     def query_trade_outcomes(

@@ -22,6 +22,7 @@ from .memory import ExperienceEngine
 from .model_manifest import ModelManifest
 from . import metrics as prom
 from .market_telemetry import EventStateStore, compute_telemetry_and_events
+from .movement_probability import MovementStateStore, load_weights_from_env, softmax_movement_probability
 from .regime import RegimeDetector
 from .exit_plan import build_exit_plan
 from .retrain_worker import RollingRetrainWorker
@@ -81,6 +82,9 @@ class MLEngine:
         self._open_positions: Dict[str, _OpenPosition] = {}
         self._pending_entries: Dict[str, _PendingEntry] = {}
         self._event_states = EventStateStore()
+        self._movement_states = MovementStateStore()
+        self._movement_weights, self._movement_bias = load_weights_from_env()
+        self._movement_funding_prior = float(os.getenv("MOVEMENT_PROB_FUNDING_PRIOR_SCALE", "50"))
         self._last_telemetry: Dict[str, float] = {}
 
     async def connect_redis(self) -> None:
@@ -502,10 +506,21 @@ class MLEngine:
 
         state = self._event_states.get(symbol)
         snap, events = compute_telemetry_and_events(buf, state)
+        mov_state = self._movement_states.get(symbol)
+        mov = softmax_movement_probability(
+            buf,
+            mov_state,
+            weights=self._movement_weights,
+            bias=self._movement_bias,
+            funding_prior_scale=self._movement_funding_prior,
+        )
         ts_ms = int(time.time() * 1000)
         try:
             await asyncio.to_thread(
                 self.influx.write_market_telemetry, symbol, snap.as_fields(), ts_ms,
+            )
+            await asyncio.to_thread(
+                self.influx.write_movement_probability, symbol, mov.as_fields(), ts_ms,
             )
             for ev in events:
                 await asyncio.to_thread(

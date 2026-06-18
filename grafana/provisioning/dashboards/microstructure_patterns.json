@@ -156,9 +156,106 @@
       ]
     },
     {
+      "title": "Movement Probability P(Short|X), P(Neutral|X), P(Long|X)",
+      "description": "Softmax regression on state vector X_t = [OBI, vol delta, trade velocity, OI delta, liq imbalance]. Bayesian funding prior applied to logits.",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 40 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": { "min": 0, "max": 1, "unit": "percentunit", "custom": { "fillOpacity": 15, "stacking": { "mode": "none" } } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "p_short" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "p_neutral" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "p_long" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"market_features\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"movement_probability\")\n  |> filter(fn: (r) => r.symbol == \"${symbol}\")\n  |> filter(fn: (r) => r._field == \"p_short\" or r._field == \"p_neutral\" or r._field == \"p_long\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+        }
+      ]
+    },
+    {
+      "title": "State Vector X_t (features)",
+      "description": "x1 OBI, x2 volume delta, x3 trade velocity (norm), x4 OI delta proxy, x5 liquidation imbalance",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 49 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": { "min": -1, "max": 1, "custom": { "fillOpacity": 5 } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "x3_trade_vel" }, "properties": [{ "id": "min", "value": 0 }, { "id": "max", "value": 1 }] }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"market_features\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"movement_probability\")\n  |> filter(fn: (r) => r.symbol == \"${symbol}\")\n  |> filter(fn: (r) => r._field == \"x1_obi\" or r._field == \"x2_vol_delta\" or r._field == \"x3_trade_vel\" or r._field == \"x4_oi_delta\" or r._field == \"x5_liq_imb\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+        }
+      ]
+    },
+    {
+      "title": "Dominant Direction (max probability)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 57 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "decimals": 1 },
+        "overrides": []
+      },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"market_features\")\n  |> range(start: -5m)\n  |> filter(fn: (r) => r._measurement == \"movement_probability\")\n  |> filter(fn: (r) => r.symbol == \"${symbol}\")\n  |> filter(fn: (r) => r._field == \"p_short\" or r._field == \"p_neutral\" or r._field == \"p_long\")\n  |> last()\n  |> group(columns: [\"_field\"])\n  |> max(column: \"_value\")"
+        }
+      ]
+    },
+    {
+      "title": "P(Short) now",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 5, "x": 8, "y": 57 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "unit": "percentunit", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.5 }] } } },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"market_features\")\n  |> range(start: -5m)\n  |> filter(fn: (r) => r._measurement == \"movement_probability\")\n  |> filter(fn: (r) => r.symbol == \"${symbol}\")\n  |> filter(fn: (r) => r._field == \"p_short\")\n  |> last()"
+        }
+      ]
+    },
+    {
+      "title": "P(Long) now",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 5, "x": 13, "y": 57 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "unit": "percentunit", "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 0.5 }] } } },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"market_features\")\n  |> range(start: -5m)\n  |> filter(fn: (r) => r._measurement == \"movement_probability\")\n  |> filter(fn: (r) => r.symbol == \"${symbol}\")\n  |> filter(fn: (r) => r._field == \"p_long\")\n  |> last()"
+        }
+      ]
+    },
+    {
+      "title": "P(Neutral) now",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 57 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "unit": "percentunit", "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] } } },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"market_features\")\n  |> range(start: -5m)\n  |> filter(fn: (r) => r._measurement == \"movement_probability\")\n  |> filter(fn: (r) => r.symbol == \"${symbol}\")\n  |> filter(fn: (r) => r._field == \"p_neutral\")\n  |> last()"
+        }
+      ]
+    },
+    {
       "title": "Pattern Events Log",
       "type": "table",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 40 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 61 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "targets": [
         {
@@ -182,7 +279,7 @@
         "datasource": { "type": "influxdb", "uid": "influxdb" },
         "refresh": 2,
         "query": {
-          "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(\n  bucket: \"market_features\",\n  tag: \"symbol\",\n  predicate: (r) => r._measurement == \"market_microstructure\" or r._measurement == \"orderbook_summary\",\n  start: -7d\n)",
+          "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(\n  bucket: \"market_features\",\n  tag: \"symbol\",\n  predicate: (r) => r._measurement == \"market_microstructure\" or r._measurement == \"movement_probability\" or r._measurement == \"orderbook_summary\",\n  start: -7d\n)",
           "queryType": "flux"
         },
         "current": { "text": "BTCUSDT", "value": "BTCUSDT" },
