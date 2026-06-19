@@ -705,14 +705,20 @@ class MLEngine:
 
         open_dir = open_pos["direction"]
 
-        # Confident opposite vector — immediate exit (model event).
+        # Confident opposite vector — require consecutive ticks to avoid flip noise.
         if direction in ("LONG", "SHORT") and direction != open_dir:
             if confidence >= self.cfg.confidence_threshold:
-                open_pos["decay_signaled"] = True
-                return self._build_confidence_decay_payload(
-                    symbol, open_pos, confidence, vol_mult, v_state, regime, buf, "direction_flip",
-                )
+                streak = open_pos.get("flip_streak", 0) + 1
+                open_pos["flip_streak"] = streak
+                if streak >= self.cfg.direction_flip_confirm_ticks:
+                    open_pos["decay_signaled"] = True
+                    open_pos.pop("flip_streak", None)
+                    return self._build_confidence_decay_payload(
+                        symbol, open_pos, confidence, vol_mult, v_state, regime, buf, "direction_flip",
+                    )
             return None
+
+        open_pos.pop("flip_streak", None)
 
         # HOLD / low-confidence noise is not a reversal signal by itself.
         if direction == "HOLD":
@@ -736,10 +742,16 @@ class MLEngine:
 
         pending_dir = pending["direction"]
         if direction in ("LONG", "SHORT") and direction != pending_dir:
-            pending["abort_signaled"] = True
-            return self._build_entry_abort_payload(
-                symbol, pending, confidence, vol_mult, v_state, regime, buf, "direction_flip",
-            )
+            streak = pending.get("flip_streak", 0) + 1
+            pending["flip_streak"] = streak
+            if streak >= self.cfg.direction_flip_confirm_ticks:
+                pending["abort_signaled"] = True
+                pending.pop("flip_streak", None)
+                return self._build_entry_abort_payload(
+                    symbol, pending, confidence, vol_mult, v_state, regime, buf, "direction_flip",
+                )
+            return None
+        pending.pop("flip_streak", None)
 
         # HOLD is neutral noise — keep pegging the pending limit.
         if direction == "HOLD":

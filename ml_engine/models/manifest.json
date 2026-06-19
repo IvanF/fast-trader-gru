@@ -1,0 +1,9 @@
+{
+  "version": "bootstrap",
+  "updated_at": 1781820030.0977747,
+  "models": {
+    "orderbook_cnn": "orderbook_cnn.onnx",
+    "flow_gru_attention": "flow_gru_attention.onnx",
+    "decision_mlp": "decision_mlp.onnx"
+  }
+}

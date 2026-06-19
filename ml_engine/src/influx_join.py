@@ -14,12 +14,12 @@ FEATURE_COLS = ["obi", "bid_vol", "ask_vol", "price", "size"]
 
 
 def _direction_label(direction: str, pnl: float) -> int:
-    """0=LONG, 1=SHORT, 2=HOLD — label reflects profitable action."""
+    """0=LONG, 1=SHORT, 2=HOLD — label reflects actual trade direction."""
     d = (direction or "").upper()
     if d == "LONG":
-        return 0 if pnl >= 0 else 2
+        return 0
     if d == "SHORT":
-        return 1 if pnl >= 0 else 2
+        return 1
     return 2
 
 

@@ -44,9 +44,18 @@ func (s *Service) tryAdoptOrphan(ctx context.Context, exPos bybit.PositionInfo) 
 	s.mu.Lock()
 	_, tracked := s.positions[exPos.Symbol]
 	_, pending := s.pending[exPos.Symbol]
+	until, inCooldown := s.ghostCooldown[exPos.Symbol]
 	s.mu.Unlock()
 	if tracked || pending {
 		return
+	}
+	if inCooldown && time.Now().UnixMilli() < until {
+		return
+	}
+	if inCooldown {
+		s.mu.Lock()
+		delete(s.ghostCooldown, exPos.Symbol)
+		s.mu.Unlock()
 	}
 	s.adoptExchangePosition(ctx, exPos, "orphan_scan")
 }

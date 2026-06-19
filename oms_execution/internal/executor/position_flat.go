@@ -18,6 +18,9 @@ func (s *Service) syncPositionFromExchange(ctx context.Context, pos *models.Acti
 	if exPos.Size <= 0 || !s.positionMatchesDirection(exPos, pos.Direction) {
 		return 0, false, nil
 	}
+	if exPos.Size < pos.MinOrderQty*0.99 {
+		return 0, false, nil
+	}
 	size := bybit.NormalizeQty(exPos.Size, pos.QtyStep, pos.MinOrderQty)
 	if size <= 0 {
 		return 0, false, nil

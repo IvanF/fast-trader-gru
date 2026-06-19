@@ -8,6 +8,7 @@ type ExitGridOptions struct {
 	MinTPPct        float64
 	MaxTPPct        float64
 	FeeBreakevenPct float64
+	MinSLPct        float64
 }
 
 // FeeAwareBreakevenPrice returns the minimum profitable exit (covers fees + micro-slippage).

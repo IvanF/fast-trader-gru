@@ -13,6 +13,14 @@ import (
 func (s *Service) reconcileExistingSignal(ctx context.Context, signal models.TradeSignal, recvAt time.Time) error {
 	signal = s.capSignalVol(signal)
 	s.mu.Lock()
+	if until, ok := s.ghostCooldown[signal.Symbol]; ok {
+		s.mu.Unlock()
+		if time.Now().UnixMilli() < until {
+			return nil
+		}
+		s.mu.Lock()
+		delete(s.ghostCooldown, signal.Symbol)
+	}
 	if pos, ok := s.positions[signal.Symbol]; ok {
 		s.mu.Unlock()
 		return s.reconcileActivePosition(ctx, signal, pos)
@@ -240,16 +248,20 @@ func (s *Service) redeployExitGrid(
 	}
 
 	if s.tpGridNeedsRefresh(pos, plan, ob, exSize) {
+		exitGrid := grid.BuildExitGrid(
+			pos.Direction, pos.FillPrice, plannedEntry, newSL, ob, pos.Signal,
+			pos.TickSize, exSize, pos.QtyStep, pos.MinOrderQty, s.exitGridOpts(),
+		)
+		if len(exitGrid.TakeProfits) == 0 {
+			pos.LastGridDeployAt = time.Now().UnixMilli()
+			return nil
+		}
 		s.logger.Info("redeploying tp ladder only",
 			"symbol", pos.Symbol,
 			"reason", reason,
 			"qty", exSize,
 		)
 		s.cancelTPOrdersOnly(ctx, pos)
-		exitGrid := grid.BuildExitGrid(
-			pos.Direction, pos.FillPrice, plannedEntry, newSL, ob, pos.Signal,
-			pos.TickSize, exSize, pos.QtyStep, pos.MinOrderQty, s.exitGridOpts(),
-		)
 		side := closeSide(pos.Direction)
 		for _, tp := range exitGrid.TakeProfits {
 			if tp.Qty <= 0 {

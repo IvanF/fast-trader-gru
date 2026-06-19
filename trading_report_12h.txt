@@ -1,0 +1,223 @@
+=== 12H MONITOR STARTED: Пт 19 июн 2026 09:29:53 MSK ===
+
+=== 2026-06-19 09:29:53 ===
+Trades: 8 | WR: 37.5% | PnL: $-0.0628
+Avg win: $0.0065 | Avg loss: $-0.0165
+W/L ratio: 0.39
+Reasons: {'exchange_closed': 8}
+Worst symbols: [('LABUSDT', '\\$-0.0366'), ('ETHUSDT', '\\$-0.0262')]
+OPTIMIZE_NEEDED: ['low_wr=38%', 'bad_wl_ratio=0.39']
+
+
+=== 2026-06-19 09:59:54 ===
+Trades: 47 | WR: 6.4% | PnL: $-0.9746
+Avg win: $0.0065 | Avg loss: $-0.0226
+W/L ratio: 0.29
+Reasons: {'exchange_closed': 47}
+Worst symbols: [('LABUSDT', '\\$-0.7428'), ('ETHUSDT', '\\$-0.2318')]
+OPTIMIZE_NEEDED: ['low_wr=6%', 'bad_wl_ratio=0.29']
+
+
+=== 2026-06-19 10:29:54 ===
+Trades: 91 | WR: 13.2% | PnL: $-1.5443
+Avg win: $0.0138 | Avg loss: $-0.0216
+W/L ratio: 0.64
+Reasons: {'exchange_closed': 91}
+Worst symbols: [('LABUSDT', '\\$-1.2265'), ('ETHUSDT', '\\$-0.4120'), ('ZECUSDT', '\\$-0.0166')]
+OPTIMIZE_NEEDED: ['low_wr=13%', 'bad_wl_ratio=0.64']
+
+
+=== 2026-06-19 10:59:54 ===
+Trades: 102 | WR: 12.7% | PnL: $-1.6940
+Avg win: $0.0167 | Avg loss: $-0.0215
+W/L ratio: 0.78
+Reasons: {'exchange_closed': 102}
+Worst symbols: [('LABUSDT', '\\$-1.3471'), ('ETHUSDT', '\\$-0.4926'), ('ZECUSDT', '\\$-0.0166')]
+OPTIMIZE_NEEDED: ['low_wr=13%', 'bad_wl_ratio=0.78']
+
+
+=== 2026-06-19 11:29:54 ===
+Trades: 105 | WR: 12.4% | PnL: $-2.0854
+Avg win: $0.0167 | Avg loss: $-0.0250
+W/L ratio: 0.67
+Reasons: {'exchange_closed': 105}
+Worst symbols: [('LABUSDT', '\\$-1.3471'), ('ETHUSDT', '\\$-0.4926'), ('BEATUSDT', '\\$-0.2560')]
+OPTIMIZE_NEEDED: ['low_wr=12%', 'bad_wl_ratio=0.67']
+
+
+=== 2026-06-19 11:59:55 ===
+Trades: 108 | WR: 13.9% | PnL: $-2.0614
+Avg win: $0.0161 | Avg loss: $-0.0248
+W/L ratio: 0.65
+Reasons: {'exchange_closed': 108}
+Worst symbols: [('LABUSDT', '\\$-1.3471'), ('ETHUSDT', '\\$-0.4926'), ('BEATUSDT', '\\$-0.2560')]
+OPTIMIZE_NEEDED: ['low_wr=14%', 'bad_wl_ratio=0.65']
+
+
+=== 2026-06-19 12:29:55 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-19 12:59:55 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-19 13:29:56 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-19 13:59:56 ===
+Trades: 1 | WR: 0.0% | PnL: $-0.0021
+Avg win: $0.0000 | Avg loss: $-0.0021
+W/L ratio: 0.00
+Reasons: {'fee_loss': 1}
+Worst symbols: [('AVAXUSDT', '\\$-0.0021')]
+INSUFFICIENT_DATA: 1 trades
+
+
+=== 2026-06-19 14:29:56 ===
+Trades: 1 | WR: 0.0% | PnL: $-0.0021
+Avg win: $0.0000 | Avg loss: $-0.0021
+W/L ratio: 0.00
+Reasons: {'fee_loss': 1}
+Worst symbols: [('AVAXUSDT', '\\$-0.0021')]
+INSUFFICIENT_DATA: 1 trades
+
+
+=== 2026-06-19 14:59:56 ===
+Trades: 36 | WR: 16.7% | PnL: $-0.5786
+Avg win: $0.0177 | Avg loss: $-0.0228
+W/L ratio: 0.77
+Reasons: {'fee_loss': 1, 'exchange_closed': 34, 'take_profit': 1}
+Worst symbols: [('LABUSDT', '\\$-0.5792'), ('ETHUSDT', '\\$-0.0927'), ('HYPEUSDT', '\\$-0.0107')]
+OPTIMIZE_NEEDED: ['low_wr=17%', 'bad_wl_ratio=0.77']
+
+
+=== 2026-06-19 15:29:56 ===
+Trades: 1 | WR: 0.0% | PnL: $-0.2285
+Avg win: $0.0000 | Avg loss: $-0.2285
+W/L ratio: 0.00
+Reasons: {'exchange_closed': 1}
+Worst symbols: [('BEATUSDT', '\\$-0.2285')]
+INSUFFICIENT_DATA: 1 trades
+
+
+=== 2026-06-19 15:59:56 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-19 16:29:57 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-19 16:59:57 ===
+Trades: 1 | WR: 100.0% | PnL: $0.0013
+Avg win: $0.0013 | Avg loss: $0.0000
+
+Reasons: {'exchange_closed': 1}
+Worst symbols: [('ZEREBROUSDT', '\\$0.0013')]
+INSUFFICIENT_DATA: 1 trades
+
+
+=== 2026-06-19 17:29:57 ===
+Trades: 1 | WR: 100.0% | PnL: $0.0013
+Avg win: $0.0013 | Avg loss: $0.0000
+
+Reasons: {'exchange_closed': 1}
+Worst symbols: [('ZEREBROUSDT', '\\$0.0013')]
+INSUFFICIENT_DATA: 1 trades
+
+
+=== 2026-06-19 17:59:57 ===
+Trades: 1 | WR: 100.0% | PnL: $0.0013
+Avg win: $0.0013 | Avg loss: $0.0000
+
+Reasons: {'exchange_closed': 1}
+Worst symbols: [('ZEREBROUSDT', '\\$0.0013')]
+INSUFFICIENT_DATA: 1 trades
+
+
+=== 2026-06-19 18:29:57 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-19 18:59:57 ===
+Trades: 3 | WR: 33.3% | PnL: $0.0771
+Avg win: $0.1061 | Avg loss: $-0.0145
+W/L ratio: 7.33
+Reasons: {'exchange_closed': 3}
+Worst symbols: [('HYPEUSDT', '\\$-0.0028'), ('BEATUSDT', '\\$0.0799')]
+INSUFFICIENT_DATA: 3 trades
+
+
+=== 2026-06-19 19:29:57 ===
+Trades: 3 | WR: 33.3% | PnL: $0.0771
+Avg win: $0.1061 | Avg loss: $-0.0145
+W/L ratio: 7.33
+Reasons: {'exchange_closed': 3}
+Worst symbols: [('HYPEUSDT', '\\$-0.0028'), ('BEATUSDT', '\\$0.0799')]
+INSUFFICIENT_DATA: 3 trades
+
+
+=== 2026-06-19 19:59:57 ===
+Trades: 4 | WR: 50.0% | PnL: $0.0953
+Avg win: $0.0621 | Avg loss: $-0.0145
+W/L ratio: 4.29
+Reasons: {'exchange_closed': 4}
+Worst symbols: [('HYPEUSDT', '\\$-0.0028'), ('BEATUSDT', '\\$0.0981')]
+INSUFFICIENT_DATA: 4 trades
+
+
+=== 2026-06-19 20:29:58 ===
+Trades: 5 | WR: 40.0% | PnL: $-0.0977
+Avg win: $0.0621 | Avg loss: $-0.0740
+W/L ratio: 0.84
+Reasons: {'exchange_closed': 5}
+Worst symbols: [('LABUSDT', '\\$-0.1930'), ('HYPEUSDT', '\\$-0.0028'), ('BEATUSDT', '\\$0.0981')]
+OPTIMIZE_NEEDED: ['bad_wl_ratio=0.84']
+
+
+=== 2026-06-19 20:59:58 ===
+Trades: 5 | WR: 40.0% | PnL: $-0.0977
+Avg win: $0.0621 | Avg loss: $-0.0740
+W/L ratio: 0.84
+Reasons: {'exchange_closed': 5}
+Worst symbols: [('LABUSDT', '\\$-0.1930'), ('HYPEUSDT', '\\$-0.0028'), ('BEATUSDT', '\\$0.0981')]
+OPTIMIZE_NEEDED: ['bad_wl_ratio=0.84']
+
+
+=== 2026-06-19 21:29:58 ===
+Trades: 7 | WR: 28.6% | PnL: $-0.1211
+Avg win: $0.0621 | Avg loss: $-0.0491
+W/L ratio: 1.27
+Reasons: {'exchange_closed': 7}
+Worst symbols: [('LABUSDT', '\\$-0.2159'), ('HYPEUSDT', '\\$-0.0028'), ('ZEREBROUSDT', '\\$-0.0005')]
+OPTIMIZE_NEEDED: ['low_wr=29%']
+
+
+=== 2026-06-19 21:59:58 ===
+Trades: 7 | WR: 28.6% | PnL: $-0.1211
+Avg win: $0.0621 | Avg loss: $-0.0491
+W/L ratio: 1.27
+Reasons: {'exchange_closed': 7}
+Worst symbols: [('LABUSDT', '\\$-0.2159'), ('HYPEUSDT', '\\$-0.0028'), ('ZEREBROUSDT', '\\$-0.0005')]
+OPTIMIZE_NEEDED: ['low_wr=29%']
+
+
+=== 2026-06-19 22:29:58 ===
+Trades: 9 | WR: 44.4% | PnL: $-0.1061
+Avg win: $0.0348 | Avg loss: $-0.0491
+W/L ratio: 0.71
+Reasons: {'exchange_closed': 9}
+Worst symbols: [('LABUSDT', '\\$-0.2159'), ('HYPEUSDT', '\\$-0.0028'), ('ZEREBROUSDT', '\\$-0.0005')]
+OPTIMIZE_NEEDED: ['bad_wl_ratio=0.71']
+
+
+=== 2026-06-19 22:59:58 ===
+Trades: 9 | WR: 44.4% | PnL: $-0.1061
+Avg win: $0.0348 | Avg loss: $-0.0491
+W/L ratio: 0.71
+Reasons: {'exchange_closed': 9}
+Worst symbols: [('LABUSDT', '\\$-0.2159'), ('HYPEUSDT', '\\$-0.0028'), ('ZEREBROUSDT', '\\$-0.0005')]
+OPTIMIZE_NEEDED: ['bad_wl_ratio=0.71']
+

@@ -97,6 +97,7 @@ type ExitOrder struct {
 	Filled    bool
 	FilledQty float64
 	FilledPx  float64
+	IsStop    bool // true for conditional stop-market orders
 }
 
 type ActivePosition struct {
@@ -127,7 +128,9 @@ type ActivePosition struct {
 	ExitGridReady    bool
 	TimeStopPlaced   bool
 	LastGridDeployAt int64
-	EmergencySizeHandled bool
+	EmergencySizeHandled  bool
+	GridDeployFailures    int
+	LastGridDeployFailure int64
 }
 
 type PendingEntryState string

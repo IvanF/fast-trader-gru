@@ -1,0 +1,102 @@
+Act as an Elite Quantitative Systems Architect specializing in Self-Learning Trading Infrastructure. Generate a microservices-based algorithmic trading bot for Bybit Futures (V5 API) using Go, Python, and Redis as the central message broker.
+
+ENVIRONMENT & LATENCY TARGETS:
+- Network Latency Profile: ~100ms - 500ms execution loop (Structural Scalping / Order Flow).
+- Hardware: Intel Xeon E5-2697 v4, Nvidia RTX 5060 Ti 16GB, 64GB RAM.
+- Data Bus: Redis (Pub/Sub & Streams) running inside Docker. No raw shared memory files.
+
+PROJECT DIRECTORY STRUCTURE:
+├── screener/               # Go: Dynamic coin selector (REST API)
+├── data_ingestion/         # Go: WS Manager -> Publishes to Redis
+├── ml_engine/              # Python: PyTorch, ONNX, FAISS -> Reads/Writes to Redis
+├── oms_execution/          # Go: Grid Maker, Risk Management -> Executes via Bybit REST
+├── docker-compose.yml
+└── README.md
+
+---
+TECHNICAL MODULE SPECIFICATIONS:
+
+1. MARKET SCREENER (Go) - The Conductor
+- Execute a loop every 60 minutes. Query Bybit V5 REST API for all USDT Perpetual tickers.
+- Filter and extract symbols where `turnover_24h >= 50,000,000` (50M USDT).
+- Publish the updated list of active symbols to a Redis channel `config:active_symbols`.
+
+2. DATA INGESTION SERVICE (Go)
+- Subscribe to Redis channel `config:active_symbols`. Dynamically open/close Bybit V5 WebSockets (orderbook.50.USDT and publicTrade.USDT) based on the current active list.
+- For every WS event, aggregate data into lightweight JSON or MessagePack payloads.
+- Publish raw updates directly to Redis using high-throughput Pub/Sub channels:
+  - Orderbook data -> `market:orderbook:[SYMBOL]`
+  - Trade stream data -> `market:trades:[SYMBOL]`
+
+3. ML ENGINE & VECTOR MEMORY (Python 3.11)
+- Async Core: Use `redis-py` with `asyncio` to listen to all active `market:*:*` channels.
+- Feature Engineering: Maintain a rolling 300-second in-memory buffer per coin to compute: Order Book Imbalance, Cumulative Volume Delta (CVD), Order Flow Speed, and VWAP deviation.
+- Inference (Late Fusion Models via ONNX Runtime on CUDA):
+  - Pass orderbook metrics through 1D-CNN.
+  - Pass order flow sequences through GRU.
+  - Concatenate outputs into a single 'Master State Vector' ($V_{state}$).
+- The Experience Engine (FAISS + Vector Matcher):
+  - Query a RAM-cached FAISS Index FlatIP with $V_{state}$ to fetch the Top-10 closest historical market contexts.
+  - Calculate the aggregated Win-Rate and historical PnL ($V_{memory}$) from these 10 matches.
+- Decision MLP Layer: Combine $V_{state}$ and $V_{memory}$. Output: Order_Direction (LONG/SHORT/HOLD), Confidence_Score (0.0-1.0), and Volatility_Multiplier (float).
+- If Confidence_Score > 0.85, publish the signal to Redis channel `orders:signals`.
+- Continuous Learning: Listen to Redis channel `execution:results`. When a trade closes, add its original $V_{state}$ and actual PnL back into the FAISS index. Periodically persist the FAISS index to disk.
+
+4. OMS / EXECUTION SERVICE (Go) - Adaptive Grid Maker
+- Subscribe to Redis channel `orders:signals`.
+- Upon receiving a trade signal for a symbol:
+  a) Grid Construction: Calculate entry levels, Multi-level Take-Profit (TP), and Stop-Loss (SL). Scale all distances using the provided `Volatility_Multiplier` to dynamically adjust to current market noise.
+  b) Liquidity Check: Fetch the latest orderbook snapshot from Redis. Identify the largest limit cluster (liquidity wall) within the range. Place the SL 2 ticks behind this wall for safety.
+  c) Order Placement: Deploy Maker-only (limit) orders via Bybit V5 REST API.
+  d) Time-Stop Guard: If an entry order is filled but fails to hit TP within a dynamic timeframe (N seconds), force-close the position via an aggressive limit chase or taker execution to eliminate decay risk.
+- Upon position closure, publish the final trade layout (FAISS vector ID, execution details, net PnL) to Redis channel `execution:results`.
+
+5. DOCKER COMPOSE ORCHESTRATION:
+- Orchestrate Redis, Screener, Ingestion, ML Engine, and OMS.
+- Configure Redis with `appendonly no` and maxmemory policies optimized for pure in-memory, low-latency pub/sub operations.
+- The `ml_engine` service in `docker-compose.yml` MUST include explicitly defined GPU reservations using the `deploy` block to expose the RTX 5060 Ti to the container via NVIDIA Container Toolkit.
+Example structure required:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+- Ensure the Python Dockerfile installs the correct PyTorch and ONNX Runtime versions compatible with CUDA 13.0 to leverage hardware acceleration.
+- Use `cpuset` to pin the Redis container to core 0, Ingestion to core 1, OMS to core 2, and the ML Engine to cores 3-6 to maximize cache efficiency and prevent kernel thrashing.
+
+6. TELEMETRY & GRAFANA OBSERVABILITY:
+- Integrate Prometheus and Grafana into the `docker-compose.yml` stack.
+- Both the OMS (Go) and ML Engine (Python) must expose Prometheus metrics asynchronously (via a `/metrics` HTTP endpoint) without blocking the hot path.
+- Track and expose the following custom metrics:
+  - Financials: Real-time PnL (Total and per-symbol), Win/Loss ratio, Average holding time.
+  - ML Telemetry: Current Market Regime state, average Confidence Score, Volatility Multiplier, and FAISS memory index size.
+  - System Performance: Execution Latency (Tick-to-Signal, Signal-to-Order), Redis pub/sub latency, CPU/VRAM utilization.
+  - Trading State: Number of active positions, grid active status, and Funding Rates.
+- Generate automated Grafana provisioning files (`datasources.yml` and a default `dashboard.json`) so the monitoring interface is fully configured and ready to use in the browser immediately upon `docker-compose up`.
+
+
+
+Provide fully functional, modular scaffolding with zero placeholders. Focus on strict error handling for network drops, Redis disconnection retries, and Bybit rate limiting (HTTP 429).
+
+
+CRITICAL ARCHITECTURE UPGRADES FOR V1:
+
+1. MARKET SCREENER ENHANCEMENT:
+- Add a Funding Rate Filter: Reject symbols with extreme positive/negative funding rates that contradict the statistical edge.
+- Pass the current Funding Rate as a continuous variable to the ML Engine.
+
+2. MULTI-TIMEFRAME & REGIME DETECTION:
+- Introduce a lightweight Regime Detection Module (using rolling GMM or EMA standard deviation) running every 60 seconds to classify the market state (Trending, Choppy, Breakout).
+- Add Multi-Timeframe Context to the Master State Vector: Combine the 300s micro-window with 15m and 1h macro trend indicators.
+- Implement a Correlation Filter: Continuously calculate the 5-min rolling Pearson correlation of the symbol against BTC. If correlation > 0.85, strictly reduce position sizing or enforce a HOLD signal.
+
+3. ML ENGINE UPGRADES (Attention & Time-Decay):
+- Upgrade the GRU network by appending a Self-Attention layer to weigh critical order flow imbalances dynamically without the full overhead of a Transformer model.
+- Implement a 'Forgetting Mechanism' (Time-Decay) in the FAISS Vector Memory. Historical matches older than X days or belonging to a completely different Regime must have their impact exponentially decayed.
+
+4. OMS / EXECUTION - ADVANCED RISK & REWARD:
+- Do NOT use CPU-heavy DBSCAN for orderbook support/resistance. Use vectorized `scipy.signal.find_peaks` applied to the orderbook depth array for ultra-fast Liquidity Wall detection.
+- Implement Asymmetric Profit Taking (Partial Closes): Upon reaching a 1:1 Risk/Reward (1R) target, immediately close 40-50% of the position and move the SL to breakeven. Convert the remaining position to a dynamic Trailing Stop based on recent CVD shifts.
+

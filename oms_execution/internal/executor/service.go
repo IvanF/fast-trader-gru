@@ -32,18 +32,20 @@ type Service struct {
 	gridDeploying map[string]bool
 	positions     map[string]*models.ActivePosition
 	pending   map[string]*models.PendingEntry
+	ghostCooldown map[string]int64
 }
 
 func New(cfg config.Config, bc *bybit.Client, rc *redisx.Client, iw *influx.Writer, logger *slog.Logger) *Service {
 	return &Service{
-		cfg:       cfg,
-		bybit:     bc,
-		redis:     rc,
-		influx:    iw,
-		logger:    logger,
-		tracker:   &metrics.PnLTracker{},
-		positions: make(map[string]*models.ActivePosition),
-		pending:   make(map[string]*models.PendingEntry),
+		cfg:          cfg,
+		bybit:        bc,
+		redis:        rc,
+		influx:       iw,
+		logger:       logger,
+		tracker:      &metrics.PnLTracker{},
+		positions:    make(map[string]*models.ActivePosition),
+		pending:      make(map[string]*models.PendingEntry),
+		ghostCooldown: make(map[string]int64),
 	}
 }
 
@@ -60,6 +62,7 @@ func (s *Service) exitGridOpts() grid.ExitGridOptions {
 		MinTPPct:        s.cfg.MinTPPct,
 		MaxTPPct:        s.cfg.MaxTPPct,
 		FeeBreakevenPct: s.cfg.FeeBreakevenPct,
+		MinSLPct:        s.cfg.MinSLPct,
 	}
 }
 
@@ -676,12 +679,32 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	}
 
 	if !pos.ExitGridReady {
+		if pos.GridDeployFailures >= 3 {
+			s.logger.Warn("exit grid exhausted retries, force-flattening", "symbol", symbol, "failures", pos.GridDeployFailures)
+			s.handleGhostPosition(ctx, pos)
+			return
+		}
+		if pos.LastGridDeployFailure > 0 && time.Now().UnixMilli()-pos.LastGridDeployFailure < 2_000 {
+			return
+		}
+		if exSize <= pos.MinOrderQty*1.01 {
+			s.logger.Warn("position at min qty, force flattening via market", "symbol", symbol, "qty", exSize)
+			_ = s.bybit.CancelAllOrders(ctx, pos.Symbol)
+			side := closeSide(pos.Direction)
+			_, _ = s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, exSize, pos.QtyStep)
+			s.handleGhostPosition(ctx, pos)
+			return
+		}
 		ob, err := s.redis.GetOrderbook(ctx, symbol)
 		if err != nil {
 			return
 		}
 		if err := s.deployExitGrid(ctx, pos, ob, pos.PlannedEntry, pos.PlannedSL, pos.TickSize); err != nil {
-			s.logger.Warn("exit grid retry failed", "symbol", symbol, "error", err)
+			pos.GridDeployFailures++
+			pos.LastGridDeployFailure = time.Now().UnixMilli()
+			s.logger.Warn("exit grid retry failed", "symbol", symbol, "error", err, "failures", pos.GridDeployFailures)
+		} else {
+			pos.GridDeployFailures = 0
 		}
 		return
 	}
@@ -714,9 +737,17 @@ func (s *Service) handleGhostPosition(ctx context.Context, pos *models.ActivePos
 	if err == nil && closed != nil && closed.UpdatedTime >= pos.EntryTime {
 		exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
 		if hasPos && exSize > 0 {
-			return
+			s.logger.Warn("ghost position still on exchange after flatten, force removing tracker",
+				"symbol", pos.Symbol, "ex_size", exSize,
+			)
 		}
 		s.finalizeClose(ctx, pos, closed.ClosedPnL, closed.AvgEntryPrice, closed.AvgExitPrice, "exchange_closed", true)
+		s.mu.Lock()
+		delete(s.positions, pos.Symbol)
+		s.ghostCooldown[pos.Symbol] = time.Now().UnixMilli()+120_000
+		metrics.ActivePositions.Set(float64(len(s.positions)))
+		metrics.GridActive.WithLabelValues(pos.Symbol).Set(0)
+		s.mu.Unlock()
 		return
 	}
 
@@ -724,6 +755,7 @@ func (s *Service) handleGhostPosition(ctx context.Context, pos *models.ActivePos
 
 	s.mu.Lock()
 	delete(s.positions, pos.Symbol)
+	s.ghostCooldown[pos.Symbol] = time.Now().UnixMilli()+120_000
 	metrics.ActivePositions.Set(float64(len(s.positions)))
 	metrics.GridActive.WithLabelValues(pos.Symbol).Set(0)
 	s.mu.Unlock()

@@ -172,6 +172,24 @@ func (c *Client) CancelOrder(ctx context.Context, symbol, orderID string) error 
 	return nil
 }
 
+// CancelStopOrder cancels a conditional/stop order using category=linear (matches PlaceStopMarket).
+func (c *Client) CancelStopOrder(ctx context.Context, symbol, orderID string) error {
+	payload := map[string]string{
+		"category": "linear",
+		"symbol":   symbol,
+		"orderId":  orderID,
+	}
+	body, _ := json.Marshal(payload)
+	var resp APIResponse
+	if err := c.signedPost(ctx, "/v5/order/cancel", body, &resp); err != nil {
+		return err
+	}
+	if resp.RetCode != 0 {
+		return fmt.Errorf("cancel stop order: %s (code %d)", resp.RetMsg, resp.RetCode)
+	}
+	return nil
+}
+
 func (c *Client) GetRecentClosedPnL(ctx context.Context, symbol string, sinceMs int64) (*ClosedPnLRecord, error) {
 	q := url.Values{
 		"category":  {"linear"},

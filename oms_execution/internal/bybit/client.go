@@ -110,6 +110,40 @@ func (c *Client) PlaceReduceLimit(ctx context.Context, symbol, side string, qty,
 	return result.OrderID, nil
 }
 
+// PlaceStopMarket posts a conditional stop-market reduce-only order.
+// triggerDirection: 1 = price rises to trigger, 2 = price falls to trigger.
+func (c *Client) PlaceStopMarket(ctx context.Context, symbol, side string, qty, qtyStep float64, triggerPrice string, triggerDirection int) (string, error) {
+	req := map[string]interface{}{
+		"category":         "linear",
+		"symbol":           symbol,
+		"side":             side,
+		"orderType":        "Market",
+		"qty":              FormatQty(qty, qtyStep),
+		"triggerPrice":     triggerPrice,
+		"triggerDirection": triggerDirection,
+		"reduceOnly":       true,
+		"positionIdx":      0,
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return "", err
+	}
+	var resp APIResponse
+	if err := c.signedPost(ctx, "/v5/order/create", body, &resp); err != nil {
+		return "", err
+	}
+	if resp.RetCode != 0 {
+		return "", fmt.Errorf("stop market: %s (code %d)", resp.RetMsg, resp.RetCode)
+	}
+	var result struct {
+		OrderID string `json:"orderId"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return "", err
+	}
+	return result.OrderID, nil
+}
+
 // PlaceReducePostOnlyLimit posts a reduce-only PostOnly limit (never crosses the spread as taker).
 func (c *Client) PlaceReducePostOnlyLimit(ctx context.Context, symbol, side string, qty, qtyStep float64, price string) (string, error) {
 	req := PlaceOrderRequest{
@@ -183,6 +217,23 @@ func (c *Client) CancelAllOrders(ctx context.Context, symbol string) error {
 	}
 	if resp.RetCode != 0 {
 		return fmt.Errorf("cancel-all: %s (code %d)", resp.RetMsg, resp.RetCode)
+	}
+	return nil
+}
+
+// CancelAllConditionalOrders cancels all conditional (stop-market, etc.) orders for a symbol.
+func (c *Client) CancelAllConditionalOrders(ctx context.Context, symbol string) error {
+	payload := map[string]string{
+		"category": "conditional",
+		"symbol":   symbol,
+	}
+	body, _ := json.Marshal(payload)
+	var resp APIResponse
+	if err := c.signedPost(ctx, "/v5/order/cancel-all", body, &resp); err != nil {
+		return err
+	}
+	if resp.RetCode != 0 {
+		return fmt.Errorf("cancel-all conditional: %s (code %d)", resp.RetMsg, resp.RetCode)
 	}
 	return nil
 }

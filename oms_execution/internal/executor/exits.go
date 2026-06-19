@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/fast-trader-gru/oms_execution/internal/bybit"
@@ -43,6 +44,10 @@ func (s *Service) deployExitGrid(ctx context.Context, pos *models.ActivePosition
 
 	s.deployMu.Lock()
 	defer s.deployMu.Unlock()
+
+	s.cancelExitOrders(ctx, pos)
+	_ = s.bybit.CancelAllOrders(ctx, pos.Symbol)
+	_ = s.bybit.CancelAllConditionalOrders(ctx, pos.Symbol)
 
 	exSize, hasPos, err := s.syncPositionFromExchange(ctx, pos)
 	if err != nil {
@@ -166,15 +171,20 @@ func (s *Service) placeStopLossCoveringRemainder(
 		return fmt.Errorf("sl qty zero")
 	}
 	side := closeSide(pos.Direction)
-	slID, err := s.bybit.PlaceReduceLimit(ctx, pos.Symbol, side, qty, pos.QtyStep, bybit.FormatPrice(price))
+	triggerDir := 2
+	if pos.Direction == "SHORT" {
+		triggerDir = 1
+	}
+	slID, err := s.bybit.PlaceStopMarket(ctx, pos.Symbol, side, qty, pos.QtyStep, bybit.FormatPrice(price), triggerDir)
 	if err != nil {
-		return fmt.Errorf("sl limit: %w", err)
+		return fmt.Errorf("sl stop-market: %w", err)
 	}
 	pos.StopLossOrder = &models.ExitOrder{
 		OrderID: slID,
 		Price:   price,
 		Qty:     qty,
 		Kind:    kind,
+		IsStop:  true,
 	}
 	metrics.OrdersPlaced.WithLabelValues("stop_loss").Inc()
 	s.logger.Info("sl order placed",
@@ -217,7 +227,11 @@ func (s *Service) atomicReplaceStopLoss(ctx context.Context, pos *models.ActiveP
 	if makerExit {
 		newID, err = s.bybit.PlaceReducePostOnlyLimit(ctx, pos.Symbol, side, qty, pos.QtyStep, bybit.FormatPrice(price))
 	} else {
-		newID, err = s.bybit.PlaceReduceLimit(ctx, pos.Symbol, side, qty, pos.QtyStep, bybit.FormatPrice(price))
+		triggerDir := 2
+		if pos.Direction == "SHORT" {
+			triggerDir = 1
+		}
+		newID, err = s.bybit.PlaceStopMarket(ctx, pos.Symbol, side, qty, pos.QtyStep, bybit.FormatPrice(price), triggerDir)
 	}
 	if err != nil {
 		return fmt.Errorf("atomic sl place: %w", err)
@@ -230,8 +244,14 @@ func (s *Service) atomicReplaceStopLoss(ctx context.Context, pos *models.ActiveP
 	}
 
 	if old != nil && !old.Filled && old.OrderID != "" && old.OrderID != newID {
-		if err := s.bybit.CancelOrder(ctx, pos.Symbol, old.OrderID); err != nil {
-			s.logger.Warn("atomic sl cancel old failed", "symbol", pos.Symbol, "order_id", old.OrderID, "error", err)
+		if old.IsStop {
+			if err := s.bybit.CancelStopOrder(ctx, pos.Symbol, old.OrderID); err != nil {
+				s.logger.Warn("atomic sl cancel old failed", "symbol", pos.Symbol, "order_id", old.OrderID, "error", err)
+			}
+		} else {
+			if err := s.bybit.CancelOrder(ctx, pos.Symbol, old.OrderID); err != nil {
+				s.logger.Warn("atomic sl cancel old failed", "symbol", pos.Symbol, "order_id", old.OrderID, "error", err)
+			}
 		}
 	}
 
@@ -241,6 +261,7 @@ func (s *Service) atomicReplaceStopLoss(ctx context.Context, pos *models.ActiveP
 		Price:   price,
 		Qty:     qty,
 		Kind:    kind,
+		IsStop:  !makerExit,
 	}
 	s.logger.Info("stop loss atomically replaced",
 		"symbol", pos.Symbol,
@@ -314,8 +335,14 @@ func (s *Service) refreshExitOrder(ctx context.Context, symbol string, order *mo
 
 func (s *Service) cancelExitOrders(ctx context.Context, pos *models.ActivePosition) {
 	if pos.StopLossOrder != nil && !pos.StopLossOrder.Filled && pos.StopLossOrder.OrderID != "" {
-		if err := s.bybit.CancelOrder(ctx, pos.Symbol, pos.StopLossOrder.OrderID); err != nil {
-			s.logger.Warn("cancel sl failed", "symbol", pos.Symbol, "order_id", pos.StopLossOrder.OrderID, "error", err)
+		if pos.StopLossOrder.IsStop {
+			if err := s.bybit.CancelStopOrder(ctx, pos.Symbol, pos.StopLossOrder.OrderID); err != nil {
+				s.logger.Warn("cancel sl failed", "symbol", pos.Symbol, "order_id", pos.StopLossOrder.OrderID, "error", err)
+			}
+		} else {
+			if err := s.bybit.CancelOrder(ctx, pos.Symbol, pos.StopLossOrder.OrderID); err != nil {
+				s.logger.Warn("cancel sl failed", "symbol", pos.Symbol, "order_id", pos.StopLossOrder.OrderID, "error", err)
+			}
 		}
 	}
 	for i := range pos.TakeProfitOrders {
@@ -408,7 +435,79 @@ func (s *Service) monitorExitOrders(ctx context.Context, pos *models.ActivePosit
 		}
 	}
 
+	// Trailing SL: after breakeven, trail SL to lock in profits.
+	if pos.BreakevenSet && !pos.TimeStopPlaced {
+		s.maybeTrailStopLoss(ctx, pos, exSize)
+	}
+
 	return false
+}
+
+// maybeTrailStopLoss moves SL tighter when price has moved significantly in our favor.
+// Logic: after breakeven, if price is > 1.5R from entry, trail SL to 0.8R lock.
+func (s *Service) maybeTrailStopLoss(ctx context.Context, pos *models.ActivePosition, exSize float64) {
+	if pos.StopLossOrder == nil || pos.StopLossOrder.Filled {
+		return
+	}
+
+	ob, err := s.redis.GetOrderbook(ctx, pos.Symbol)
+	if err != nil {
+		return
+	}
+	mid := grid.MidPrice(ob)
+	if mid <= 0 {
+		return
+	}
+
+	risk := math.Abs(pos.FillPrice - pos.StopLoss)
+	if risk <= 0 {
+		return
+	}
+
+	var newSL float64
+	switch pos.Direction {
+	case "LONG":
+		profitDist := mid - pos.FillPrice
+		if profitDist < risk*1.5 {
+			return
+		}
+		// Trail: lock 0.8R of current profit
+		newSL = mid - risk*0.8
+		if newSL <= pos.StopLoss {
+			return
+		}
+	case "SHORT":
+		profitDist := pos.FillPrice - mid
+		if profitDist < risk*1.5 {
+			return
+		}
+		newSL = mid + risk*0.8
+		if newSL >= pos.StopLoss {
+			return
+		}
+	default:
+		return
+	}
+
+	newSL = grid.RoundToTick(newSL, pos.TickSize)
+	newSL = s.enforceSLPrice(pos, newSL, pos.TickSize)
+
+	slQty := s.slCoverQty(pos, exSize)
+	if slQty <= 0 {
+		return
+	}
+
+	if err := s.atomicReplaceStopLoss(ctx, pos, newSL, slQty, "stop_loss"); err != nil {
+		s.logger.Warn("trailing SL failed", "symbol", pos.Symbol, "error", err)
+		return
+	}
+	s.logger.Info("trailing SL moved",
+		"symbol", pos.Symbol,
+		"old_sl", pos.StopLoss,
+		"new_sl", newSL,
+		"mid", mid,
+		"fill", pos.FillPrice,
+	)
 }
 
 func (s *Service) tryFinalizePosition(ctx context.Context, pos *models.ActivePosition, reason string, fallbackExit float64) {
@@ -428,6 +527,14 @@ func (s *Service) retryMissingTakeProfits(ctx context.Context, pos *models.Activ
 		return
 	}
 	if time.Now().UnixMilli()-pos.FilledAt > 60_000 {
+		return
+	}
+	exSize, hasPos, err := s.syncPositionFromExchange(ctx, pos)
+	if err != nil || !hasPos || exSize <= 0 {
+		return
+	}
+	if exSize <= pos.MinOrderQty*1.01 {
+		pos.ExitGridReady = true
 		return
 	}
 	pos.ExitGridReady = false

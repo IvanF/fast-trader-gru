@@ -24,6 +24,7 @@ class Config:
     kill_confidence_threshold: float
     entry_abort_threshold: float
     adverse_confirm_ticks: int
+    direction_flip_confirm_ticks: int
     decay_obi_threshold: float
     max_signal_confidence: float
     blacklist_symbols: frozenset[str]
@@ -78,6 +79,7 @@ class Config:
             kill_confidence_threshold=float(os.getenv("KILL_CONFIDENCE_THRESHOLD", "0.35")),
             entry_abort_threshold=float(os.getenv("ENTRY_ABORT_THRESHOLD", "0.50")),
             adverse_confirm_ticks=int(os.getenv("ADVERSE_CONFIRM_TICKS", os.getenv("DECAY_OBI_MIN_TICKS", "3"))),
+            direction_flip_confirm_ticks=int(os.getenv("DIRECTION_FLIP_CONFIRM_TICKS", "5")),
             decay_obi_threshold=float(os.getenv("DECAY_OBI_THRESHOLD", "0.30")),
             max_signal_confidence=float(os.getenv("MAX_SIGNAL_CONFIDENCE", "0.98")),
             blacklist_symbols=cls._parse_symbol_set(os.getenv("BLACKLIST_SYMBOLS", "")),
