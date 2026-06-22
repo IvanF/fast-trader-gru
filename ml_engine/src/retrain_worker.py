@@ -121,16 +121,38 @@ class RollingRetrainWorker:
                     logger.info("train stdout:\n%s", result.stdout[-2000:])
             elif result.returncode == 3:
                 logger.warning(
-                    "retrain skipped (insufficient InfluxDB samples — need closed trades): reason=%s\n%s",
+                    "retrain skipped (insufficient samples): reason=%s\n%s",
                     reason,
                     (result.stdout or result.stderr)[-1000:],
                 )
             elif result.returncode == 4:
-                prom.retrain_failures.inc()
-                logger.error(
-                    "retrain failed: CUDA not available (TRAIN_DEVICE=cuda). "
-                    "Ensure gpus: all and nvidia-container-toolkit.\n%s",
-                    (result.stderr or result.stdout)[-1000:],
+                logger.warning("CUDA failed, retrying with CPU...")
+                cmd_cpu = cmd[:-1] + ["cpu"]
+                try:
+                    result_cpu = subprocess.run(
+                        cmd_cpu,
+                        capture_output=True, text=True,
+                        timeout=self.cfg.retrain_timeout_sec,
+                        env={**os.environ, "MODEL_DIR": self.cfg.model_dir, "TRAIN_DEVICE": "cpu"},
+                    )
+                    duration_cpu = time.time() - start
+                    prom.retrain_duration.observe(duration_cpu)
+                    self._apply_report(result_cpu.returncode, duration_cpu)
+                    if result_cpu.returncode == 0:
+                        logger.info("retrain completed on CPU in %.1fs reason=%s", duration_cpu, reason)
+                        if result_cpu.stdout:
+                            logger.info("train stdout:\n%s", result_cpu.stdout[-2000:])
+                    else:
+                        prom.retrain_failures.inc()
+                        logger.error("retrain failed on CPU: code=%d\n%s", result_cpu.returncode, result_cpu.stderr[-500:])
+                except Exception as exc:
+                    prom.retrain_failures.inc()
+                    logger.error("CPU retry failed: %s", exc)
+            elif result.returncode == 5:
+                logger.warning(
+                    "retrain rejected: new model not better than previous. reason=%s\n%s",
+                    reason,
+                    (result.stdout or result.stderr)[-1000:],
                 )
             else:
                 prom.retrain_failures.inc()

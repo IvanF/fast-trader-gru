@@ -19,9 +19,13 @@ class RegimeDetector:
     def __init__(self, ema_alpha: float = 0.1) -> None:
         self.ema_alpha = ema_alpha
         self._ema_std: Dict[str, float] = {}
-        self._gmm = GaussianMixture(n_components=3, random_state=42, max_iter=50)
-        self._fitted = False
+        self._gmms: Dict[str, GaussianMixture] = {}
         self._regimes: Dict[str, Regime] = {}
+
+    def _get_gmm(self, symbol: str) -> GaussianMixture:
+        if symbol not in self._gmms:
+            self._gmms[symbol] = GaussianMixture(n_components=3, random_state=42, max_iter=50)
+        return self._gmms[symbol]
 
     def update(self, symbol: str, returns: np.ndarray) -> Regime:
         if len(returns) < 5:
@@ -38,9 +42,9 @@ class RegimeDetector:
         ])
         if len(features) >= 10:
             try:
-                self._gmm.fit(features)
-                self._fitted = True
-                label = int(self._gmm.predict(features[-1:])[0])
+                gmm = self._get_gmm(symbol)
+                gmm.fit(features)
+                label = int(gmm.predict(features[-1:])[0])
             except Exception:
                 label = 1
         else:

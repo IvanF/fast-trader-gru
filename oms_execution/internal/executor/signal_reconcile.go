@@ -232,7 +232,7 @@ func (s *Service) redeployExitGrid(
 	if plannedSL <= 0 {
 		plannedSL = plan.StopLoss
 	}
-	newSL := s.enforceSLPrice(pos, plannedSL, pos.TickSize)
+	newSL := s.enforceSLPrice(ctx, pos, plannedSL, pos.TickSize)
 	newSL = clampSLTightenOnly(pos.Direction, pos.StopLoss, newSL)
 
 	slQty := s.slCoverQty(pos, exSize)
@@ -248,9 +248,12 @@ func (s *Service) redeployExitGrid(
 	}
 
 	if s.tpGridNeedsRefresh(pos, plan, ob, exSize) {
+		tpRefPrice := pos.FillPrice
+		opts := s.exitGridOpts()
+		opts.MaxTPPct = 0
 		exitGrid := grid.BuildExitGrid(
-			pos.Direction, pos.FillPrice, plannedEntry, newSL, ob, pos.Signal,
-			pos.TickSize, exSize, pos.QtyStep, pos.MinOrderQty, s.exitGridOpts(),
+			pos.Direction, tpRefPrice, plannedEntry, newSL, ob, pos.Signal,
+			pos.TickSize, exSize, pos.QtyStep, pos.MinOrderQty, opts,
 		)
 		if len(exitGrid.TakeProfits) == 0 {
 			pos.LastGridDeployAt = time.Now().UnixMilli()

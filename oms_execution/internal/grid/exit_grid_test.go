@@ -2,8 +2,6 @@ package grid
 
 import (
 	"testing"
-
-	"github.com/fast-trader-gru/oms_execution/internal/bybit"
 )
 
 func TestFinalizeGridAllocationReservesSL(t *testing.T) {
@@ -29,7 +27,8 @@ func TestFinalizeGridAllocationReservesSL(t *testing.T) {
 	if grid.StopLoss.Qty <= 0 {
 		t.Fatalf("sl qty must be > 0, got %.4f", grid.StopLoss.Qty)
 	}
-	if bybit.NormalizeQty(tpSum+grid.StopLoss.Qty, step, minQty) != bybit.NormalizeQty(total, step, minQty) {
-		t.Fatalf("tp+sl = %.4f + %.4f != total %.4f", tpSum, grid.StopLoss.Qty, total)
+	// SL covers full position (TP orders are reduce-only)
+	if grid.StopLoss.Qty < total {
+		t.Fatalf("sl qty %.4f must be >= total %.4f (full coverage)", grid.StopLoss.Qty, total)
 	}
 }

@@ -9,16 +9,15 @@ import torch
 
 
 def resolve_train_device(device_name: str | None = None) -> torch.device:
-    """Return training device. Default TRAIN_DEVICE=cuda; fails if CUDA unavailable."""
+    """Return training device. Default TRAIN_DEVICE=cuda; falls back to CPU if unavailable."""
     want = (device_name or os.getenv("TRAIN_DEVICE", "cuda")).lower()
     if want == "cuda":
         if not torch.cuda.is_available():
             print(
-                "TRAIN_DEVICE=cuda but CUDA is not available. "
-                "Check NVIDIA driver, nvidia-container-toolkit, and docker-compose gpus: all.",
+                "TRAIN_DEVICE=cuda but CUDA is not available, falling back to CPU",
                 file=sys.stderr,
             )
-            sys.exit(4)
+            return torch.device("cpu")
         name = torch.cuda.get_device_name(0)
         print(f"training device=cuda ({name})")
         return torch.device("cuda")

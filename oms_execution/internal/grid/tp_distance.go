@@ -111,5 +111,21 @@ func applyTPPriceFloors(
 		lv.Price = price
 		out = append(out, lv)
 	}
+
+	if direction == "SHORT" {
+		offset := math.Max(fillPrice*0.001, tickSize*5)
+		for i := len(out) - 1; i >= 1; i-- {
+			if out[i].Price >= out[i-1].Price {
+				out[i].Price = out[i-1].Price - offset
+			}
+		}
+	} else if direction == "LONG" {
+		offset := math.Max(fillPrice*0.001, tickSize*5)
+		for i := len(out) - 1; i >= 1; i-- {
+			if out[i].Price <= out[i-1].Price {
+				out[i].Price = out[i-1].Price + offset
+			}
+		}
+	}
 	return out
 }

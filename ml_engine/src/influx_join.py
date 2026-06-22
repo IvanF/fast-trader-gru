@@ -26,7 +26,12 @@ def _direction_label(direction: str, pnl: float) -> int:
 def _confidence_label(pnl: float, entry: float) -> float:
     if entry <= 0:
         return 0.5
-    return float(np.clip(abs(pnl / entry), 0.0, 1.0))
+    raw = abs(pnl / entry)
+    if raw < 0.001:
+        return 0.1
+    if pnl > 0:
+        return float(np.clip(0.5 + raw * 10, 0.5, 1.0))
+    return float(np.clip(0.5 - raw * 10, 0.0, 0.5))
 
 
 def _rows_to_sequences(rows: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -72,7 +77,7 @@ def _rows_to_sequences(rows: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarr
     if len(prices) >= 2:
         macro[4] = (prices[-1] - prices[0]) / max(prices[0], 1e-8)
     if len(prices) >= 10:
-        macro[5] = (prices[-1] - prices[0]) / max(prices[0], 1e-8)
+        macro[5] = (prices[-1] - prices[len(prices)//2]) / max(prices[len(prices)//2], 1e-8)
     if sizes and prices:
         vwap = sum(p * s for p, s in zip(prices, sizes)) / max(sum(sizes), 1e-8)
         macro[3] = (prices[-1] - vwap) / max(vwap, 1e-8)
@@ -117,9 +122,13 @@ def build_joined_dataset(
 
         memory_vec = np.array([
             1.0 if pnl >= 0 else 0.0,
-            pnl,
-            np.tanh(pnl / 100),
-            1.0, 0.0, 0.0, 0.0, 0.0,
+            np.tanh(pnl * 10),
+            np.tanh(float(outcome.get("holding_time_ms", 0)) / 3600000),
+            1.0 if direction == "LONG" else 0.0,
+            1.0 if direction == "SHORT" else 0.0,
+            float(outcome.get("grid_levels", 0)) / 10.0,
+            float(np.clip(abs(pnl / entry) * 100, 0, 1.0)) if entry > 0 else 0.0,
+            1.0,
         ], dtype=np.float32)
 
         ob_list.append(ob_seq)

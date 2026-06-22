@@ -423,3 +423,437 @@ Avg PnL/trade: $-0.011784
 SL/fee hits: 0 (0%)
 Avg hold time: 2793s
 
+=== 2026-06-19 23:11:00 ===
+Trades: 12 | Wins: 6 | Losses: 6
+Win rate: 50.0%
+Total PnL: $-0.0747
+Avg PnL/trade: $-0.006229
+SL/fee hits: 0 (0%)
+Avg hold time: 2400s
+
+=== 2026-06-19 23:26:00 ===
+Trades: 12 | Wins: 6 | Losses: 6
+Win rate: 50.0%
+Total PnL: $-0.0747
+Avg PnL/trade: $-0.006229
+SL/fee hits: 0 (0%)
+Avg hold time: 2400s
+
+=== 2026-06-19 23:41:00 ===
+Trades: 13 | Wins: 7 | Losses: 6
+Win rate: 53.8%
+Total PnL: $-0.0619
+Avg PnL/trade: $-0.004759
+SL/fee hits: 0 (0%)
+Avg hold time: 2290s
+
+=== 2026-06-19 23:56:00 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 00:11:00 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 00:26:00 ===
+Trades: 1 | Wins: 0 | Losses: 1
+Win rate: 0.0%
+Total PnL: $-0.0150
+Avg PnL/trade: $-0.014954
+SL/fee hits: 0 (0%)
+Avg hold time: 1387s
+
+=== 2026-06-20 00:41:00 ===
+Trades: 1 | Wins: 0 | Losses: 1
+Win rate: 0.0%
+Total PnL: $-0.0150
+Avg PnL/trade: $-0.014954
+SL/fee hits: 0 (0%)
+Avg hold time: 1387s
+
+=== 2026-06-20 00:56:00 ===
+Trades: 1 | Wins: 0 | Losses: 1
+Win rate: 0.0%
+Total PnL: $-0.0150
+Avg PnL/trade: $-0.014954
+SL/fee hits: 0 (0%)
+Avg hold time: 1387s
+
+=== 2026-06-20 01:11:00 ===
+Trades: 2 | Wins: 0 | Losses: 2
+Win rate: 0.0%
+Total PnL: $-0.1880
+Avg PnL/trade: $-0.094013
+SL/fee hits: 0 (0%)
+Avg hold time: 1378s
+
+=== 2026-06-20 01:26:00 ===
+Trades: 4 | Wins: 0 | Losses: 4
+Win rate: 0.0%
+Total PnL: $-0.7808
+Avg PnL/trade: $-0.195199
+SL/fee hits: 0 (0%)
+Avg hold time: 1635s
+
+=== 2026-06-20 01:41:00 ===
+Trades: 4 | Wins: 0 | Losses: 4
+Win rate: 0.0%
+Total PnL: $-0.7808
+Avg PnL/trade: $-0.195199
+SL/fee hits: 0 (0%)
+Avg hold time: 1635s
+
+=== 2026-06-20 01:56:00 ===
+Trades: 5 | Wins: 0 | Losses: 5
+Win rate: 0.0%
+Total PnL: $-0.7983
+Avg PnL/trade: $-0.159657
+SL/fee hits: 0 (0%)
+Avg hold time: 2162s
+
+=== 2026-06-20 02:11:00 ===
+Trades: 5 | Wins: 0 | Losses: 5
+Win rate: 0.0%
+Total PnL: $-0.7983
+Avg PnL/trade: $-0.159657
+SL/fee hits: 0 (0%)
+Avg hold time: 2162s
+
+=== 2026-06-20 02:26:00 ===
+Trades: 5 | Wins: 0 | Losses: 5
+Win rate: 0.0%
+Total PnL: $-0.7983
+Avg PnL/trade: $-0.159657
+SL/fee hits: 0 (0%)
+Avg hold time: 2162s
+
+=== 2026-06-20 02:41:00 ===
+Trades: 5 | Wins: 0 | Losses: 5
+Win rate: 0.0%
+Total PnL: $-0.7983
+Avg PnL/trade: $-0.159657
+SL/fee hits: 0 (0%)
+Avg hold time: 2162s
+
+=== 2026-06-20 02:56:00 ===
+Trades: 6 | Wins: 0 | Losses: 6
+Win rate: 0.0%
+Total PnL: $-0.8012
+Avg PnL/trade: $-0.133538
+SL/fee hits: 0 (0%)
+Avg hold time: 3411s
+
+=== 2026-06-20 03:11:00 ===
+Trades: 8 | Wins: 0 | Losses: 8
+Win rate: 0.0%
+Total PnL: $-0.9868
+Avg PnL/trade: $-0.123355
+SL/fee hits: 0 (0%)
+Avg hold time: 2941s
+
+=== 2026-06-20 03:26:00 ===
+Trades: 8 | Wins: 0 | Losses: 8
+Win rate: 0.0%
+Total PnL: $-0.9868
+Avg PnL/trade: $-0.123355
+SL/fee hits: 0 (0%)
+Avg hold time: 2941s
+
+=== 2026-06-20 03:41:01 ===
+Trades: 9 | Wins: 0 | Losses: 9
+Win rate: 0.0%
+Total PnL: $-1.3015
+Avg PnL/trade: $-0.144610
+SL/fee hits: 0 (0%)
+Avg hold time: 3036s
+
+=== 2026-06-20 03:56:01 ===
+Trades: 9 | Wins: 0 | Losses: 9
+Win rate: 0.0%
+Total PnL: $-1.3015
+Avg PnL/trade: $-0.144610
+SL/fee hits: 0 (0%)
+Avg hold time: 3036s
+
+=== 2026-06-20 04:11:01 ===
+Trades: 10 | Wins: 0 | Losses: 10
+Win rate: 0.0%
+Total PnL: $-1.5260
+Avg PnL/trade: $-0.152598
+SL/fee hits: 1 (10%)
+Avg hold time: 3970s
+
+=== 2026-06-20 04:26:01 ===
+Trades: 10 | Wins: 0 | Losses: 10
+Win rate: 0.0%
+Total PnL: $-1.5260
+Avg PnL/trade: $-0.152598
+SL/fee hits: 1 (10%)
+Avg hold time: 3970s
+
+=== 2026-06-20 04:41:01 ===
+Trades: 12 | Wins: 0 | Losses: 12
+Win rate: 0.0%
+Total PnL: $-1.7067
+Avg PnL/trade: $-0.142226
+SL/fee hits: 1 (8%)
+Avg hold time: 4723s
+
+=== 2026-06-20 04:56:01 ===
+Trades: 12 | Wins: 0 | Losses: 12
+Win rate: 0.0%
+Total PnL: $-1.7067
+Avg PnL/trade: $-0.142226
+SL/fee hits: 1 (8%)
+Avg hold time: 4723s
+
+=== 2026-06-20 05:11:01 ===
+Trades: 14 | Wins: 0 | Losses: 14
+Win rate: 0.0%
+Total PnL: $-1.8924
+Avg PnL/trade: $-0.135171
+SL/fee hits: 1 (7%)
+Avg hold time: 4596s
+
+=== 2026-06-20 05:26:01 ===
+Trades: 14 | Wins: 0 | Losses: 14
+Win rate: 0.0%
+Total PnL: $-1.8924
+Avg PnL/trade: $-0.135171
+SL/fee hits: 1 (7%)
+Avg hold time: 4596s
+
+=== 2026-06-20 05:41:01 ===
+Trades: 14 | Wins: 0 | Losses: 14
+Win rate: 0.0%
+Total PnL: $-1.8924
+Avg PnL/trade: $-0.135171
+SL/fee hits: 1 (7%)
+Avg hold time: 4596s
+
+=== 2026-06-20 05:56:01 ===
+Trades: 14 | Wins: 0 | Losses: 14
+Win rate: 0.0%
+Total PnL: $-1.8924
+Avg PnL/trade: $-0.135171
+SL/fee hits: 1 (7%)
+Avg hold time: 4596s
+
+=== 2026-06-20 06:11:01 ===
+Trades: 14 | Wins: 0 | Losses: 14
+Win rate: 0.0%
+Total PnL: $-1.8924
+Avg PnL/trade: $-0.135171
+SL/fee hits: 1 (7%)
+Avg hold time: 4596s
+
+=== 2026-06-20 06:26:01 ===
+Trades: 15 | Wins: 1 | Losses: 14
+Win rate: 6.7%
+Total PnL: $-1.8823
+Avg PnL/trade: $-0.125489
+SL/fee hits: 1 (7%)
+Avg hold time: 4712s
+
+=== 2026-06-20 06:41:01 ===
+Trades: 15 | Wins: 1 | Losses: 14
+Win rate: 6.7%
+Total PnL: $-1.8823
+Avg PnL/trade: $-0.125489
+SL/fee hits: 1 (7%)
+Avg hold time: 4712s
+
+=== 2026-06-20 06:56:01 ===
+Trades: 15 | Wins: 1 | Losses: 14
+Win rate: 6.7%
+Total PnL: $-1.8823
+Avg PnL/trade: $-0.125489
+SL/fee hits: 1 (7%)
+Avg hold time: 4712s
+
+=== 2026-06-20 07:11:01 ===
+Trades: 15 | Wins: 1 | Losses: 14
+Win rate: 6.7%
+Total PnL: $-1.8823
+Avg PnL/trade: $-0.125489
+SL/fee hits: 1 (7%)
+Avg hold time: 4712s
+
+=== 2026-06-20 07:26:01 ===
+Trades: 16 | Wins: 1 | Losses: 15
+Win rate: 6.2%
+Total PnL: $-2.0161
+Avg PnL/trade: $-0.126009
+SL/fee hits: 1 (6%)
+Avg hold time: 4649s
+
+=== 2026-06-20 07:41:01 ===
+Trades: 16 | Wins: 1 | Losses: 15
+Win rate: 6.2%
+Total PnL: $-2.0161
+Avg PnL/trade: $-0.126009
+SL/fee hits: 1 (6%)
+Avg hold time: 4649s
+
+=== 2026-06-20 07:56:01 ===
+Trades: 17 | Wins: 2 | Losses: 15
+Win rate: 11.8%
+Total PnL: $-2.0047
+Avg PnL/trade: $-0.117925
+SL/fee hits: 1 (6%)
+Avg hold time: 4449s
+
+=== 2026-06-20 08:11:01 ===
+Trades: 18 | Wins: 2 | Losses: 16
+Win rate: 11.1%
+Total PnL: $-2.3029
+Avg PnL/trade: $-0.127940
+SL/fee hits: 2 (11%)
+Avg hold time: 4479s
+
+=== 2026-06-20 08:26:01 ===
+Trades: 18 | Wins: 2 | Losses: 16
+Win rate: 11.1%
+Total PnL: $-2.3029
+Avg PnL/trade: $-0.127940
+SL/fee hits: 2 (11%)
+Avg hold time: 4479s
+
+=== 2026-06-20 08:41:01 ===
+Trades: 18 | Wins: 2 | Losses: 16
+Win rate: 11.1%
+Total PnL: $-2.3029
+Avg PnL/trade: $-0.127940
+SL/fee hits: 2 (11%)
+Avg hold time: 4479s
+
+=== 2026-06-20 08:56:02 ===
+Trades: 18 | Wins: 2 | Losses: 16
+Win rate: 11.1%
+Total PnL: $-2.3029
+Avg PnL/trade: $-0.127940
+SL/fee hits: 2 (11%)
+Avg hold time: 4479s
+
+=== 2026-06-20 09:11:02 ===
+Trades: 19 | Wins: 3 | Losses: 16
+Win rate: 15.8%
+Total PnL: $-2.2925
+Avg PnL/trade: $-0.120658
+SL/fee hits: 2 (11%)
+Avg hold time: 4500s
+
+=== 2026-06-20 09:26:02 ===
+Trades: 19 | Wins: 3 | Losses: 16
+Win rate: 15.8%
+Total PnL: $-2.2925
+Avg PnL/trade: $-0.120658
+SL/fee hits: 2 (11%)
+Avg hold time: 4500s
+
+=== 2026-06-20 09:41:02 ===
+Trades: 20 | Wins: 3 | Losses: 17
+Win rate: 15.0%
+Total PnL: $-2.4823
+Avg PnL/trade: $-0.124115
+SL/fee hits: 2 (10%)
+Avg hold time: 5176s
+
+=== 2026-06-20 09:56:02 ===
+Trades: 20 | Wins: 3 | Losses: 17
+Win rate: 15.0%
+Total PnL: $-2.4823
+Avg PnL/trade: $-0.124115
+SL/fee hits: 2 (10%)
+Avg hold time: 5176s
+
+=== 2026-06-20 10:11:02 ===
+Trades: 20 | Wins: 3 | Losses: 17
+Win rate: 15.0%
+Total PnL: $-2.4823
+Avg PnL/trade: $-0.124115
+SL/fee hits: 2 (10%)
+Avg hold time: 5176s
+
+=== 2026-06-20 10:26:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 10:41:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 10:56:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 11:11:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 11:26:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 11:41:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 11:56:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 12:11:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 12:26:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 12:41:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 12:56:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 13:11:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 13:26:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 13:41:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 13:56:02 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 14:11:03 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 14:26:03 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 14:41:03 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 14:56:03 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 15:11:03 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 15:26:03 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 15:41:03 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 15:56:03 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 16:11:03 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 16:26:03 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 16:41:03 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 16:56:03 ===
+Trades: 0 | Wins: 0 | Losses: 0
+
+=== 2026-06-20 17:11:03 ===
+Trades: 0 | Wins: 0 | Losses: 0
+

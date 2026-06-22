@@ -58,8 +58,6 @@ func BuildExitGrid(
 		vm = 1.0
 	}
 
-	// ATR-based SL: use regime-scaled risk distance instead of fixed wall-based.
-	// risk already comes from the ML exit plan; scale by regime if it's too tight.
 	atrMult := atrSLMultiplier(signal.Regime)
 	minRisk := fillPrice * opts.MinSLPct
 	atrRisk := risk * atrMult
@@ -68,8 +66,36 @@ func BuildExitGrid(
 	}
 	risk = atrRisk
 
+	// When price moved against position, recalculate risk from current price
+	if direction == "SHORT" && fillPrice > plannedEntry {
+		risk = fillPrice - slPrice
+		if risk < minRisk {
+			risk = minRisk
+		}
+	} else if direction == "LONG" && fillPrice < plannedEntry {
+		risk = slPrice - fillPrice
+		if risk < minRisk {
+			risk = minRisk
+		}
+	}
+
 	if risk <= 0 {
 		risk = baseGridSpacing * fillPrice
+	}
+
+	// For profitable positions, scale TP risk to be closer to current price
+	profitDist := 0.0
+	if direction == "LONG" && fillPrice > plannedEntry {
+		profitDist = fillPrice - plannedEntry
+	} else if direction == "SHORT" && fillPrice < plannedEntry {
+		profitDist = plannedEntry - fillPrice
+	}
+	if profitDist > 0 && risk > minRisk {
+		tpRisk := risk - profitDist*0.5
+		if tpRisk < minRisk {
+			tpRisk = minRisk
+		}
+		risk = tpRisk
 	}
 
 	rangePct := baseGridSpacing * vm * 4
@@ -140,11 +166,16 @@ func buildHeuristicTPs(
 		if wallPrice <= fillPrice {
 			wallPrice = roundToTick(fillPrice+risk, tickSize)
 		}
+		if wallPrice <= fillPrice+risk*0.3 {
+			wallPrice = roundToTick(fillPrice+risk*0.5, tickSize)
+		}
 	} else {
 		wall := liquidity.FindSupportWall(ob, fillPrice, rangePct)
 		wallPrice = roundToTick(wall.Price+wallOffset, tickSize)
-		if wallPrice >= fillPrice {
-			wallPrice = roundToTick(fillPrice-risk, tickSize)
+		// For SHORT, wall TP should be ABOVE support (where price bounces)
+		// Don't adjust to fillPrice-risk — keep at support level
+		if wallPrice <= 0 || wallPrice >= fillPrice {
+			wallPrice = roundToTick(fillPrice-risk*0.5, tickSize)
 		}
 	}
 	wallQty := qtyFromWeight(tpBudget, tpLevelWeights[1], qtyStep, minQty)
@@ -198,6 +229,7 @@ func qtyFromWeight(budget, weight, qtyStep, minQty float64) float64 {
 }
 
 func finalizeGridAllocation(grid *ExitGrid, totalQty, qtyStep, minQty, tpBudgetPct float64) {
+	originalQty := totalQty
 	totalQty = bybit.NormalizeQty(totalQty, qtyStep, minQty)
 	if totalQty <= 0 {
 		return
@@ -205,8 +237,22 @@ func finalizeGridAllocation(grid *ExitGrid, totalQty, qtyStep, minQty, tpBudgetP
 
 	maxTPQty := totalQty - minQty
 	if maxTPQty < minQty {
-		grid.TakeProfits = nil
-		grid.StopLoss.Qty = totalQty
+		if len(grid.TakeProfits) > 0 {
+			tpQty := originalQty
+			if tpQty < minQty {
+				tpQty = totalQty
+			}
+			tpQty = bybit.NormalizeQty(tpQty, qtyStep, minQty)
+			grid.TakeProfits = []ExitLevel{{
+				Price: grid.TakeProfits[0].Price,
+				Qty:   tpQty,
+				Kind:  "breakeven",
+			}}
+			grid.StopLoss.Qty = 0
+		} else {
+			grid.TakeProfits = nil
+			grid.StopLoss.Qty = totalQty
+		}
 		return
 	}
 
@@ -232,7 +278,7 @@ func finalizeGridAllocation(grid *ExitGrid, totalQty, qtyStep, minQty, tpBudgetP
 		grid.TakeProfits = trimmed
 	}
 
-	slQty := bybit.NormalizeQty(totalQty-tpSum, qtyStep, minQty)
+	slQty := bybit.NormalizeQty(totalQty, qtyStep, minQty)
 	if slQty <= 0 && tpSum < totalQty {
 		trimmed := make([]ExitLevel, 0, len(grid.TakeProfits))
 		tpSum = 0
@@ -251,8 +297,11 @@ func finalizeGridAllocation(grid *ExitGrid, totalQty, qtyStep, minQty, tpBudgetP
 		slQty = bybit.NormalizeQty(totalQty-tpSum, qtyStep, minQty)
 	}
 	if slQty <= 0 {
-		grid.TakeProfits = nil
-		slQty = totalQty
+		slQty = originalQty
+		if slQty < minQty {
+			slQty = totalQty
+		}
+		slQty = bybit.NormalizeQty(slQty, qtyStep, minQty)
 	}
 	grid.StopLoss.Qty = slQty
 }

@@ -32,6 +32,8 @@ from src.onnx_deploy import export_onnx_models, promote_models, publish_reload, 
 from src.train_device import resolve_train_device
 
 REPORT_PATH = os.getenv("RETRAIN_REPORT_PATH", "/app/data/retrain_report.json")
+MIN_SAMPLES = int(os.getenv("RETRAIN_MIN_SAMPLES", "20"))
+MIN_VAL_ACC = float(os.getenv("RETRAIN_MIN_VAL_ACC", "0.45"))
 
 # Regularization defaults — prevent confidence logit saturation (sigmoid → 1.0).
 DEFAULT_LABEL_SMOOTHING = float(os.getenv("TRAIN_LABEL_SMOOTHING", "0.1"))
@@ -55,7 +57,7 @@ def apply_low_priority(nice_level: int = 15) -> None:
 
 
 class AsymmetricTradingLoss(nn.Module):
-    """Cross-entropy with label smoothing and higher penalty on losing trades."""
+    """Cross-entropy with label smoothing, direction balancing, and higher penalty on losing trades."""
 
     def __init__(self, loss_penalty: float = 2.5, label_smoothing: float = 0.1) -> None:
         super().__init__()
@@ -68,23 +70,28 @@ class AsymmetricTradingLoss(nn.Module):
         direction: torch.Tensor,
         pnl: torch.Tensor,
     ) -> torch.Tensor:
+        num_classes = 3
+        class_counts = torch.bincount(direction, minlength=num_classes).float()
+        class_weights = num_classes / (class_counts + 1e-8)
+        class_weights = class_weights / class_weights.sum() * num_classes
+        weights = class_weights[direction]
+
         ce = F.cross_entropy(
             logits[:, :3],
             direction,
+            weight=class_weights.to(logits.device),
             reduction="none",
             label_smoothing=self.label_smoothing,
         )
-        # Losing trades and HOLD-on-loss get amplified penalty
         penalty = torch.where(
             pnl < 0,
             torch.full_like(pnl, self.loss_penalty),
             torch.ones_like(pnl),
         )
-        # Wrong direction on negative PnL — extra asymmetric weight
         pred = logits[:, :3].argmax(dim=1)
         wrong = (pred != direction).float()
         penalty = penalty + wrong * (self.loss_penalty - 1.0) * torch.clamp(-pnl, min=0.0)
-        return (ce * penalty).mean()
+        return (ce * weights * penalty).mean()
 
 
 class JoinedDataset(Dataset):
@@ -240,7 +247,7 @@ def main() -> int:
 
     apply_low_priority(args.nice_level)
     start_time = time.time()
-    hours = max(2, min(6, args.hours)) if not args.days else args.days * 24
+    hours = max(2, min(48, args.hours)) if not args.days else args.days * 24
 
     device = resolve_train_device(args.device)
     print(f"lookback={hours}h trigger={args.trigger}")
@@ -268,16 +275,17 @@ def main() -> int:
 
     n = len(data["direction"])
     print(f"training samples: {n}")
-    if n < 5:
+    if n < MIN_SAMPLES:
         report = {
             "exit_code": 3,
             "error": "insufficient_samples",
             "samples": n,
+            "min_required": MIN_SAMPLES,
             "timestamp": time.time(),
             "trigger": args.trigger,
         }
         write_report(report)
-        print("insufficient training samples (need >= 5)", file=sys.stderr)
+        print(f"insufficient training samples (need >= {MIN_SAMPLES})", file=sys.stderr)
         return 3
 
     dataset = JoinedDataset(data)
@@ -328,11 +336,54 @@ def main() -> int:
     if best_state:
         model.load_state_dict(best_state)
 
+    loss_delta = final_loss - initial_loss
+    loss_improved = loss_delta < -0.01
+
+    prev_acc = 0.0
+    prev_version = "none"
+    if os.path.exists(REPORT_PATH):
+        try:
+            with open(REPORT_PATH, "r", encoding="utf-8") as f:
+                prev_report = json.load(f)
+            prev_acc = float(prev_report.get("val_acc", 0))
+            prev_version = str(prev_report.get("version", "unknown"))
+        except (json.JSONDecodeError, KeyError, ValueError):
+            pass
+
+    print(f"previous model: version={prev_version} val_acc={prev_acc:.3f}")
+    print(f"new model: val_acc={best_acc:.3f} loss_delta={loss_delta:.4f}")
+
+    acc_improved = best_acc > prev_acc + 0.02
+    acc_above_min = best_acc >= MIN_VAL_ACC
+    should_promote = (acc_improved or loss_improved) and acc_above_min
+
+    if not should_promote:
+        reason = []
+        if not acc_above_min:
+            reason.append(f"val_acc={best_acc:.3f} < MIN_VAL_ACC={MIN_VAL_ACC}")
+        if not acc_improved and not loss_improved:
+            reason.append(f"no improvement (prev={prev_acc:.3f}, new={best_acc:.3f}, loss_delta={loss_delta:.4f})")
+        print(f"model NOT promoted: {'; '.join(reason)}", file=sys.stderr)
+        report = {
+            "exit_code": 5,
+            "version": "rejected",
+            "new_acc": best_acc,
+            "prev_acc": prev_acc,
+            "prev_version": prev_version,
+            "loss_delta": loss_delta,
+            "samples": n,
+            "reason": "; ".join(reason),
+            "timestamp": time.time(),
+            "trigger": args.trigger,
+        }
+        write_report(report)
+        return 5
+
     staging = os.path.join(args.model_dir, "staging")
     paths = export_onnx_models(model.fusion, model.decision, staging, device=device)
     validate_onnx(paths, prefer_gpu=use_cuda)
     manifest = promote_models(staging, args.model_dir)
-    print(f"promoted version={manifest.version} acc={best_acc:.3f}")
+    print(f"promoted version={manifest.version} acc={best_acc:.3f} (prev={prev_acc:.3f})")
 
     if not args.no_publish:
         redis_addr = os.getenv("REDIS_ADDR", "redis:6379")
@@ -355,8 +406,10 @@ def main() -> int:
         "duration_sec": duration,
         "initial_loss": initial_loss,
         "final_loss": final_loss,
-        "loss_delta": final_loss - initial_loss,
+        "loss_delta": loss_delta,
         "val_acc": best_acc,
+        "prev_acc": prev_acc,
+        "prev_version": prev_version,
         "samples": n,
         "trigger": args.trigger,
         "lookback_hours": hours,
@@ -366,7 +419,7 @@ def main() -> int:
         "max_grad_norm": args.max_grad_norm,
     }
     write_report(report)
-    print(f"training complete in {duration:.1f}s loss_delta={report['loss_delta']:.4f}")
+    print(f"training complete in {duration:.1f}s loss_delta={loss_delta:.4f}")
     return 0
 
 

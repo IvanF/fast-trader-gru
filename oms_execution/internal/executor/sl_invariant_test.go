@@ -21,12 +21,14 @@ func TestSlWouldWidenShort(t *testing.T) {
 }
 
 func TestClampSLTightenOnly(t *testing.T) {
+	// LONG: tighten = move SL UP (higher price), widen = move SL DOWN (lower price)
 	if got := clampSLTightenOnly("LONG", 100, 99); got != 100 {
 		t.Fatalf("LONG clamp = %v, want 100", got)
 	}
 	if got := clampSLTightenOnly("LONG", 100, 101); got != 101 {
 		t.Fatalf("LONG tighten = %v, want 101", got)
 	}
+	// SHORT: tighten = move SL DOWN (lower price), widen = move SL UP (higher price)
 	if got := clampSLTightenOnly("SHORT", 100, 101); got != 100 {
 		t.Fatalf("SHORT clamp = %v, want 100", got)
 	}

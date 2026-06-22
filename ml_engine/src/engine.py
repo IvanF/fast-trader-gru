@@ -728,8 +728,15 @@ class MLEngine:
             open_pos["adverse_streak"] = 0
             return None
 
-        # Microstructure noise on open positions is handled by the TP/SL grid — no forced exit.
-        return None
+        # Microstructure adverse: if OBI and trend oppose position, force exit.
+        adverse = self._microstructure_adverse_tick(open_dir, buf, regime)
+        if not self._adverse_events_confirmed(open_pos, adverse):
+            return None
+
+        open_pos["decay_signaled"] = True
+        return self._build_confidence_decay_payload(
+            symbol, open_pos, confidence, vol_mult, v_state, regime, buf, "microstructure_adverse",
+        )
 
     def _check_entry_abort(self, symbol: str, buf) -> dict | None:
         pending = self._pending_entries.get(symbol)
@@ -761,14 +768,8 @@ class MLEngine:
             pending["adverse_streak"] = 0
             return None
 
-        adverse = self._microstructure_adverse_tick(pending_dir, buf, regime)
-        if not self._adverse_events_confirmed(pending, adverse):
-            return None
-
-        pending["abort_signaled"] = True
-        return self._build_entry_abort_payload(
-            symbol, pending, confidence, vol_mult, v_state, regime, buf, "microstructure_adverse",
-        )
+        # Microstructure adverse is too aggressive for pending entries — only direction flip matters.
+        return None
 
     def _build_entry_abort_payload(
         self,

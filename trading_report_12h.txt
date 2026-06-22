@@ -221,3 +221,252 @@ Reasons: {'exchange_closed': 9}
 Worst symbols: [('LABUSDT', '\\$-0.2159'), ('HYPEUSDT', '\\$-0.0028'), ('ZEREBROUSDT', '\\$-0.0005')]
 OPTIMIZE_NEEDED: ['bad_wl_ratio=0.71']
 
+
+=== 2026-06-19 23:29:58 ===
+Trades: 13 | WR: 53.8% | PnL: $-0.0619
+Avg win: $0.0262 | Avg loss: $-0.0409
+W/L ratio: 0.64
+Reasons: {'exchange_closed': 11, 'take_profit_grid': 1, 'exchange_flat': 1}
+Worst symbols: [('LABUSDT', '\\$-0.2159'), ('HYPEUSDT', '\\$-0.0028'), ('ZEREBROUSDT', '\\$-0.0005')]
+OPTIMIZE_NEEDED: ['bad_wl_ratio=0.64']
+
+
+=== 2026-06-19 23:59:58 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-20 00:29:58 ===
+Trades: 1 | WR: 0.0% | PnL: $-0.0150
+Avg win: $0.0000 | Avg loss: $-0.0150
+W/L ratio: 0.00
+Reasons: {'exchange_closed': 1}
+Worst symbols: [('BEATUSDT', '\\$-0.0150')]
+INSUFFICIENT_DATA: 1 trades
+
+
+=== 2026-06-20 00:59:59 ===
+Trades: 1 | WR: 0.0% | PnL: $-0.0150
+Avg win: $0.0000 | Avg loss: $-0.0150
+W/L ratio: 0.00
+Reasons: {'exchange_closed': 1}
+Worst symbols: [('BEATUSDT', '\\$-0.0150')]
+INSUFFICIENT_DATA: 1 trades
+
+
+=== 2026-06-20 01:29:59 ===
+Trades: 4 | WR: 0.0% | PnL: $-0.7808
+Avg win: $0.0000 | Avg loss: $-0.1952
+W/L ratio: 0.00
+Reasons: {'exchange_closed': 4}
+Worst symbols: [('BEATUSDT', '\\$-0.4411'), ('LABUSDT', '\\$-0.3397')]
+INSUFFICIENT_DATA: 4 trades
+
+
+=== 2026-06-20 01:59:59 ===
+Trades: 5 | WR: 0.0% | PnL: $-0.7983
+Avg win: $0.0000 | Avg loss: $-0.1597
+W/L ratio: 0.00
+Reasons: {'exchange_closed': 5}
+Worst symbols: [('BEATUSDT', '\\$-0.4411'), ('LABUSDT', '\\$-0.3397'), ('AVAXUSDT', '\\$-0.0175')]
+OPTIMIZE_NEEDED: ['low_wr=0%', 'bad_wl_ratio=0.00']
+
+
+=== 2026-06-20 02:29:59 ===
+Trades: 5 | WR: 0.0% | PnL: $-0.7983
+Avg win: $0.0000 | Avg loss: $-0.1597
+W/L ratio: 0.00
+Reasons: {'exchange_closed': 5}
+Worst symbols: [('BEATUSDT', '\\$-0.4411'), ('LABUSDT', '\\$-0.3397'), ('AVAXUSDT', '\\$-0.0175')]
+OPTIMIZE_NEEDED: ['low_wr=0%', 'bad_wl_ratio=0.00']
+
+
+=== 2026-06-20 02:59:59 ===
+Trades: 6 | WR: 0.0% | PnL: $-0.8012
+Avg win: $0.0000 | Avg loss: $-0.1335
+W/L ratio: 0.00
+Reasons: {'exchange_closed': 6}
+Worst symbols: [('BEATUSDT', '\\$-0.4411'), ('LABUSDT', '\\$-0.3397'), ('AVAXUSDT', '\\$-0.0175')]
+OPTIMIZE_NEEDED: ['low_wr=0%', 'bad_wl_ratio=0.00']
+
+
+=== 2026-06-20 03:29:59 ===
+Trades: 9 | WR: 0.0% | PnL: $-1.3015
+Avg win: $0.0000 | Avg loss: $-0.1446
+W/L ratio: 0.00
+Reasons: {'exchange_closed': 9}
+Worst symbols: [('LABUSDT', '\\$-0.5132'), ('BEATUSDT', '\\$-0.4411'), ('AVAXUSDT', '\\$-0.3321')]
+OPTIMIZE_NEEDED: ['low_wr=0%', 'bad_wl_ratio=0.00']
+
+
+=== 2026-06-20 03:59:59 ===
+Trades: 9 | WR: 0.0% | PnL: $-1.3015
+Avg win: $0.0000 | Avg loss: $-0.1446
+W/L ratio: 0.00
+Reasons: {'exchange_closed': 9}
+Worst symbols: [('LABUSDT', '\\$-0.5132'), ('BEATUSDT', '\\$-0.4411'), ('AVAXUSDT', '\\$-0.3321')]
+OPTIMIZE_NEEDED: ['low_wr=0%', 'bad_wl_ratio=0.00']
+
+
+=== 2026-06-20 04:29:59 ===
+Trades: 11 | WR: 0.0% | PnL: $-1.6856
+Avg win: $0.0000 | Avg loss: $-0.1532
+W/L ratio: 0.00
+Reasons: {'exchange_closed': 10, 'fee_loss': 1}
+Worst symbols: [('LABUSDT', '\\$-0.6728'), ('BEATUSDT', '\\$-0.4411'), ('AVAXUSDT', '\\$-0.3321')]
+OPTIMIZE_NEEDED: ['low_wr=0%', 'bad_wl_ratio=0.00']
+
+
+=== 2026-06-20 04:59:59 ===
+Trades: 12 | WR: 0.0% | PnL: $-1.7067
+Avg win: $0.0000 | Avg loss: $-0.1422
+W/L ratio: 0.00
+Reasons: {'exchange_closed': 11, 'fee_loss': 1}
+Worst symbols: [('LABUSDT', '\\$-0.6728'), ('BEATUSDT', '\\$-0.4622'), ('AVAXUSDT', '\\$-0.3321')]
+OPTIMIZE_NEEDED: ['low_wr=0%', 'bad_wl_ratio=0.00']
+
+
+=== 2026-06-20 05:29:59 ===
+Trades: 14 | WR: 0.0% | PnL: $-1.8924
+Avg win: $0.0000 | Avg loss: $-0.1352
+W/L ratio: 0.00
+Reasons: {'exchange_closed': 13, 'fee_loss': 1}
+Worst symbols: [('LABUSDT', '\\$-0.6728'), ('BEATUSDT', '\\$-0.4622'), ('AVAXUSDT', '\\$-0.3321')]
+OPTIMIZE_NEEDED: ['low_wr=0%', 'bad_wl_ratio=0.00']
+
+
+=== 2026-06-20 05:59:59 ===
+Trades: 14 | WR: 0.0% | PnL: $-1.8924
+Avg win: $0.0000 | Avg loss: $-0.1352
+W/L ratio: 0.00
+Reasons: {'exchange_closed': 13, 'fee_loss': 1}
+Worst symbols: [('LABUSDT', '\\$-0.6728'), ('BEATUSDT', '\\$-0.4622'), ('AVAXUSDT', '\\$-0.3321')]
+OPTIMIZE_NEEDED: ['low_wr=0%', 'bad_wl_ratio=0.00']
+
+
+=== 2026-06-20 06:29:59 ===
+Trades: 15 | WR: 6.7% | PnL: $-1.8823
+Avg win: $0.0101 | Avg loss: $-0.1352
+W/L ratio: 0.07
+Reasons: {'exchange_closed': 14, 'fee_loss': 1}
+Worst symbols: [('LABUSDT', '\\$-0.6728'), ('BEATUSDT', '\\$-0.4522'), ('AVAXUSDT', '\\$-0.3321')]
+OPTIMIZE_NEEDED: ['low_wr=7%', 'bad_wl_ratio=0.07']
+
+
+=== 2026-06-20 07:00:00 ===
+Trades: 15 | WR: 6.7% | PnL: $-1.8823
+Avg win: $0.0101 | Avg loss: $-0.1352
+W/L ratio: 0.07
+Reasons: {'exchange_closed': 14, 'fee_loss': 1}
+Worst symbols: [('LABUSDT', '\\$-0.6728'), ('BEATUSDT', '\\$-0.4522'), ('AVAXUSDT', '\\$-0.3321')]
+OPTIMIZE_NEEDED: ['low_wr=7%', 'bad_wl_ratio=0.07']
+
+
+=== 2026-06-20 07:30:00 ===
+Trades: 16 | WR: 6.2% | PnL: $-2.0161
+Avg win: $0.0101 | Avg loss: $-0.1351
+W/L ratio: 0.07
+Reasons: {'exchange_closed': 15, 'fee_loss': 1}
+Worst symbols: [('LABUSDT', '\\$-0.6728'), ('BEATUSDT', '\\$-0.5860'), ('AVAXUSDT', '\\$-0.3321')]
+OPTIMIZE_NEEDED: ['low_wr=6%', 'bad_wl_ratio=0.07']
+
+
+=== 2026-06-20 08:00:00 ===
+Trades: 17 | WR: 11.8% | PnL: $-2.0047
+Avg win: $0.0107 | Avg loss: $-0.1351
+W/L ratio: 0.08
+Reasons: {'exchange_closed': 16, 'fee_loss': 1}
+Worst symbols: [('LABUSDT', '\\$-0.6728'), ('BEATUSDT', '\\$-0.5746'), ('AVAXUSDT', '\\$-0.3321')]
+OPTIMIZE_NEEDED: ['low_wr=12%', 'bad_wl_ratio=0.08']
+
+
+=== 2026-06-20 08:30:00 ===
+Trades: 18 | WR: 11.1% | PnL: $-2.3029
+Avg win: $0.0107 | Avg loss: $-0.1453
+W/L ratio: 0.07
+Reasons: {'exchange_closed': 16, 'fee_loss': 2}
+Worst symbols: [('LABUSDT', '\\$-0.6728'), ('BEATUSDT', '\\$-0.5746'), ('ZECUSDT', '\\$-0.4801')]
+OPTIMIZE_NEEDED: ['low_wr=11%', 'bad_wl_ratio=0.07']
+
+
+=== 2026-06-20 09:00:00 ===
+Trades: 18 | WR: 11.1% | PnL: $-2.3029
+Avg win: $0.0107 | Avg loss: $-0.1453
+W/L ratio: 0.07
+Reasons: {'exchange_closed': 16, 'fee_loss': 2}
+Worst symbols: [('LABUSDT', '\\$-0.6728'), ('BEATUSDT', '\\$-0.5746'), ('ZECUSDT', '\\$-0.4801')]
+OPTIMIZE_NEEDED: ['low_wr=11%', 'bad_wl_ratio=0.07']
+
+
+=== 2026-06-20 09:30:00 ===
+Trades: 20 | WR: 15.0% | PnL: $-2.4823
+Avg win: $0.0106 | Avg loss: $-0.1479
+W/L ratio: 0.07
+Reasons: {'exchange_closed': 18, 'fee_loss': 2}
+Worst symbols: [('LABUSDT', '\\$-0.8626'), ('BEATUSDT', '\\$-0.5642'), ('ZECUSDT', '\\$-0.4801')]
+OPTIMIZE_NEEDED: ['low_wr=15%', 'bad_wl_ratio=0.07']
+
+
+=== 2026-06-20 10:00:00 ===
+Trades: 20 | WR: 15.0% | PnL: $-2.4823
+Avg win: $0.0106 | Avg loss: $-0.1479
+W/L ratio: 0.07
+Reasons: {'exchange_closed': 18, 'fee_loss': 2}
+Worst symbols: [('LABUSDT', '\\$-0.8626'), ('BEATUSDT', '\\$-0.5642'), ('ZECUSDT', '\\$-0.4801')]
+OPTIMIZE_NEEDED: ['low_wr=15%', 'bad_wl_ratio=0.07']
+
+
+=== 2026-06-20 10:30:00 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-20 11:00:00 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-20 11:30:01 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-20 12:00:01 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-20 12:30:01 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-20 13:00:01 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-20 13:30:01 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-20 14:00:02 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-20 14:30:02 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-20 15:00:02 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-20 15:30:02 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-20 16:00:02 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-20 16:30:02 ===
+INSUFFICIENT_DATA: 0 trades
+
+
+=== 2026-06-20 17:00:03 ===
+INSUFFICIENT_DATA: 0 trades
+

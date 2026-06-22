@@ -46,6 +46,26 @@ type Config struct {
 	ExitGridMinRedeploySec     int
 	MinHoldTimeSec             int
 	DecayMinHoldSec            int
+	SymbolOverrides            map[string]SymbolConfig
+}
+
+type SymbolConfig struct {
+	MinSLPct       *float64
+	TradeMarginUSD *float64
+}
+
+func (c *Config) GetMinSLPct(symbol string) float64 {
+	if ov, ok := c.SymbolOverrides[symbol]; ok && ov.MinSLPct != nil {
+		return *ov.MinSLPct
+	}
+	return c.MinSLPct
+}
+
+func (c *Config) GetTradeMarginUSD(symbol string) float64 {
+	if ov, ok := c.SymbolOverrides[symbol]; ok && ov.TradeMarginUSD != nil {
+		return *ov.TradeMarginUSD
+	}
+	return c.TradeMarginUSD
 }
 
 func Load() Config {
@@ -94,7 +114,32 @@ func Load() Config {
 		ExitGridMinRedeploySec:     intEnv("EXIT_GRID_MIN_REDEPLOY_SEC", 15),
 		MinHoldTimeSec:             intEnv("MIN_HOLD_TIME_SEC", 0),
 		DecayMinHoldSec:            intEnv("DECAY_MIN_HOLD_SEC", 0),
+		SymbolOverrides:            parseSymbolOverrides(),
 	}
+}
+
+func parseSymbolOverrides() map[string]SymbolConfig {
+	overrides := make(map[string]SymbolConfig)
+	symbols := []string{"LAB", "BTC", "ETH", "SOL", "XRP", "NEAR", "HYPE", "SPCX", "WLD", "ZEC", "BTW"}
+	for _, sym := range symbols {
+		var sc SymbolConfig
+		slKey := sym + "_MIN_SL_PCT"
+		marginKey := sym + "_TRADE_MARGIN_USD"
+		if v := os.Getenv(slKey); v != "" {
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				sc.MinSLPct = &f
+			}
+		}
+		if v := os.Getenv(marginKey); v != "" {
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				sc.TradeMarginUSD = &f
+			}
+		}
+		if sc.MinSLPct != nil || sc.TradeMarginUSD != nil {
+			overrides[sym+"USDT"] = sc
+		}
+	}
+	return overrides
 }
 
 func (c Config) UsesUSDSizing() bool {

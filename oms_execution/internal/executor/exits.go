@@ -24,7 +24,7 @@ func hasRemainingSize(size, minQty float64) bool {
 	return size >= minQty*0.99
 }
 
-func (s *Service) enforceSLPrice(pos *models.ActivePosition, slPrice, tickSize float64) float64 {
+func (s *Service) enforceSLPrice(ctx context.Context, pos *models.ActivePosition, slPrice, tickSize float64) float64 {
 	adjusted := grid.EnforceMinSLDistance(pos.FillPrice, slPrice, pos.Direction, s.cfg.MinSLPct, tickSize)
 	if grid.SLDistancePct(pos.FillPrice, adjusted) < s.cfg.MinSLPct {
 		s.logger.Info("sl widened to min distance",
@@ -34,6 +34,23 @@ func (s *Service) enforceSLPrice(pos *models.ActivePosition, slPrice, tickSize f
 			"adjusted", adjusted,
 			"min_pct", s.cfg.MinSLPct,
 		)
+	}
+	ob, err := s.redis.GetOrderbook(ctx, pos.Symbol)
+	if err == nil {
+		mid := grid.MidPrice(ob)
+		if mid > 0 {
+			minDist := pos.FillPrice * s.cfg.MinSLPct
+			if pos.Direction == "SHORT" && adjusted <= mid {
+				adjusted = grid.RoundToTick(mid+minDist, tickSize)
+				s.logger.Info("sl moved above current price (underwater)",
+					"symbol", pos.Symbol, "mid", mid, "adjusted", adjusted)
+			}
+			if pos.Direction == "LONG" && adjusted >= mid {
+				adjusted = grid.RoundToTick(mid-minDist, tickSize)
+				s.logger.Info("sl moved below current price (underwater)",
+					"symbol", pos.Symbol, "mid", mid, "adjusted", adjusted)
+			}
+		}
 	}
 	return adjusted
 }
@@ -57,9 +74,12 @@ func (s *Service) deployExitGrid(ctx context.Context, pos *models.ActivePosition
 		return fmt.Errorf("no exchange position for exit grid")
 	}
 
+	tpRefPrice := pos.FillPrice
+	opts := s.exitGridOpts()
+	opts.MaxTPPct = 0
 	exitGrid := grid.BuildExitGrid(
 		pos.Direction,
-		pos.FillPrice,
+		tpRefPrice,
 		plannedEntry,
 		plannedSL,
 		ob,
@@ -68,9 +88,9 @@ func (s *Service) deployExitGrid(ctx context.Context, pos *models.ActivePosition
 		exSize,
 		pos.QtyStep,
 		pos.MinOrderQty,
-		s.exitGridOpts(),
+		opts,
 	)
-	slPrice := s.enforceSLPrice(pos, exitGrid.StopLoss.Price, tickSize)
+	slPrice := s.enforceSLPrice(ctx, pos, exitGrid.StopLoss.Price, tickSize)
 	side := closeSide(pos.Direction)
 
 	// Place TPs first (reduce-only limits), then SL covers 100% of remaining exposure.
@@ -113,6 +133,16 @@ func (s *Service) deployExitGrid(ctx context.Context, pos *models.ActivePosition
 			tpPlaced += tp.Qty
 		}
 		slQty = exSize - tpPlaced
+	}
+	if slQty <= 0 {
+		pos.ExitGridReady = true
+		pos.LastGridDeployAt = time.Now().UnixMilli()
+		s.logger.Info("exit grid deployed (tp-only, no sl remainder)",
+			"symbol", pos.Symbol,
+			"tp_levels", len(pos.TakeProfitOrders),
+			"ex_size", exSize,
+		)
+		return nil
 	}
 	slQty = bybit.NormalizeQty(slQty, pos.QtyStep, pos.MinOrderQty)
 	if slQty > exSize {
@@ -165,7 +195,7 @@ func (s *Service) placeStopLossCoveringRemainder(
 	tickSize float64,
 	kind string,
 ) error {
-	price = s.enforceSLPrice(pos, price, tickSize)
+	price = s.enforceSLPrice(ctx, pos, price, tickSize)
 	qty = bybit.NormalizeQty(qty, pos.QtyStep, pos.MinOrderQty)
 	if qty <= 0 {
 		return fmt.Errorf("sl qty zero")
@@ -203,7 +233,7 @@ func (s *Service) atomicReplaceStopLoss(ctx context.Context, pos *models.ActiveP
 	if makerExit {
 		price = grid.RoundToTick(price, pos.TickSize)
 	} else {
-		price = s.enforceSLPrice(pos, price, pos.TickSize)
+		price = s.enforceSLPrice(ctx, pos, price, pos.TickSize)
 	}
 	if pos.StopLoss > 0 && kind == "stop_loss" && slWouldWiden(pos.Direction, pos.StopLoss, price) {
 		s.logger.Warn("sl widen blocked",
@@ -215,8 +245,29 @@ func (s *Service) atomicReplaceStopLoss(ctx context.Context, pos *models.ActiveP
 		)
 		return nil
 	}
+	// Validate SL price is on correct side of current price
+	ob, obErr := s.redis.GetOrderbook(ctx, pos.Symbol)
+	if obErr == nil {
+		mid := grid.MidPrice(ob)
+		if mid > 0 {
+			minDist := pos.FillPrice * s.cfg.MinSLPct
+			if pos.Direction == "SHORT" && price <= mid {
+				price = grid.RoundToTick(mid+minDist, pos.TickSize)
+				s.logger.Info("sl moved above current price (underwater)",
+					"symbol", pos.Symbol, "mid", mid, "adjusted", price)
+			}
+			if pos.Direction == "LONG" && price >= mid {
+				price = grid.RoundToTick(mid-minDist, pos.TickSize)
+				s.logger.Info("sl moved below current price (underwater)",
+					"symbol", pos.Symbol, "mid", mid, "adjusted", price)
+			}
+		}
+	}
 	qty = bybit.NormalizeQty(qty, pos.QtyStep, pos.MinOrderQty)
 	if qty <= 0 {
+		return nil
+	}
+	if pos.StopLossOrder != nil && !pos.StopLossOrder.Filled && qty < pos.StopLossOrder.Qty && kind == "stop_loss" {
 		return nil
 	}
 
@@ -302,12 +353,24 @@ func (s *Service) syncSLToFullRemainder(ctx context.Context, pos *models.ActiveP
 	if slQty <= 0 {
 		return
 	}
-	if abs(slQty-pos.StopLossOrder.Qty) <= pos.QtyStep*0.5 && pos.StopLossOrder.Kind == "stop_loss" {
+	if slQty <= pos.StopLossOrder.Qty && pos.StopLossOrder.Kind == "stop_loss" {
 		return
 	}
 	price := pos.StopLoss
 	if price <= 0 {
 		price = pos.StopLossOrder.Price
+	}
+	ob, obErr := s.redis.GetOrderbook(ctx, pos.Symbol)
+	if obErr == nil {
+		mid := grid.MidPrice(ob)
+		if mid > 0 {
+			if pos.Direction == "SHORT" && price <= mid {
+				return
+			}
+			if pos.Direction == "LONG" && price >= mid {
+				return
+			}
+		}
 	}
 	if err := s.atomicReplaceStopLoss(ctx, pos, price, slQty, "stop_loss"); err != nil {
 		s.logger.Warn("sync sl to full remainder failed", "symbol", pos.Symbol, "error", err)
@@ -468,7 +531,7 @@ func (s *Service) maybeTrailStopLoss(ctx context.Context, pos *models.ActivePosi
 	switch pos.Direction {
 	case "LONG":
 		profitDist := mid - pos.FillPrice
-		if profitDist < risk*1.5 {
+		if profitDist < risk*1.0 {
 			return
 		}
 		// Trail: lock 0.8R of current profit
@@ -478,7 +541,7 @@ func (s *Service) maybeTrailStopLoss(ctx context.Context, pos *models.ActivePosi
 		}
 	case "SHORT":
 		profitDist := pos.FillPrice - mid
-		if profitDist < risk*1.5 {
+		if profitDist < risk*1.0 {
 			return
 		}
 		newSL = mid + risk*0.8
@@ -490,7 +553,7 @@ func (s *Service) maybeTrailStopLoss(ctx context.Context, pos *models.ActivePosi
 	}
 
 	newSL = grid.RoundToTick(newSL, pos.TickSize)
-	newSL = s.enforceSLPrice(pos, newSL, pos.TickSize)
+	// Do NOT enforce min SL distance here — trailing SL intentionally moves SL closer to price.
 
 	slQty := s.slCoverQty(pos, exSize)
 	if slQty <= 0 {
