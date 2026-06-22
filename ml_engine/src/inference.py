@@ -213,7 +213,15 @@ class HotSwapONNXInference:
             mlp_sess = self._bundle.mlp
 
         if mlp_sess is not None:
+            expected = mlp_sess.get_inputs()[0].shape[1]
             inp = np.concatenate([v_state, v_memory]).astype(np.float32).reshape(1, -1)
+            actual = inp.shape[1]
+            if actual != expected:
+                if actual > expected:
+                    inp = inp[:, :expected]
+                else:
+                    pad = np.zeros((1, expected - actual), dtype=np.float32)
+                    inp = np.concatenate([inp, pad], axis=1)
             outputs = mlp_sess.run(None, {mlp_sess.get_inputs()[0].name: inp})
             logits = outputs[0][0]
             direction_idx = int(np.argmax(logits[:3]))

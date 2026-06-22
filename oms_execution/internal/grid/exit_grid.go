@@ -3,6 +3,7 @@ package grid
 import (
 	"math"
 	"sort"
+	"strconv"
 
 	"github.com/fast-trader-gru/oms_execution/internal/bybit"
 	"github.com/fast-trader-gru/oms_execution/internal/liquidity"
@@ -39,7 +40,90 @@ func atrSLMultiplier(regime string) float64 {
 	}
 }
 
-// BuildExitGrid places SL/TP relative to actual fill, using liquidity walls and ML regime.
+// computeSmartSL places SL at nearest S/R level, capped by max distance, tightened for knives.
+func computeSmartSL(
+	direction string,
+	fillPrice float64,
+	ob models.OrderbookSnapshot,
+	signal models.TradeSignal,
+	tickSize, risk, maxSLPct float64,
+) float64 {
+	obi := 0.0
+	if len(ob.Bids) > 0 && len(ob.Asks) > 0 {
+		var bidVol, askVol float64
+		for i := 0; i < 10 && i < len(ob.Bids); i++ {
+			s, _ := strconv.ParseFloat(ob.Bids[i].Size, 64)
+			bidVol += s
+		}
+		for i := 0; i < 10 && i < len(ob.Asks); i++ {
+			s, _ := strconv.ParseFloat(ob.Asks[i].Size, 64)
+			askVol += s
+		}
+		total := bidVol + askVol
+		if total > 0 {
+			obi = (bidVol - askVol) / total
+		}
+	}
+
+	_, knifeTighten := liquidity.DetectKnife(
+		signal.MacroTrend5m, signal.MacroTrend15m, obi, signal.Regime, direction,
+	)
+
+	var sl float64
+	if direction == "LONG" {
+		support := liquidity.FindNearestSupport(ob, fillPrice)
+		if support.Price > 0 {
+			sl = support.Price - tickSize*2
+		} else {
+			sl = fillPrice - risk
+		}
+
+		if signal.MacroTrend15m < -0.005 {
+			trendTighten := math.Max(0.6, 1.0+signal.MacroTrend15m*10)
+			sl = fillPrice - (fillPrice-sl)*trendTighten
+		}
+
+		sl = fillPrice - (fillPrice-sl)*knifeTighten
+
+		maxSLDist := fillPrice * maxSLPct
+		minSL := fillPrice - maxSLDist
+		if sl < minSL {
+			sl = minSL
+		}
+
+		if sl >= fillPrice {
+			sl = fillPrice - risk
+		}
+	} else {
+		resistance := liquidity.FindNearestResistance(ob, fillPrice)
+		if resistance.Price > 0 {
+			sl = resistance.Price + tickSize*2
+		} else {
+			sl = fillPrice + risk
+		}
+
+		if signal.MacroTrend15m > 0.005 {
+			trendTighten := math.Max(0.6, 1.0-signal.MacroTrend15m*10)
+			sl = fillPrice + (sl-fillPrice)*trendTighten
+		}
+
+		sl = fillPrice + (sl-fillPrice)*knifeTighten
+
+		maxSLDist := fillPrice * maxSLPct
+		maxSL := fillPrice + maxSLDist
+		if sl > maxSL {
+			sl = maxSL
+		}
+
+		if sl <= fillPrice {
+			sl = fillPrice + risk
+		}
+	}
+
+	return roundToTick(sl, tickSize)
+}
+
+// BuildExitGrid places SL/TP relative to actual fill, using smart S/R-aware SL + liquidity walls for TP.
 func BuildExitGrid(
 	direction string,
 	fillPrice, plannedEntry, plannedSL float64,
@@ -49,41 +133,26 @@ func BuildExitGrid(
 	opts ExitGridOptions,
 ) ExitGrid {
 	tpBudgetPct := opts.TPBudgetPct
-	delta := fillPrice - plannedEntry
-	slPrice := roundToTick(plannedSL+delta, tickSize)
-	risk := math.Abs(fillPrice - slPrice)
-
 	vm := signal.VolatilityMultiplier
 	if vm <= 0 {
 		vm = 1.0
 	}
 
-	atrMult := atrSLMultiplier(signal.Regime)
 	minRisk := fillPrice * opts.MinSLPct
-	atrRisk := risk * atrMult
-	if atrRisk < minRisk {
-		atrRisk = minRisk
-	}
-	risk = atrRisk
-
-	// When price moved against position, recalculate risk from current price
-	if direction == "SHORT" && fillPrice > plannedEntry {
-		risk = fillPrice - slPrice
-		if risk < minRisk {
-			risk = minRisk
-		}
-	} else if direction == "LONG" && fillPrice < plannedEntry {
-		risk = slPrice - fillPrice
-		if risk < minRisk {
-			risk = minRisk
-		}
+	baseRisk := baseGridSpacing * vm * fillPrice
+	if baseRisk < minRisk {
+		baseRisk = minRisk
 	}
 
-	if risk <= 0 {
-		risk = baseGridSpacing * fillPrice
+	slPrice := computeSmartSL(
+		direction, fillPrice, ob, signal, tickSize, baseRisk, opts.MaxSLPct,
+	)
+
+	risk := math.Abs(fillPrice - slPrice)
+	if risk < minRisk {
+		risk = minRisk
 	}
 
-	// For profitable positions, scale TP risk to be closer to current price
 	profitDist := 0.0
 	if direction == "LONG" && fillPrice > plannedEntry {
 		profitDist = fillPrice - plannedEntry
@@ -98,21 +167,21 @@ func BuildExitGrid(
 		risk = tpRisk
 	}
 
+	timeStopSec := opts.TimeStopSec
+	if timeStopSec <= 0 {
+		timeStopSec = 3600
+	}
+	maxTPDist := MaxTPDistance(fillPrice, vm, timeStopSec, signal.Regime)
+
 	rangePct := baseGridSpacing * vm * 4
 	wallOffset := tickSize * 2
-
-	if direction == "LONG" {
-		slPrice = roundToTick(fillPrice-risk, tickSize)
-	} else {
-		slPrice = roundToTick(fillPrice+risk, tickSize)
-	}
 
 	grid := ExitGrid{
 		StopLoss: ExitLevel{Price: slPrice, Kind: "stop_loss"},
 	}
 
 	// Hybrid ladder: near heuristic levels first, then ML formula / liquidity extensions.
-	grid.TakeProfits = buildHeuristicTPs(direction, fillPrice, ob, signal, risk, rangePct, wallOffset, totalQty, qtyStep, minQty, tickSize, vm, tpBudgetPct)
+	grid.TakeProfits = buildHeuristicTPs(direction, fillPrice, ob, signal, risk, rangePct, wallOffset, totalQty, qtyStep, minQty, tickSize, vm, tpBudgetPct, maxTPDist)
 	if len(signal.TakeProfits) > 0 {
 		grid.TakeProfits = append(grid.TakeProfits, tpsFromSignal(signal.TakeProfits, direction, fillPrice, plannedEntry, totalQty, qtyStep, minQty, tickSize, tpBudgetPct)...)
 	}
@@ -124,7 +193,7 @@ func BuildExitGrid(
 	grid.TakeProfits = applyTPPriceFloors(direction, fillPrice, grid.TakeProfits, opts.MinTPPct, opts.FeeBreakevenPct, tickSize)
 	grid.TakeProfits = FilterTPLevelsByMaxDistance(direction, fillPrice, grid.TakeProfits, opts.MaxTPPct, tickSize)
 	if len(grid.TakeProfits) == 0 {
-		grid.TakeProfits = buildHeuristicTPs(direction, fillPrice, ob, signal, risk, rangePct, wallOffset, totalQty, qtyStep, minQty, tickSize, vm, tpBudgetPct)
+		grid.TakeProfits = buildHeuristicTPs(direction, fillPrice, ob, signal, risk, rangePct, wallOffset, totalQty, qtyStep, minQty, tickSize, vm, tpBudgetPct, maxTPDist)
 		grid.TakeProfits = applyTPPriceFloors(direction, fillPrice, grid.TakeProfits, opts.MinTPPct, opts.FeeBreakevenPct, tickSize)
 	}
 	if tpBudgetPct <= 0 {
@@ -142,7 +211,7 @@ func buildHeuristicTPs(
 	fillPrice float64,
 	ob models.OrderbookSnapshot,
 	signal models.TradeSignal,
-	risk, rangePct, wallOffset, totalQty, qtyStep, minQty, tickSize, vm, tpBudgetPct float64,
+	risk, rangePct, wallOffset, totalQty, qtyStep, minQty, tickSize, vm, tpBudgetPct, maxTPDist float64,
 ) []ExitLevel {
 	if tpBudgetPct <= 0 {
 		tpBudgetPct = defaultTPBudgetPct
@@ -172,8 +241,6 @@ func buildHeuristicTPs(
 	} else {
 		wall := liquidity.FindSupportWall(ob, fillPrice, rangePct)
 		wallPrice = roundToTick(wall.Price+wallOffset, tickSize)
-		// For SHORT, wall TP should be ABOVE support (where price bounces)
-		// Don't adjust to fillPrice-risk — keep at support level
 		if wallPrice <= 0 || wallPrice >= fillPrice {
 			wallPrice = roundToTick(fillPrice-risk*0.5, tickSize)
 		}
@@ -200,6 +267,32 @@ func buildHeuristicTPs(
 	} else {
 		rPrice = roundToTick(fillPrice-risk*rMult, tickSize)
 	}
+
+	strongWall := liquidity.FindStrongestWallWithin(ob, direction, fillPrice, maxTPDist)
+	if strongWall.Price > 0 {
+		wallOffset2 := tickSize * 3
+		if direction == "LONG" {
+			capPrice := roundToTick(strongWall.Price-wallOffset2, tickSize)
+			if capPrice > 0 && capPrice < rPrice {
+				rPrice = capPrice
+			}
+		} else {
+			capPrice := roundToTick(strongWall.Price+wallOffset2, tickSize)
+			if capPrice > 0 && capPrice > rPrice {
+				rPrice = capPrice
+			}
+		}
+	}
+
+	rDist := math.Abs(rPrice - fillPrice)
+	if rDist > maxTPDist {
+		if direction == "LONG" {
+			rPrice = roundToTick(fillPrice+maxTPDist, tickSize)
+		} else {
+			rPrice = roundToTick(fillPrice-maxTPDist, tickSize)
+		}
+	}
+
 	rQty := qtyFromWeight(tpBudget, tpLevelWeights[2], qtyStep, minQty)
 	if rQty > 0 {
 		out = append(out, ExitLevel{Price: rPrice, Qty: rQty, Kind: "r_multiple"})
@@ -213,6 +306,31 @@ func buildHeuristicTPs(
 		} else {
 			extPrice = roundToTick(fillPrice-ext, tickSize)
 		}
+
+		if strongWall.Price > 0 {
+			wallOffset3 := tickSize * 2
+			if direction == "LONG" {
+				capPrice := roundToTick(strongWall.Price-wallOffset3, tickSize)
+				if capPrice > 0 && capPrice < extPrice {
+					extPrice = capPrice
+				}
+			} else {
+				capPrice := roundToTick(strongWall.Price+wallOffset3, tickSize)
+				if capPrice > 0 && capPrice > extPrice {
+					extPrice = capPrice
+				}
+			}
+		}
+
+		extDist := math.Abs(extPrice - fillPrice)
+		if extDist > maxTPDist*1.5 {
+			if direction == "LONG" {
+				extPrice = roundToTick(fillPrice+maxTPDist*1.5, tickSize)
+			} else {
+				extPrice = roundToTick(fillPrice-maxTPDist*1.5, tickSize)
+			}
+		}
+
 		extQty := qtyFromWeight(tpBudget, tpLevelWeights[3], qtyStep, minQty)
 		if extQty > 0 {
 			out = append(out, ExitLevel{Price: extPrice, Qty: extQty, Kind: "trend"})
@@ -237,22 +355,8 @@ func finalizeGridAllocation(grid *ExitGrid, totalQty, qtyStep, minQty, tpBudgetP
 
 	maxTPQty := totalQty - minQty
 	if maxTPQty < minQty {
-		if len(grid.TakeProfits) > 0 {
-			tpQty := originalQty
-			if tpQty < minQty {
-				tpQty = totalQty
-			}
-			tpQty = bybit.NormalizeQty(tpQty, qtyStep, minQty)
-			grid.TakeProfits = []ExitLevel{{
-				Price: grid.TakeProfits[0].Price,
-				Qty:   tpQty,
-				Kind:  "breakeven",
-			}}
-			grid.StopLoss.Qty = 0
-		} else {
-			grid.TakeProfits = nil
-			grid.StopLoss.Qty = totalQty
-		}
+		grid.TakeProfits = nil
+		grid.StopLoss.Qty = totalQty
 		return
 	}
 

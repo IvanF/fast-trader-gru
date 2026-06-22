@@ -51,18 +51,19 @@ func New(cfg config.Config, bc *bybit.Client, rc *redisx.Client, iw *influx.Writ
 
 func (s *Service) planOpts() grid.PlanOptions {
 	return grid.PlanOptions{
-		EntryMakerTicks:  s.cfg.EntryMakerTicks,
-		VolMultiplierCap: s.cfg.VolMultiplierCap,
+		VolMultiplierCap:   s.cfg.VolMultiplierCap,
 	}
 }
 
-func (s *Service) exitGridOpts() grid.ExitGridOptions {
+func (s *Service) exitGridOptsForSymbol(symbol string) grid.ExitGridOptions {
 	return grid.ExitGridOptions{
 		TPBudgetPct:     s.cfg.TPBudgetPct,
 		MinTPPct:        s.cfg.MinTPPct,
 		MaxTPPct:        s.cfg.MaxTPPct,
 		FeeBreakevenPct: s.cfg.FeeBreakevenPct,
-		MinSLPct:        s.cfg.MinSLPct,
+		MinSLPct:        s.cfg.GetMinSLPct(symbol),
+		MaxSLPct:        s.cfg.GetMaxSLPct(symbol),
+		TimeStopSec:     s.cfg.GetTimeStopSeconds(symbol),
 	}
 }
 
@@ -220,10 +221,13 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 		return fmt.Errorf("invalid mark price for %s", signal.Symbol)
 	}
 
+	leverage := s.cfg.GetLeverage(signal.Symbol)
+	timeStop := s.cfg.GetTimeStopSeconds(signal.Symbol)
+
 	var qty float64
 	var notionalUSD float64
 	if s.cfg.UsesUSDSizing() {
-		notionalUSD = risk.TradeNotionalUSD(marginUSD, s.cfg.Leverage)
+		notionalUSD = risk.TradeNotionalUSD(marginUSD, leverage)
 		qty = risk.QtyFromNotional(notionalUSD, mid)
 	} else {
 		qty = s.cfg.DefaultQty
@@ -231,10 +235,10 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 			qty *= signal.PositionScale
 		}
 		notionalUSD = qty * mid
-		marginUSD = notionalUSD / float64(max(s.cfg.Leverage, 1))
+		marginUSD = notionalUSD / float64(max(leverage, 1))
 	}
 
-	plan := grid.BuildPlan(signal, ob, inst.TickSize, qty, s.cfg.TimeStopSeconds, s.planOpts())
+	plan := grid.BuildPlan(signal, ob, inst.TickSize, qty, timeStop, s.planOpts())
 	if signal.StopLoss > 0 {
 		plan.StopLoss = signal.StopLoss
 	}
@@ -257,7 +261,7 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 
 	actualNotional := plan.Qty * mid
 	if s.cfg.UsesUSDSizing() {
-		actualMargin := actualNotional / float64(max(s.cfg.Leverage, 1))
+		actualMargin := actualNotional / float64(max(leverage, 1))
 		if actualMargin > marginUSD*1.25 {
 			return fmt.Errorf(
 				"min lot too large for $%.0f margin budget: need $%.2f margin (qty=%.8f @ %.4f)",
@@ -265,8 +269,8 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 			)
 		}
 		marginUSD = actualMargin
-		if err := s.bybit.SetLeverage(ctx, signal.Symbol, s.cfg.Leverage); err != nil {
-			s.logger.Warn("set leverage failed", "symbol", signal.Symbol, "leverage", s.cfg.Leverage, "error", err)
+		if err := s.bybit.SetLeverage(ctx, signal.Symbol, leverage); err != nil {
+			s.logger.Warn("set leverage failed", "symbol", signal.Symbol, "leverage", leverage, "error", err)
 		}
 	}
 
@@ -316,7 +320,7 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 		TickSize:    inst.TickSize,
 		MarginUSD:   marginUSD,
 		NotionalUSD: actualNotional,
-		Leverage:    s.cfg.Leverage,
+		Leverage:    leverage,
 		Signal:      signal,
 		PlacedAt:    time.Now().UnixMilli(),
 		Orderbook:   ob,
@@ -520,7 +524,7 @@ func (s *Service) promotePending(ctx context.Context, p *models.PendingEntry, av
 		plan := grid.BuildPlan(p.Signal, ob, p.TickSize, qty, p.TimeStopSec, s.planOpts())
 		plannedSL = plan.StopLoss
 	}
-	plannedSL = grid.EnforceMinSLDistance(avgPrice, plannedSL, p.Direction, s.cfg.MinSLPct, p.TickSize)
+	plannedSL = grid.EnforceMinSLDistance(avgPrice, plannedSL, p.Direction, s.cfg.GetMinSLPct(p.Symbol), p.TickSize)
 
 	entryTime := time.Now().UnixMilli()
 	pos := &models.ActivePosition{

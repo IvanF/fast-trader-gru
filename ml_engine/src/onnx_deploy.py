@@ -14,7 +14,7 @@ import redis
 import torch
 
 from .model_manifest import ModelManifest, new_version
-from .models.nn_models import DecisionMLP, FusionModel
+from .models.nn_models import MLP_IN_DIM, DecisionMLP, FusionModel
 
 ONNX_FILENAMES = (
     "orderbook_cnn.onnx",
@@ -88,7 +88,7 @@ def export_onnx_models(
         dynamic_axes={"flow_seq": {0: "batch"}, "gru_embedding": {0: "batch"}},
     )
 
-    dummy_fused = torch.randn(1, 136, device=dev)
+    dummy_fused = torch.randn(1, MLP_IN_DIM, device=dev)
     _torch_onnx_export(
         decision, dummy_fused, mlp_path,
         input_names=["fused_vector"],

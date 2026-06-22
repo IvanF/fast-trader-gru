@@ -46,6 +46,9 @@ def _rows_to_sequences(rows: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarr
     flow_vals = []
     prices = []
     sizes = []
+    bid_vols = []
+    ask_vols = []
+    levels_list = []
 
     for row in rows:
         obi = float(row.get("obi", 0) or 0)
@@ -53,7 +56,11 @@ def _rows_to_sequences(rows: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarr
         ask = float(row.get("ask_vol", 0) or 0)
         price = float(row.get("price", 0) or 0)
         size = float(row.get("size", 0) or 0)
+        levels = float(row.get("levels", 0) or 0)
         obi_vals.append([obi, bid - ask])
+        bid_vols.append(bid)
+        ask_vols.append(ask)
+        levels_list.append(levels)
         if size > 0 and price > 0:
             signed = size if str(row.get("side", "Buy")).upper() in ("BUY", "B") else -size
             flow_vals.append([signed, price, size])
@@ -81,6 +88,27 @@ def _rows_to_sequences(rows: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarr
     if sizes and prices:
         vwap = sum(p * s for p, s in zip(prices, sizes)) / max(sum(sizes), 1e-8)
         macro[3] = (prices[-1] - vwap) / max(vwap, 1e-8)
+
+    last_bid = bid_vols[-1] if bid_vols else 0.0
+    last_ask = ask_vols[-1] if ask_vols else 0.0
+    total_depth = last_bid + last_ask
+    macro[7] = (last_bid - last_ask) / total_depth if total_depth > 0 else 0.0
+    macro[8] = np.tanh(total_depth / 1e6)
+
+    avg_bid = np.mean(bid_vols[-10:]) if bid_vols else 0.0
+    avg_ask = np.mean(ask_vols[-10:]) if ask_vols else 0.0
+    avg_total = avg_bid + avg_ask
+    macro[9] = (avg_bid - avg_ask) / avg_total if avg_total > 0 else 0.0
+
+    macro[10] = levels_list[-1] / 50.0 if levels_list else 0.0
+
+    bid_vol_std = np.std(bid_vols[-20:]) if len(bid_vols) >= 2 else 0.0
+    ask_vol_std = np.std(ask_vols[-20:]) if len(ask_vols) >= 2 else 0.0
+    macro[11] = np.tanh(bid_vol_std / 1e4)
+    macro[12] = np.tanh(ask_vol_std / 1e4)
+
+    avg_fill = np.mean([s for s in sizes if s > 0]) if any(s > 0 for s in sizes) else 0.0
+    macro[13] = avg_fill / (total_depth / 10.0) if total_depth > 0 else 0.0
 
     return ob_seq, flow_seq, macro
 
@@ -122,13 +150,15 @@ def build_joined_dataset(
 
         memory_vec = np.array([
             1.0 if pnl >= 0 else 0.0,
-            np.tanh(pnl * 10),
-            np.tanh(float(outcome.get("holding_time_ms", 0)) / 3600000),
-            1.0 if direction == "LONG" else 0.0,
-            1.0 if direction == "SHORT" else 0.0,
-            float(outcome.get("grid_levels", 0)) / 10.0,
-            float(np.clip(abs(pnl / entry) * 100, 0, 1.0)) if entry > 0 else 0.0,
+            float(pnl),
+            float(np.tanh(pnl / 100)),
             1.0,
+            1.0,
+            1.0 if outcome.get("regime", "Choppy") == "Trending" else 0.0,
+            1.0 if outcome.get("regime", "Choppy") == "Breakout" else 0.0,
+            1.0 if outcome.get("regime", "Choppy") == "Choppy" else 0.0,
+            (1.0 if pnl >= 0 else 0.0) if direction == "LONG" else 0.5,
+            (1.0 if pnl >= 0 else 0.0) if direction == "SHORT" else 0.5,
         ], dtype=np.float32)
 
         ob_list.append(ob_seq)
@@ -162,7 +192,7 @@ def _empty_dataset() -> dict[str, np.ndarray]:
         "flow_seq": np.zeros((0, SEQ_LEN, FLOW_DIM), dtype=np.float32),
         "macro": np.zeros((0, MACRO_DIM), dtype=np.float32),
         "state_vector": np.zeros((0, STATE_DIM), dtype=np.float32),
-        "memory": np.zeros((0, 8), dtype=np.float32),
+        "memory": np.zeros((0, 10), dtype=np.float32),
         "direction": np.zeros(0, dtype=np.int64),
         "confidence": np.zeros(0, dtype=np.float32),
         "pnl": np.zeros(0, dtype=np.float32),

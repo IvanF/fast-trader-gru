@@ -118,3 +118,150 @@ func AdjustSLBehindWall(wall Wall, direction string, tickSize float64) float64 {
 	}
 	return wall.Price + offset
 }
+
+// FindNearestResistance finds the nearest ask-side level above refPrice.
+func FindNearestResistance(ob models.OrderbookSnapshot, refPrice float64) Wall {
+	bestDist := math.MaxFloat64
+	var best Wall
+	for _, l := range ob.Asks {
+		p, _ := strconv.ParseFloat(l.Price, 64)
+		s, _ := strconv.ParseFloat(l.Size, 64)
+		if p <= refPrice || s <= 0 {
+			continue
+		}
+		dist := p - refPrice
+		if dist < bestDist {
+			bestDist = dist
+			best = Wall{Price: p, Size: s, Side: "ask"}
+		}
+	}
+	return best
+}
+
+// FindNearestSupport finds the nearest bid-side level below refPrice.
+func FindNearestSupport(ob models.OrderbookSnapshot, refPrice float64) Wall {
+	bestDist := math.MaxFloat64
+	var best Wall
+	for _, l := range ob.Bids {
+		p, _ := strconv.ParseFloat(l.Price, 64)
+		s, _ := strconv.ParseFloat(l.Size, 64)
+		if p >= refPrice || s <= 0 {
+			continue
+		}
+		dist := refPrice - p
+		if dist < bestDist {
+			bestDist = dist
+			best = Wall{Price: p, Size: s, Side: "bid"}
+		}
+	}
+	return best
+}
+
+// FindStrongestResistance finds the ask-side level with largest size above refPrice.
+func FindStrongestResistance(ob models.OrderbookSnapshot, refPrice float64) Wall {
+	var best Wall
+	for _, l := range ob.Asks {
+		p, _ := strconv.ParseFloat(l.Price, 64)
+		s, _ := strconv.ParseFloat(l.Size, 64)
+		if p <= refPrice || s <= 0 {
+			continue
+		}
+		if s > best.Size {
+			best = Wall{Price: p, Size: s, Side: "ask"}
+		}
+	}
+	return best
+}
+
+// FindStrongestSupport finds the bid-side level with largest size below refPrice.
+func FindStrongestSupport(ob models.OrderbookSnapshot, refPrice float64) Wall {
+	var best Wall
+	for _, l := range ob.Bids {
+		p, _ := strconv.ParseFloat(l.Price, 64)
+		s, _ := strconv.ParseFloat(l.Size, 64)
+		if p >= refPrice || s <= 0 {
+			continue
+		}
+		if s > best.Size {
+			best = Wall{Price: p, Size: s, Side: "bid"}
+		}
+	}
+	return best
+}
+
+// FindStrongestWallWithin finds the strongest S/R wall within maxDist of refPrice.
+// For LONG, looks for resistance above (where price might stall).
+// For SHORT, looks for support below (where price might bounce).
+func FindStrongestWallWithin(ob models.OrderbookSnapshot, direction string, refPrice, maxDist float64) Wall {
+	bestSize := 0.0
+	var best Wall
+
+	if direction == "LONG" {
+		high := refPrice + maxDist
+		for _, l := range ob.Asks {
+			p, _ := strconv.ParseFloat(l.Price, 64)
+			s, _ := strconv.ParseFloat(l.Size, 64)
+			if p <= refPrice || p > high || s <= 0 {
+				continue
+			}
+			if s > bestSize {
+				bestSize = s
+				best = Wall{Price: p, Size: s, Side: "ask"}
+			}
+		}
+	} else {
+		low := refPrice - maxDist
+		for _, l := range ob.Bids {
+			p, _ := strconv.ParseFloat(l.Price, 64)
+			s, _ := strconv.ParseFloat(l.Size, 64)
+			if p >= refPrice || p < low || s <= 0 {
+				continue
+			}
+			if s > bestSize {
+				bestSize = s
+				best = Wall{Price: p, Size: s, Side: "bid"}
+			}
+		}
+	}
+	return best
+}
+
+// DetectKnife detects rapid adverse price movement conditions.
+// Returns (isKnife, tightenFactor). tightenFactor < 1.0 means tighten SL.
+func DetectKnife(macroTrend5m, macroTrend15m, obi float64, regime, direction string) (bool, float64) {
+	knifeScore := 0.0
+
+	if direction == "LONG" {
+		if macroTrend5m < -0.003 {
+			knifeScore += 0.4
+		}
+		if macroTrend15m < -0.008 {
+			knifeScore += 0.3
+		}
+		if obi < -0.2 {
+			knifeScore += 0.2
+		}
+		if regime == "Breakout" && macroTrend5m < -0.002 {
+			knifeScore += 0.1
+		}
+	} else {
+		if macroTrend5m > 0.003 {
+			knifeScore += 0.4
+		}
+		if macroTrend15m > 0.008 {
+			knifeScore += 0.3
+		}
+		if obi > 0.2 {
+			knifeScore += 0.2
+		}
+		if regime == "Breakout" && macroTrend5m > 0.002 {
+			knifeScore += 0.1
+		}
+	}
+
+	if knifeScore >= 0.5 {
+		tighten := math.Max(0.3, 1.0-knifeScore*0.8)
+		return true, tighten
+	}
+	return false, 1.0
+}

@@ -39,6 +39,7 @@ type Config struct {
 	VolMultiplierCap           float64
 	PendingVolRepriceDelta     float64
 	MinSLPct                   float64
+	MaxSLPct                   float64
 	MinTPPct                   float64
 	MaxTPPct                   float64
 	FeeBreakevenPct            float64
@@ -50,8 +51,11 @@ type Config struct {
 }
 
 type SymbolConfig struct {
-	MinSLPct       *float64
-	TradeMarginUSD *float64
+	MinSLPct        *float64
+	MaxSLPct        *float64
+	TradeMarginUSD  *float64
+	Leverage        *int
+	TimeStopSeconds *int
 }
 
 func (c *Config) GetMinSLPct(symbol string) float64 {
@@ -66,6 +70,27 @@ func (c *Config) GetTradeMarginUSD(symbol string) float64 {
 		return *ov.TradeMarginUSD
 	}
 	return c.TradeMarginUSD
+}
+
+func (c *Config) GetMaxSLPct(symbol string) float64 {
+	if ov, ok := c.SymbolOverrides[symbol]; ok && ov.MaxSLPct != nil {
+		return *ov.MaxSLPct
+	}
+	return c.MaxSLPct
+}
+
+func (c *Config) GetLeverage(symbol string) int {
+	if ov, ok := c.SymbolOverrides[symbol]; ok && ov.Leverage != nil {
+		return *ov.Leverage
+	}
+	return c.Leverage
+}
+
+func (c *Config) GetTimeStopSeconds(symbol string) int {
+	if ov, ok := c.SymbolOverrides[symbol]; ok && ov.TimeStopSeconds != nil {
+		return *ov.TimeStopSeconds
+	}
+	return c.TimeStopSeconds
 }
 
 func Load() Config {
@@ -107,6 +132,7 @@ func Load() Config {
 		VolMultiplierCap:           floatEnv("VOL_MULTIPLIER_CAP", 2.0),
 		PendingVolRepriceDelta:     floatEnv("PENDING_VOL_REPRICE_DELTA", 0.5),
 		MinSLPct:                   floatEnv("MIN_SL_PCT", 0.005),
+		MaxSLPct:                   floatEnv("MAX_SL_PCT", 0.012),
 		MinTPPct:                   floatEnv("MIN_TP_PCT", 0.002),
 		MaxTPPct:                   floatEnv("MAX_TP_PCT", 0.008),
 		FeeBreakevenPct:            floatEnv("FEE_BREAKEVEN_PCT", 0.0015),
@@ -120,14 +146,22 @@ func Load() Config {
 
 func parseSymbolOverrides() map[string]SymbolConfig {
 	overrides := make(map[string]SymbolConfig)
-	symbols := []string{"LAB", "BTC", "ETH", "SOL", "XRP", "NEAR", "HYPE", "SPCX", "WLD", "ZEC", "BTW"}
+	symbols := []string{"LAB", "BTC", "ETH", "SOL", "XRP", "NEAR", "HYPE", "SPCX", "WLD", "ZEC", "BTW", "UB"}
 	for _, sym := range symbols {
 		var sc SymbolConfig
 		slKey := sym + "_MIN_SL_PCT"
+		maxSlKey := sym + "_MAX_SL_PCT"
 		marginKey := sym + "_TRADE_MARGIN_USD"
+		levKey := sym + "_LEVERAGE"
+		timeStopKey := sym + "_TIME_STOP_SECONDS"
 		if v := os.Getenv(slKey); v != "" {
 			if f, err := strconv.ParseFloat(v, 64); err == nil {
 				sc.MinSLPct = &f
+			}
+		}
+		if v := os.Getenv(maxSlKey); v != "" {
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				sc.MaxSLPct = &f
 			}
 		}
 		if v := os.Getenv(marginKey); v != "" {
@@ -135,7 +169,17 @@ func parseSymbolOverrides() map[string]SymbolConfig {
 				sc.TradeMarginUSD = &f
 			}
 		}
-		if sc.MinSLPct != nil || sc.TradeMarginUSD != nil {
+		if v := os.Getenv(levKey); v != "" {
+			if i, err := strconv.Atoi(v); err == nil {
+				sc.Leverage = &i
+			}
+		}
+		if v := os.Getenv(timeStopKey); v != "" {
+			if i, err := strconv.Atoi(v); err == nil {
+				sc.TimeStopSeconds = &i
+			}
+		}
+		if sc.MinSLPct != nil || sc.MaxSLPct != nil || sc.TradeMarginUSD != nil || sc.Leverage != nil || sc.TimeStopSeconds != nil {
 			overrides[sym+"USDT"] = sc
 		}
 	}

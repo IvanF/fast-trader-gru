@@ -21,6 +21,8 @@ type TradeSignal struct {
 	SetupAction          string    `json:"setup_action,omitempty"`
 	AbortReason          string    `json:"abort_reason,omitempty"`
 	DecayReason          string    `json:"decay_reason,omitempty"`
+	MacroTrend5m         float64   `json:"macro_trend_5m,omitempty"`
+	MacroTrend15m        float64   `json:"macro_trend_15m,omitempty"`
 }
 
 // PendingOrderEvent notifies ML of pending entry lifecycle for alpha-decay abort.

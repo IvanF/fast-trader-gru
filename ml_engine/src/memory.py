@@ -19,6 +19,7 @@ class MemoryEntry:
     timestamp: float
     regime: str
     won: bool
+    direction: str = "HOLD"
 
 
 class ExperienceEngine:
@@ -46,7 +47,7 @@ class ExperienceEngine:
         with open(f"{self.index_path}.meta.json", "w", encoding="utf-8") as f:
             json.dump([e.__dict__ for e in self.metadata], f)
 
-    def add(self, vector: np.ndarray, pnl: float, regime: str) -> int:
+    def add(self, vector: np.ndarray, pnl: float, regime: str, direction: str = "HOLD") -> int:
         vec = vector.astype(np.float32).reshape(1, -1)
         faiss.normalize_L2(vec)
         vid = self.index.ntotal
@@ -57,6 +58,7 @@ class ExperienceEngine:
             timestamp=time.time(),
             regime=regime,
             won=pnl >= 0,
+            direction=direction.upper() if direction else "HOLD",
         ))
         return vid
 
@@ -68,7 +70,11 @@ class ExperienceEngine:
 
     def query(self, vector: np.ndarray, current_regime: str, k: int = 10) -> Tuple[np.ndarray, dict]:
         if self.index.ntotal == 0:
-            return np.zeros(8, dtype=np.float32), {"win_rate": 0.5, "avg_pnl": 0.0, "matches": 0}
+            v = np.zeros(10, dtype=np.float32)
+            v[0] = 0.5
+            v[8] = 0.5
+            v[9] = 0.5
+            return v, {"win_rate": 0.5, "avg_pnl": 0.0, "matches": 0, "long_win_rate": 0.5, "short_win_rate": 0.5}
 
         vec = vector.astype(np.float32).reshape(1, -1)
         faiss.normalize_L2(vec)
@@ -78,6 +84,10 @@ class ExperienceEngine:
         weighted_pnl = 0.0
         weighted_wins = 0.0
         total_weight = 0.0
+        long_wins = 0.0
+        long_weight = 0.0
+        short_wins = 0.0
+        short_weight = 0.0
         for dist, idx in zip(distances[0], indices[0]):
             if idx < 0 or idx >= len(self.metadata):
                 continue
@@ -86,12 +96,24 @@ class ExperienceEngine:
             weighted_pnl += entry.pnl * w
             weighted_wins += (1.0 if entry.won else 0.0) * w
             total_weight += w
+            if entry.direction == "LONG":
+                long_wins += (1.0 if entry.won else 0.0) * w
+                long_weight += w
+            elif entry.direction == "SHORT":
+                short_wins += (1.0 if entry.won else 0.0) * w
+                short_weight += w
 
         if total_weight <= 0:
-            return np.zeros(8, dtype=np.float32), {"win_rate": 0.5, "avg_pnl": 0.0, "matches": 0}
+            v = np.zeros(10, dtype=np.float32)
+            v[0] = 0.5
+            v[8] = 0.5
+            v[9] = 0.5
+            return v, {"win_rate": 0.5, "avg_pnl": 0.0, "matches": 0, "long_win_rate": 0.5, "short_win_rate": 0.5}
 
         win_rate = weighted_wins / total_weight
         avg_pnl = weighted_pnl / total_weight
+        long_win_rate = long_wins / max(long_weight, 1e-8) if long_weight > 0 else 0.5
+        short_win_rate = short_wins / max(short_weight, 1e-8) if short_weight > 0 else 0.5
         v_memory = np.array([
             win_rate, avg_pnl,
             float(np.tanh(avg_pnl / 100)),
@@ -100,8 +122,13 @@ class ExperienceEngine:
             1.0 if current_regime == "Trending" else 0.0,
             1.0 if current_regime == "Breakout" else 0.0,
             1.0 if current_regime == "Choppy" else 0.0,
+            long_win_rate,
+            short_win_rate,
         ], dtype=np.float32)
-        return v_memory, {"win_rate": win_rate, "avg_pnl": avg_pnl, "matches": int(k)}
+        return v_memory, {
+            "win_rate": win_rate, "avg_pnl": avg_pnl, "matches": int(k),
+            "long_win_rate": long_win_rate, "short_win_rate": short_win_rate,
+        }
 
     @property
     def size(self) -> int:

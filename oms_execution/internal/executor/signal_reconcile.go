@@ -137,7 +137,7 @@ func (s *Service) reconcileActivePosition(ctx context.Context, signal models.Tra
 
 	plan := grid.BuildPlan(signal, ob, pos.TickSize, pos.RemainingQty, pos.TimeStopSec, s.planOpts())
 	if s.exitGridNeedsRefresh(pos, plan, ob) {
-		return s.redeployExitGrid(ctx, pos, ob, plan.EntryPrice, plan.StopLoss, "signal_regime_update")
+		return s.redeployExitGrid(ctx, pos, ob, plan.EntryPrice, pos.StopLoss, "signal_regime_update")
 	}
 	return nil
 }
@@ -201,7 +201,7 @@ func (s *Service) maybeRefreshExitGrid(ctx context.Context, pos *models.ActivePo
 
 	plan := grid.BuildPlan(pos.Signal, ob, pos.TickSize, pos.RemainingQty, pos.TimeStopSec, s.planOpts())
 	if s.exitGridNeedsRefresh(pos, plan, ob) {
-		_ = s.redeployExitGrid(ctx, pos, ob, plan.EntryPrice, plan.StopLoss, "market_drift")
+		_ = s.redeployExitGrid(ctx, pos, ob, plan.EntryPrice, pos.StopLoss, "market_drift")
 	}
 }
 
@@ -249,7 +249,7 @@ func (s *Service) redeployExitGrid(
 
 	if s.tpGridNeedsRefresh(pos, plan, ob, exSize) {
 		tpRefPrice := pos.FillPrice
-		opts := s.exitGridOpts()
+		opts := s.exitGridOptsForSymbol(pos.Symbol)
 		opts.MaxTPPct = 0
 		exitGrid := grid.BuildExitGrid(
 			pos.Direction, tpRefPrice, plannedEntry, newSL, ob, pos.Signal,
@@ -287,9 +287,13 @@ func (s *Service) redeployExitGrid(
 }
 
 func (s *Service) tpGridNeedsRefresh(pos *models.ActivePosition, plan models.GridPlan, ob models.OrderbookSnapshot, exSize float64) bool {
+	actualSL := pos.StopLoss
+	if actualSL <= 0 {
+		actualSL = plan.StopLoss
+	}
 	fresh := grid.BuildExitGrid(
-		pos.Direction, pos.FillPrice, plan.EntryPrice, plan.StopLoss, ob, pos.Signal,
-		pos.TickSize, exSize, pos.QtyStep, pos.MinOrderQty, s.exitGridOpts(),
+		pos.Direction, pos.FillPrice, plan.EntryPrice, actualSL, ob, pos.Signal,
+		pos.TickSize, exSize, pos.QtyStep, pos.MinOrderQty, s.exitGridOptsForSymbol(pos.Symbol),
 	)
 	for _, tp := range pos.TakeProfitOrders {
 		if tp.Filled {
@@ -337,11 +341,6 @@ func (s *Service) cancelUnfilledExits(ctx context.Context, pos *models.ActivePos
 func (s *Service) exitGridNeedsRefresh(pos *models.ActivePosition, plan models.GridPlan, ob models.OrderbookSnapshot) bool {
 	if pos.StopLossOrder == nil || pos.StopLossOrder.Filled {
 		return false
-	}
-	if priceDriftPct(pos.StopLossOrder.Price, plan.StopLoss) >= s.cfg.ExitRepriceThresholdPct {
-		if !slWouldWiden(pos.Direction, pos.StopLoss, plan.StopLoss) {
-			return true
-		}
 	}
 	return s.tpGridNeedsRefresh(pos, plan, ob, pos.RemainingQty)
 }

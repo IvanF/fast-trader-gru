@@ -9,6 +9,42 @@ type ExitGridOptions struct {
 	MaxTPPct        float64
 	FeeBreakevenPct float64
 	MinSLPct        float64
+	MaxSLPct        float64
+	TimeStopSec     int
+}
+
+// MaxTPDistance calculates the maximum realistic TP distance based on
+// volatility (vm), time horizon (timeStopSec), and regime.
+// Uses sqrt-time scaling: longer holds allow proportionally larger moves.
+func MaxTPDistance(fillPrice, vm float64, timeStopSec int, regime string) float64 {
+	if timeStopSec <= 0 {
+		timeStopSec = 3600
+	}
+	if vm <= 0 {
+		vm = 1.0
+	}
+
+	baseSpacing := 0.0025
+	timeFactor := math.Sqrt(float64(timeStopSec) / 3600.0)
+
+	regimeMult := 1.0
+	switch regime {
+	case "Trending":
+		regimeMult = 1.5
+	case "Breakout":
+		regimeMult = 2.0
+	case "Choppy":
+		regimeMult = 0.8
+	}
+
+	maxMove := fillPrice * baseSpacing * vm * timeFactor * regimeMult * 3.0
+	if maxMove < fillPrice*0.005 {
+		maxMove = fillPrice * 0.005
+	}
+	if maxMove > fillPrice*0.10 {
+		maxMove = fillPrice * 0.10
+	}
+	return maxMove
 }
 
 // FeeAwareBreakevenPrice returns the minimum profitable exit (covers fees + micro-slippage).

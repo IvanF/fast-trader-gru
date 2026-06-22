@@ -25,21 +25,22 @@ func hasRemainingSize(size, minQty float64) bool {
 }
 
 func (s *Service) enforceSLPrice(ctx context.Context, pos *models.ActivePosition, slPrice, tickSize float64) float64 {
-	adjusted := grid.EnforceMinSLDistance(pos.FillPrice, slPrice, pos.Direction, s.cfg.MinSLPct, tickSize)
-	if grid.SLDistancePct(pos.FillPrice, adjusted) < s.cfg.MinSLPct {
+	minSLPct := s.cfg.GetMinSLPct(pos.Symbol)
+	adjusted := grid.EnforceMinSLDistance(pos.FillPrice, slPrice, pos.Direction, minSLPct, tickSize)
+	if grid.SLDistancePct(pos.FillPrice, adjusted) < minSLPct {
 		s.logger.Info("sl widened to min distance",
 			"symbol", pos.Symbol,
 			"fill", pos.FillPrice,
 			"requested", slPrice,
 			"adjusted", adjusted,
-			"min_pct", s.cfg.MinSLPct,
+			"min_pct", minSLPct,
 		)
 	}
 	ob, err := s.redis.GetOrderbook(ctx, pos.Symbol)
 	if err == nil {
 		mid := grid.MidPrice(ob)
 		if mid > 0 {
-			minDist := pos.FillPrice * s.cfg.MinSLPct
+			minDist := pos.FillPrice * minSLPct
 			if pos.Direction == "SHORT" && adjusted <= mid {
 				adjusted = grid.RoundToTick(mid+minDist, tickSize)
 				s.logger.Info("sl moved above current price (underwater)",
@@ -75,7 +76,7 @@ func (s *Service) deployExitGrid(ctx context.Context, pos *models.ActivePosition
 	}
 
 	tpRefPrice := pos.FillPrice
-	opts := s.exitGridOpts()
+	opts := s.exitGridOptsForSymbol(pos.Symbol)
 	opts.MaxTPPct = 0
 	exitGrid := grid.BuildExitGrid(
 		pos.Direction,
@@ -229,8 +230,8 @@ func (s *Service) placeStopLossCoveringRemainder(
 
 // atomicReplaceStopLoss places the new SL first, verifies it, then cancels the old SL.
 func (s *Service) atomicReplaceStopLoss(ctx context.Context, pos *models.ActivePosition, price, qty float64, kind string) error {
-	makerExit := kind == "confidence_decay_exit" || kind == "signal_exit"
-	if makerExit {
+	skipEnforce := kind == "confidence_decay_exit" || kind == "signal_exit" || kind == "trailing_stop"
+	if skipEnforce {
 		price = grid.RoundToTick(price, pos.TickSize)
 	} else {
 		price = s.enforceSLPrice(ctx, pos, price, pos.TickSize)
@@ -250,7 +251,7 @@ func (s *Service) atomicReplaceStopLoss(ctx context.Context, pos *models.ActiveP
 	if obErr == nil {
 		mid := grid.MidPrice(ob)
 		if mid > 0 {
-			minDist := pos.FillPrice * s.cfg.MinSLPct
+			minDist := pos.FillPrice * s.cfg.GetMinSLPct(pos.Symbol)
 			if pos.Direction == "SHORT" && price <= mid {
 				price = grid.RoundToTick(mid+minDist, pos.TickSize)
 				s.logger.Info("sl moved above current price (underwater)",
@@ -275,7 +276,8 @@ func (s *Service) atomicReplaceStopLoss(ctx context.Context, pos *models.ActiveP
 	side := closeSide(pos.Direction)
 	var newID string
 	var err error
-	if makerExit {
+	isMaker := kind == "confidence_decay_exit" || kind == "signal_exit"
+	if isMaker {
 		newID, err = s.bybit.PlaceReducePostOnlyLimit(ctx, pos.Symbol, side, qty, pos.QtyStep, bybit.FormatPrice(price))
 	} else {
 		triggerDir := 2
@@ -312,7 +314,7 @@ func (s *Service) atomicReplaceStopLoss(ctx context.Context, pos *models.ActiveP
 		Price:   price,
 		Qty:     qty,
 		Kind:    kind,
-		IsStop:  !makerExit,
+		IsStop:  kind != "confidence_decay_exit" && kind != "signal_exit",
 	}
 	s.logger.Info("stop loss atomically replaced",
 		"symbol", pos.Symbol,
@@ -498,6 +500,22 @@ func (s *Service) monitorExitOrders(ctx context.Context, pos *models.ActivePosit
 		}
 	}
 
+	// For positions without TPs (min-lot), activate breakeven+trailing when price covers fees.
+	if !pos.BreakevenSet && !pos.TimeStopPlaced && len(pos.TakeProfitOrders) == 0 {
+		ob, obErr := s.redis.GetOrderbook(ctx, pos.Symbol)
+		if obErr == nil {
+			mid := grid.MidPrice(ob)
+			if mid > 0 {
+				feeDist := pos.FillPrice * s.cfg.FeeBreakevenPct
+				if (pos.Direction == "LONG" && mid >= pos.FillPrice+feeDist) ||
+					(pos.Direction == "SHORT" && mid <= pos.FillPrice-feeDist) {
+					pos.BreakevenSet = true
+					pos.PartialTaken = true
+				}
+			}
+		}
+	}
+
 	// Trailing SL: after breakeven, trail SL to lock in profits.
 	if pos.BreakevenSet && !pos.TimeStopPlaced {
 		s.maybeTrailStopLoss(ctx, pos, exSize)
@@ -555,12 +573,26 @@ func (s *Service) maybeTrailStopLoss(ctx context.Context, pos *models.ActivePosi
 	newSL = grid.RoundToTick(newSL, pos.TickSize)
 	// Do NOT enforce min SL distance here — trailing SL intentionally moves SL closer to price.
 
+	// Re-check price: mid may have moved since initial fetch. Bybit rejects trigger on wrong side.
+	ob2, ob2Err := s.redis.GetOrderbook(ctx, pos.Symbol)
+	if ob2Err == nil {
+		now := grid.MidPrice(ob2)
+		if now > 0 {
+			if pos.Direction == "SHORT" && newSL <= now {
+				return
+			}
+			if pos.Direction == "LONG" && newSL >= now {
+				return
+			}
+		}
+	}
+
 	slQty := s.slCoverQty(pos, exSize)
 	if slQty <= 0 {
 		return
 	}
 
-	if err := s.atomicReplaceStopLoss(ctx, pos, newSL, slQty, "stop_loss"); err != nil {
+	if err := s.atomicReplaceStopLoss(ctx, pos, newSL, slQty, "trailing_stop"); err != nil {
 		s.logger.Warn("trailing SL failed", "symbol", pos.Symbol, "error", err)
 		return
 	}

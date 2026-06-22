@@ -103,17 +103,21 @@ func (s *Service) adoptExchangePosition(ctx context.Context, exPos bybit.Positio
 		ob = models.OrderbookSnapshot{Symbol: exPos.Symbol}
 	}
 
-	plan := grid.BuildPlan(signal, ob, inst.TickSize, qty, s.cfg.TimeStopSeconds, s.planOpts())
+	leverage := s.cfg.GetLeverage(exPos.Symbol)
+	timeStop := s.cfg.GetTimeStopSeconds(exPos.Symbol)
+	minSLPct := s.cfg.GetMinSLPct(exPos.Symbol)
+
+	plan := grid.BuildPlan(signal, ob, inst.TickSize, qty, timeStop, s.planOpts())
 	if plan.StopLoss <= 0 {
 		plan.StopLoss = fillPrice * 0.99
 		if direction == "SHORT" {
 			plan.StopLoss = fillPrice * 1.01
 		}
 	}
-	plan.StopLoss = grid.EnforceMinSLDistance(fillPrice, plan.StopLoss, direction, s.cfg.MinSLPct, inst.TickSize)
+	plan.StopLoss = grid.EnforceMinSLDistance(fillPrice, plan.StopLoss, direction, minSLPct, inst.TickSize)
 
 	notional := qty * fillPrice
-	marginUSD := notional / float64(max(s.cfg.Leverage, 1))
+	marginUSD := notional / float64(max(leverage, 1))
 
 	pos := &models.ActivePosition{
 		Symbol:       exPos.Symbol,
@@ -126,13 +130,13 @@ func (s *Service) adoptExchangePosition(ctx context.Context, exPos bybit.Positio
 		RemainingQty: qty,
 		StopLoss:     plan.StopLoss,
 		EntryTime:    time.Now().UnixMilli(),
-		TimeStopSec:  s.cfg.TimeStopSeconds,
+		TimeStopSec:  timeStop,
 		QtyStep:      inst.Lot.QtyStep,
 		MinOrderQty:  inst.Lot.MinOrderQty,
 		TickSize:     inst.TickSize,
 		MarginUSD:    marginUSD,
 		NotionalUSD:  notional,
-		Leverage:     s.cfg.Leverage,
+		Leverage:     leverage,
 		Signal:       signal,
 		FilledAt:     time.Now().UnixMilli(),
 	}

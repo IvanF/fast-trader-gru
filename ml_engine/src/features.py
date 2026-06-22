@@ -129,6 +129,42 @@ class SymbolBuffer:
             return 0.0
         return (prices[-1] - prices[0]) / prices[0]
 
+    def liquidity_features(self) -> np.ndarray:
+        bid_vol = sum(_level_size(b) for b in self.latest_bids[:10]) if self.latest_bids else 0.0
+        ask_vol = sum(_level_size(a) for a in self.latest_asks[:10]) if self.latest_asks else 0.0
+        total_depth = bid_vol + ask_vol
+        depth_imbalance = (bid_vol - ask_vol) / total_depth if total_depth > 0 else 0.0
+
+        top3_bid = sum(_level_size(b) for b in self.latest_bids[:3]) if self.latest_bids else 0.0
+        top3_ask = sum(_level_size(a) for a in self.latest_asks[:3]) if self.latest_asks else 0.0
+        top3_total = top3_bid + top3_ask
+        depth_concentration = top3_total / total_depth if total_depth > 0 else 0.0
+
+        spread_bps = 0.0
+        if self.latest_bids and self.latest_asks:
+            best_bid = _level_price(self.latest_bids[0])
+            best_ask = _level_price(self.latest_asks[0])
+            if best_bid > 0 and best_ask > 0:
+                spread_bps = (best_ask - best_bid) / best_bid * 10000
+
+        avg_level_size = total_depth / 10.0 if total_depth > 0 else 0.0
+        avg_fill = np.mean([p.size for p in self.points if p.size > 0]) if any(p.size > 0 for p in self.points) else 0.0
+        fill_to_depth = avg_fill / avg_level_size if avg_level_size > 0 else 0.0
+
+        bid_levels = sum(1 for b in self.latest_bids[:10] if _level_size(b) > 0) if self.latest_bids else 0
+        ask_levels = sum(1 for a in self.latest_asks[:10] if _level_size(a) > 0) if self.latest_asks else 0
+        level_density = (bid_levels + ask_levels) / 20.0
+
+        return np.array([
+            depth_imbalance,
+            depth_concentration,
+            spread_bps,
+            fill_to_depth,
+            level_density,
+            np.tanh(bid_vol / 1e6),
+            np.tanh(ask_vol / 1e6),
+        ], dtype=np.float32)
+
     def feature_vector(self) -> np.ndarray:
         obi = self.order_book_imbalance()
         cvd_norm = np.tanh(self.cvd / 1e6)
@@ -136,10 +172,11 @@ class SymbolBuffer:
         vwap_dev = self.vwap_deviation()
         trend_15m = self.macro_trend(900)
         trend_1h = self.macro_trend(3600)
-        return np.array([
+        base = np.array([
             obi, cvd_norm, ofs, vwap_dev,
             trend_15m, trend_1h, self.funding_rate,
         ], dtype=np.float32)
+        return np.concatenate([base, self.liquidity_features()])
 
     def orderbook_sequence(self, length: int = 60) -> np.ndarray:
         obs = [p for p in self.points if p.side == "OB"]

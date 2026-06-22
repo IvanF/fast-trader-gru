@@ -311,7 +311,8 @@ class MLEngine:
                 vec = np.pad(vec, (0, self.cfg.state_dim - vec.size))
             pnl = float(data.get("net_pnl", 0))
             regime = data.get("regime", "Choppy")
-            self.memory.add(vec[: self.cfg.state_dim], pnl, regime)
+            direction = data.get("direction", "HOLD")
+            self.memory.add(vec[: self.cfg.state_dim], pnl, regime, direction)
             prom.faiss_index_size.set(self.memory.size)
 
             if self.influx is not None:
@@ -842,6 +843,9 @@ class MLEngine:
             min_tp_pct=self.cfg.min_tp_pct,
             fee_breakeven_pct=self.cfg.fee_breakeven_pct,
             max_tp_pct=self.cfg.max_tp_pct,
+            max_sl_pct=self.cfg.max_sl_pct,
+            macro_trend_5m=buf.macro_trend(300),
+            macro_trend_15m=buf.macro_trend(900),
         )
 
         signal = {
@@ -854,6 +858,8 @@ class MLEngine:
             "regime": regime.value,
             "btc_correlation": corr,
             "position_scale": position_scale,
+            "macro_trend_5m": buf.macro_trend(300),
+            "macro_trend_15m": buf.macro_trend(900),
             "timestamp": int(time.time() * 1000),
             "signal_id": str(uuid.uuid4()),
         }

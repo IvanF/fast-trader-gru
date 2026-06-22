@@ -32,6 +32,7 @@ class Config:
     min_tp_pct: float
     max_tp_pct: float
     fee_breakeven_pct: float
+    max_sl_pct: float
     entry_maker_ticks: int
     buffer_seconds: int
     regime_interval_sec: int
@@ -87,6 +88,7 @@ class Config:
             min_tp_pct=float(os.getenv("MIN_TP_PCT", "0.002")),
             max_tp_pct=float(os.getenv("MAX_TP_PCT", "0.008")),
             fee_breakeven_pct=float(os.getenv("FEE_BREAKEVEN_PCT", "0.0015")),
+            max_sl_pct=float(os.getenv("MAX_SL_PCT", "0.012")),
             entry_maker_ticks=int(os.getenv("ENTRY_MAKER_TICKS", "2")),
             buffer_seconds=int(os.getenv("BUFFER_SECONDS", "300")),
             regime_interval_sec=int(os.getenv("REGIME_INTERVAL_SEC", "60")),
