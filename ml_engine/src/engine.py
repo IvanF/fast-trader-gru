@@ -312,7 +312,12 @@ class MLEngine:
             pnl = float(data.get("net_pnl", 0))
             regime = data.get("regime", "Choppy")
             direction = data.get("direction", "HOLD")
-            self.memory.add(vec[: self.cfg.state_dim], pnl, regime, direction)
+            # Filter large losses from FAISS — they skew memory avg_pnl.
+            # Keep them in InfluxDB for retraining (class weights handle balance).
+            if pnl >= -0.10:
+                self.memory.add(vec[: self.cfg.state_dim], pnl, regime, direction)
+            else:
+                logger.info("skipping large loss from FAISS: %s pnl=%.4f", data.get("symbol"), pnl)
             prom.faiss_index_size.set(self.memory.size)
 
             if self.influx is not None:
@@ -624,18 +629,18 @@ class MLEngine:
         )
 
     def _score_symbol(self, symbol: str, buf):
-        """Run ONNX inference and return (direction, confidence, vol_mult, state_vec, regime)."""
+        """Run ONNX inference and return (direction, confidence, vol_mult, state_vec, regime, memory_info)."""
         ob_seq = buf.orderbook_sequence()
         flow_seq = buf.flow_sequence()
         macro = buf.feature_vector()
 
         v_state = self.inference.infer_state_vector(ob_seq, flow_seq, macro)
         regime = self.regime.get(symbol)
-        v_memory, _ = self.memory.query(v_state, regime.value)
+        v_memory, memory_info = self.memory.query(v_state, regime.value)
 
         direction, confidence, vol_mult = self.inference.decide(v_state, v_memory)
         vol_mult = min(max(vol_mult, 0.5), self.cfg.vol_multiplier_cap)
-        return direction, confidence, vol_mult, v_state, regime
+        return direction, confidence, vol_mult, v_state, regime, memory_info
 
     def _obi_against(self, direction: str, buf) -> bool:
         obi = buf.order_book_imbalance()
@@ -700,7 +705,7 @@ class MLEngine:
         if open_pos is None or open_pos.get("decay_signaled"):
             return None
 
-        direction, confidence, vol_mult, v_state, regime = self._score_symbol(symbol, buf)
+        direction, confidence, vol_mult, v_state, regime, _ = self._score_symbol(symbol, buf)
         self._stats["predictions"] += 1
         prom.confidence_score.labels(symbol=symbol).set(confidence)
 
@@ -744,7 +749,7 @@ class MLEngine:
         if pending is None or pending.get("abort_signaled"):
             return None
 
-        direction, confidence, vol_mult, v_state, regime = self._score_symbol(symbol, buf)
+        direction, confidence, vol_mult, v_state, regime, _ = self._score_symbol(symbol, buf)
         self._stats["predictions"] += 1
         prom.confidence_score.labels(symbol=symbol).set(confidence)
 
@@ -802,7 +807,7 @@ class MLEngine:
     def _run_tick_prediction(self, symbol: str, buf) -> dict | None:
         """CPU-bound ONNX inference — runs in a thread pool to keep the event loop responsive."""
         tick_start = time.time()
-        direction, confidence, vol_mult, v_state, regime = self._score_symbol(symbol, buf)
+        direction, confidence, vol_mult, v_state, regime, mem_info = self._score_symbol(symbol, buf)
         self._stats["predictions"] += 1
         corr = self.features.correlation_with_btc(symbol)
         prom.btc_correlation.labels(symbol=symbol).set(corr)
@@ -813,6 +818,34 @@ class MLEngine:
                 direction = "HOLD"
                 self._stats["hold_correlation"] += 1
             position_scale = 0.25
+
+        # Direction gate: Expected Value based — flip or block when direction is clearly unprofitable
+        if direction != "HOLD" and mem_info.get("matches", 0) >= 5:
+            short_ev = mem_info.get("short_avg_pnl", 0.0)
+            long_ev = mem_info.get("long_avg_pnl", 0.0)
+            short_matches = mem_info.get("short_matches", 0)
+            long_matches = mem_info.get("long_matches", 0)
+
+            if direction == "SHORT" and short_matches >= 3:
+                if short_ev < -0.01 and long_matches >= 3 and long_ev > 0:
+                    direction = "LONG"
+                    logger.info("EV gate: SHORT→LONG for %s (short_ev=$%.4f long_ev=$%.4f)",
+                                symbol, short_ev, long_ev)
+                elif short_ev < -0.05 and (long_matches < 3 or long_ev <= 0):
+                    direction = "HOLD"
+                    self._stats["hold_direction"] += 1
+                    logger.info("EV gate: SHORT→HOLD for %s (short_ev=$%.4f)",
+                                symbol, short_ev)
+            elif direction == "LONG" and long_matches >= 3:
+                if long_ev < -0.01 and short_matches >= 3 and short_ev > 0:
+                    direction = "SHORT"
+                    logger.info("EV gate: LONG→SHORT for %s (long_ev=$%.4f short_ev=$%.4f)",
+                                symbol, long_ev, short_ev)
+                elif long_ev < -0.05 and (short_matches < 3 or short_ev <= 0):
+                    direction = "HOLD"
+                    self._stats["hold_direction"] += 1
+                    logger.info("EV gate: LONG→HOLD for %s (long_ev=$%.4f)",
+                                symbol, long_ev)
 
         prom.confidence_score.labels(symbol=symbol).set(confidence)
         prom.volatility_multiplier.labels(symbol=symbol).set(vol_mult)

@@ -86,8 +86,10 @@ class ExperienceEngine:
         total_weight = 0.0
         long_wins = 0.0
         long_weight = 0.0
+        long_pnl = 0.0
         short_wins = 0.0
         short_weight = 0.0
+        short_pnl = 0.0
         for dist, idx in zip(distances[0], indices[0]):
             if idx < 0 or idx >= len(self.metadata):
                 continue
@@ -99,21 +101,30 @@ class ExperienceEngine:
             if entry.direction == "LONG":
                 long_wins += (1.0 if entry.won else 0.0) * w
                 long_weight += w
+                long_pnl += entry.pnl * w
             elif entry.direction == "SHORT":
                 short_wins += (1.0 if entry.won else 0.0) * w
                 short_weight += w
+                short_pnl += entry.pnl * w
 
         if total_weight <= 0:
             v = np.zeros(10, dtype=np.float32)
             v[0] = 0.5
             v[8] = 0.5
             v[9] = 0.5
-            return v, {"win_rate": 0.5, "avg_pnl": 0.0, "matches": 0, "long_win_rate": 0.5, "short_win_rate": 0.5}
+            return v, {"win_rate": 0.5, "avg_pnl": 0.0, "matches": 0, "long_win_rate": 0.5, "short_win_rate": 0.5,
+                       "long_avg_pnl": 0.0, "short_avg_pnl": 0.0, "long_matches": 0, "short_matches": 0}
 
         win_rate = weighted_wins / total_weight
         avg_pnl = weighted_pnl / total_weight
         long_win_rate = long_wins / max(long_weight, 1e-8) if long_weight > 0 else 0.5
         short_win_rate = short_wins / max(short_weight, 1e-8) if short_weight > 0 else 0.5
+        long_avg_pnl = long_pnl / max(long_weight, 1e-8) if long_weight > 0 else 0.0
+        short_avg_pnl = short_pnl / max(short_weight, 1e-8) if short_weight > 0 else 0.0
+        long_matches = sum(1 for dist, idx in zip(distances[0], indices[0])
+                          if 0 <= idx < len(self.metadata) and self.metadata[idx].direction == "LONG")
+        short_matches = sum(1 for dist, idx in zip(distances[0], indices[0])
+                           if 0 <= idx < len(self.metadata) and self.metadata[idx].direction == "SHORT")
         v_memory = np.array([
             win_rate, avg_pnl,
             float(np.tanh(avg_pnl / 100)),
@@ -128,6 +139,8 @@ class ExperienceEngine:
         return v_memory, {
             "win_rate": win_rate, "avg_pnl": avg_pnl, "matches": int(k),
             "long_win_rate": long_win_rate, "short_win_rate": short_win_rate,
+            "long_avg_pnl": long_avg_pnl, "short_avg_pnl": short_avg_pnl,
+            "long_matches": long_matches, "short_matches": short_matches,
         }
 
     @property

@@ -218,10 +218,21 @@ func buildHeuristicTPs(
 	}
 	tpBudget := bybit.NormalizeQty(totalQty*tpBudgetPct, qtyStep, minQty)
 	if tpBudget <= 0 {
-		return nil
+		if totalQty >= minQty {
+			tpBudget = minQty
+		} else {
+			return nil
+		}
 	}
 
 	var out []ExitLevel
+
+	// For very small positions: single breakeven TP at fillPrice
+	if totalQty <= minQty*2 {
+		bePrice := FeeAwareBreakevenPrice(fillPrice, direction, 0.002, tickSize)
+		out = append(out, ExitLevel{Price: bePrice, Qty: minQty, Kind: "breakeven"})
+		return out
+	}
 
 	beQty := qtyFromWeight(tpBudget, tpLevelWeights[0], qtyStep, minQty)
 	if beQty > 0 {
@@ -250,14 +261,14 @@ func buildHeuristicTPs(
 		out = append(out, ExitLevel{Price: wallPrice, Qty: wallQty, Kind: "wall"})
 	}
 
-	rMult := 2.0
+	rMult := 1.5
 	switch signal.Regime {
 	case "Trending":
-		rMult = 2.5
+		rMult = 2.0
 	case "Breakout":
-		rMult = 3.0
+		rMult = 2.5
 	case "Choppy":
-		rMult = 1.5
+		rMult = 1.2
 	}
 	rMult *= vm
 
@@ -355,9 +366,14 @@ func finalizeGridAllocation(grid *ExitGrid, totalQty, qtyStep, minQty, tpBudgetP
 
 	maxTPQty := totalQty - minQty
 	if maxTPQty < minQty {
-		grid.TakeProfits = nil
-		grid.StopLoss.Qty = totalQty
-		return
+		if len(grid.TakeProfits) > 0 {
+			grid.TakeProfits = grid.TakeProfits[:1]
+			grid.TakeProfits[0].Qty = minQty
+		} else {
+			grid.TakeProfits = nil
+			grid.StopLoss.Qty = totalQty
+			return
+		}
 	}
 
 	var tpSum float64
@@ -367,19 +383,25 @@ func finalizeGridAllocation(grid *ExitGrid, totalQty, qtyStep, minQty, tpBudgetP
 	}
 
 	if tpSum > maxTPQty && tpSum > 0 {
-		scale := maxTPQty / tpSum
-		tpSum = 0
-		trimmed := make([]ExitLevel, 0, len(grid.TakeProfits))
-		for _, tp := range grid.TakeProfits {
-			q := bybit.NormalizeQty(tp.Qty*scale, qtyStep, minQty)
-			if q <= 0 || tpSum+q > maxTPQty {
-				continue
+		if maxTPQty > 0 {
+			scale := maxTPQty / tpSum
+			tpSum = 0
+			trimmed := make([]ExitLevel, 0, len(grid.TakeProfits))
+			for _, tp := range grid.TakeProfits {
+				q := bybit.NormalizeQty(tp.Qty*scale, qtyStep, minQty)
+				if q <= 0 || tpSum+q > maxTPQty {
+					continue
+				}
+				tp.Qty = q
+				trimmed = append(trimmed, tp)
+				tpSum += q
 			}
-			tp.Qty = q
-			trimmed = append(trimmed, tp)
-			tpSum += q
+			grid.TakeProfits = trimmed
+		} else {
+			grid.TakeProfits = grid.TakeProfits[:1]
+			grid.TakeProfits[0].Qty = minQty
+			tpSum = minQty
 		}
-		grid.TakeProfits = trimmed
 	}
 
 	slQty := bybit.NormalizeQty(totalQty, qtyStep, minQty)

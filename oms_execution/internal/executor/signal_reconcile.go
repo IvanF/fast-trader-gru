@@ -198,6 +198,12 @@ func (s *Service) maybeRefreshExitGrid(ctx context.Context, pos *models.ActivePo
 	if !pos.ExitGridReady || pos.TimeStopPlaced {
 		return
 	}
+	if pos.LastGridDeployAt > 0 {
+		elapsed := time.Now().UnixMilli() - pos.LastGridDeployAt
+		if elapsed < int64(s.cfg.ExitGridMinRedeploySec)*1000 {
+			return
+		}
+	}
 
 	plan := grid.BuildPlan(pos.Signal, ob, pos.TickSize, pos.RemainingQty, pos.TimeStopSec, s.planOpts())
 	if s.exitGridNeedsRefresh(pos, plan, ob) {
@@ -248,14 +254,73 @@ func (s *Service) redeployExitGrid(
 	}
 
 	if s.tpGridNeedsRefresh(pos, plan, ob, exSize) {
+		elapsed := time.Now().UnixMilli() - pos.LastGridDeployAt
+		if elapsed >= int64(s.cfg.ExitGridMinRedeploySec)*1000 {
 		tpRefPrice := pos.FillPrice
 		opts := s.exitGridOptsForSymbol(pos.Symbol)
 		opts.MaxTPPct = 0
-		exitGrid := grid.BuildExitGrid(
-			pos.Direction, tpRefPrice, plannedEntry, newSL, ob, pos.Signal,
-			pos.TickSize, exSize, pos.QtyStep, pos.MinOrderQty, opts,
-		)
+
+		var exitGrid grid.ExitGrid
+		if exSize < pos.MinOrderQty*2 {
+			tpPrice := pos.FillPrice
+			if pos.Direction == "SHORT" {
+				tpPrice = grid.FeeAwareBreakevenPrice(pos.FillPrice, "SHORT", opts.FeeBreakevenPct, pos.TickSize)
+			} else {
+				tpPrice = grid.FeeAwareBreakevenPrice(pos.FillPrice, "LONG", opts.FeeBreakevenPct, pos.TickSize)
+			}
+			mid := grid.MidPrice(ob)
+			if mid > 0 {
+				if pos.Direction == "SHORT" && tpPrice >= mid {
+					tpPrice = grid.RoundToTick(mid-pos.FillPrice*opts.MinTPPct, pos.TickSize)
+				}
+				if pos.Direction == "LONG" && tpPrice <= mid {
+					tpPrice = grid.RoundToTick(mid+pos.FillPrice*opts.MinTPPct, pos.TickSize)
+				}
+			}
+			exitGrid = grid.ExitGrid{
+				StopLoss: grid.ExitLevel{Price: newSL, Kind: "stop_loss"},
+				TakeProfits: []grid.ExitLevel{
+					{Price: tpPrice, Qty: exSize, Kind: "breakeven"},
+				},
+			}
+		} else {
+			exitGrid = grid.BuildExitGrid(
+				pos.Direction, tpRefPrice, plannedEntry, newSL, ob, pos.Signal,
+				pos.TickSize, exSize, pos.QtyStep, pos.MinOrderQty, opts,
+			)
+			mid := grid.MidPrice(ob)
+			if mid > 0 {
+				filtered := exitGrid.TakeProfits[:0]
+				for _, tp := range exitGrid.TakeProfits {
+					if pos.Direction == "SHORT" && tp.Price >= mid {
+						continue
+					}
+					if pos.Direction == "LONG" && tp.Price <= mid {
+						continue
+					}
+					filtered = append(filtered, tp)
+				}
+				exitGrid.TakeProfits = filtered
+			}
+		}
+
 		if len(exitGrid.TakeProfits) == 0 {
+			bePrice := grid.FeeAwareBreakevenPrice(pos.FillPrice, pos.Direction, opts.FeeBreakevenPct, pos.TickSize)
+			mid := grid.MidPrice(ob)
+			if mid > 0 {
+				if pos.Direction == "SHORT" && bePrice >= mid {
+					bePrice = grid.RoundToTick(mid-pos.FillPrice*opts.MinTPPct, pos.TickSize)
+				}
+				if pos.Direction == "LONG" && bePrice <= mid {
+					bePrice = grid.RoundToTick(mid+pos.FillPrice*opts.MinTPPct, pos.TickSize)
+				}
+			}
+			tpID, err := s.bybit.PlaceReduceLimit(ctx, pos.Symbol, closeSide(pos.Direction), exSize, pos.QtyStep, bybit.FormatPrice(bePrice))
+			if err == nil {
+				pos.TakeProfitOrders = []models.ExitOrder{{OrderID: tpID, Price: bePrice, Qty: exSize, Kind: "breakeven"}}
+				pos.LastGridDeployAt = time.Now().UnixMilli()
+				return nil
+			}
 			pos.LastGridDeployAt = time.Now().UnixMilli()
 			return nil
 		}
@@ -263,6 +328,7 @@ func (s *Service) redeployExitGrid(
 			"symbol", pos.Symbol,
 			"reason", reason,
 			"qty", exSize,
+			"tp_count", len(exitGrid.TakeProfits),
 		)
 		s.cancelTPOrdersOnly(ctx, pos)
 		side := closeSide(pos.Direction)
@@ -280,6 +346,7 @@ func (s *Service) redeployExitGrid(
 			})
 		}
 		s.syncSLToFullRemainder(ctx, pos)
+		}
 	}
 
 	pos.LastGridDeployAt = time.Now().UnixMilli()
@@ -295,6 +362,20 @@ func (s *Service) tpGridNeedsRefresh(pos *models.ActivePosition, plan models.Gri
 		pos.Direction, pos.FillPrice, plan.EntryPrice, actualSL, ob, pos.Signal,
 		pos.TickSize, exSize, pos.QtyStep, pos.MinOrderQty, s.exitGridOptsForSymbol(pos.Symbol),
 	)
+	mid := grid.MidPrice(ob)
+	if mid > 0 {
+		filtered := fresh.TakeProfits[:0]
+		for _, tp := range fresh.TakeProfits {
+			if pos.Direction == "SHORT" && tp.Price >= mid {
+				continue
+			}
+			if pos.Direction == "LONG" && tp.Price <= mid {
+				continue
+			}
+			filtered = append(filtered, tp)
+		}
+		fresh.TakeProfits = filtered
+	}
 	for _, tp := range pos.TakeProfitOrders {
 		if tp.Filled {
 			continue

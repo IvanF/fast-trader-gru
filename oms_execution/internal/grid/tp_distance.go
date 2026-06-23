@@ -24,25 +24,25 @@ func MaxTPDistance(fillPrice, vm float64, timeStopSec int, regime string) float6
 		vm = 1.0
 	}
 
-	baseSpacing := 0.0025
+	baseSpacing := 0.002
 	timeFactor := math.Sqrt(float64(timeStopSec) / 3600.0)
 
 	regimeMult := 1.0
 	switch regime {
 	case "Trending":
-		regimeMult = 1.5
+		regimeMult = 1.2
 	case "Breakout":
-		regimeMult = 2.0
+		regimeMult = 1.5
 	case "Choppy":
 		regimeMult = 0.8
 	}
 
 	maxMove := fillPrice * baseSpacing * vm * timeFactor * regimeMult * 3.0
-	if maxMove < fillPrice*0.005 {
-		maxMove = fillPrice * 0.005
+	if maxMove < fillPrice*0.003 {
+		maxMove = fillPrice * 0.003
 	}
-	if maxMove > fillPrice*0.10 {
-		maxMove = fillPrice * 0.10
+	if maxMove > fillPrice*0.05 {
+		maxMove = fillPrice * 0.05
 	}
 	return maxMove
 }

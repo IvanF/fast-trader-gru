@@ -161,6 +161,18 @@ func (s *Service) adoptExchangePosition(ctx context.Context, exPos bybit.Positio
 	)
 
 	if err := s.deployExitGrid(ctx, pos, ob, plan.EntryPrice, plan.StopLoss, inst.TickSize); err != nil {
+		notional := qty * fillPrice
+		if len(pos.TakeProfitOrders) == 0 && notional < 15.0 {
+			s.logger.Warn("orphan with no TPs and small notional, flattening",
+				"symbol", exPos.Symbol, "qty", qty, "notional", notional)
+			s.cancelExitOrders(ctx, pos)
+			if flatErr := s.ensureExchangeFlat(ctx, pos, "orphan_remainder_close"); flatErr != nil {
+				s.logger.Error("orphan flatten failed", "symbol", exPos.Symbol, "error", flatErr)
+			} else {
+				s.tryFinalizePosition(ctx, pos, "orphan_remainder_close", 0)
+				return
+			}
+		}
 		s.logger.Error("orphan exit grid deploy failed", "symbol", exPos.Symbol, "error", err)
 	}
 	s.publishPositionOpened(ctx, pos)

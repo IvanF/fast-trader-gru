@@ -699,6 +699,18 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 			s.handleGhostPosition(ctx, pos)
 			return
 		}
+		notional := exSize * pos.FillPrice
+		if len(pos.TakeProfitOrders) == 0 && notional < 15.0 {
+			s.logger.Warn("grid failed with small remainder, flattening",
+				"symbol", symbol, "qty", exSize, "notional", notional)
+			_ = s.bybit.CancelAllOrders(ctx, pos.Symbol)
+			if err := s.ensureExchangeFlat(ctx, pos, "grid_fail_remainder_close"); err != nil {
+				s.logger.Warn("grid fail flatten failed", "symbol", symbol, "error", err)
+			} else {
+				s.tryFinalizePosition(ctx, pos, "grid_fail_close", 0)
+			}
+			return
+		}
 		ob, err := s.redis.GetOrderbook(ctx, symbol)
 		if err != nil {
 			return
@@ -717,6 +729,44 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	if err != nil {
 		return
 	}
+
+	// Close small remainder BEFORE retryMissingTakeProfits creates new TPs
+	closeSmall := false
+	if len(pos.TakeProfitOrders) == 0 && !pos.PartialTaken {
+		closeSmall = true
+	}
+	if !closeSmall {
+		allTPsFilled := true
+		for _, tp := range pos.TakeProfitOrders {
+			if !tp.Filled {
+				allTPsFilled = false
+				break
+			}
+		}
+		if allTPsFilled && pos.PartialTaken {
+			closeSmall = true
+		}
+	}
+	if closeSmall {
+		exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
+		if hasPos && exSize > 0 {
+			notional := exSize * pos.FillPrice
+			s.logger.Info("remainder check",
+				"symbol", pos.Symbol, "qty", exSize, "notional", notional, "close", notional < 15.0)
+			if notional < 20.0 {
+				s.logger.Warn("closing small remainder",
+					"symbol", pos.Symbol, "qty", exSize, "notional", notional)
+				s.cancelExitOrders(ctx, pos)
+				if err := s.ensureExchangeFlat(ctx, pos, "remainder_close"); err != nil {
+					s.logger.Warn("remainder close failed", "symbol", pos.Symbol, "error", err)
+				} else {
+					s.tryFinalizePosition(ctx, pos, "take_profit_grid", 0)
+					return
+				}
+			}
+		}
+	}
+
 	s.retryMissingTakeProfits(ctx, pos, ob)
 
 	if elapsedMs(pos.EntryTime) > int64(pos.TimeStopSec)*1000 {
