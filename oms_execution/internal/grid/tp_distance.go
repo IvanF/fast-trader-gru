@@ -4,13 +4,16 @@ import "math"
 
 // ExitGridOptions controls TP ladder pricing floors and ceilings.
 type ExitGridOptions struct {
-	TPBudgetPct     float64
-	MinTPPct        float64
-	MaxTPPct        float64
-	FeeBreakevenPct float64
-	MinSLPct        float64
-	MaxSLPct        float64
-	TimeStopSec     int
+	TPBudgetPct        float64
+	MinTPPct           float64
+	MaxTPPct           float64
+	FeeBreakevenPct    float64
+	MinSLPct           float64
+	MaxSLPct           float64
+	TimeStopSec        int
+	EntryFeeRate       float64 // taker fee rate for entry (e.g. 0.00055)
+	ExitFeeRate        float64 // maker fee rate for exit (e.g. 0.0002)
+	TargetNetProfitPct float64 // target net profit as fraction (e.g. 0.002 = 0.2%)
 }
 
 // MaxTPDistance calculates the maximum realistic TP distance based on
@@ -131,32 +134,36 @@ func applyTPPriceFloors(
 	minBE := FeeAwareBreakevenPrice(fillPrice, direction, feeBreakevenPct, tickSize)
 	out := make([]ExitLevel, 0, len(levels))
 	for _, lv := range levels {
-		price := EnforceMinTPDistance(fillPrice, lv.Price, direction, minTPPct, tickSize)
-		if lv.Kind == "breakeven" {
-			switch direction {
-			case "LONG":
-				if price < minBE {
-					price = minBE
-				}
-			case "SHORT":
-				if price > minBE {
-					price = minBE
+		if lv.Kind == "wall" {
+			lv.Price = roundToTick(lv.Price, tickSize)
+			lv.Price = math.Max(lv.Price, fillPrice+tickSize)
+		} else {
+			lv.Price = EnforceMinTPDistance(fillPrice, lv.Price, direction, minTPPct, tickSize)
+			if lv.Kind == "breakeven" {
+				switch direction {
+				case "LONG":
+					if lv.Price < minBE {
+						lv.Price = minBE
+					}
+				case "SHORT":
+					if lv.Price > minBE {
+						lv.Price = minBE
+					}
 				}
 			}
 		}
-		lv.Price = price
 		out = append(out, lv)
 	}
 
 	if direction == "SHORT" {
-		offset := math.Max(fillPrice*0.001, tickSize*5)
+		offset := math.Max(fillPrice*0.0005, tickSize*3)
 		for i := len(out) - 1; i >= 1; i-- {
 			if out[i].Price >= out[i-1].Price {
 				out[i].Price = out[i-1].Price - offset
 			}
 		}
 	} else if direction == "LONG" {
-		offset := math.Max(fillPrice*0.001, tickSize*5)
+		offset := math.Max(fillPrice*0.0005, tickSize*3)
 		for i := len(out) - 1; i >= 1; i-- {
 			if out[i].Price <= out[i-1].Price {
 				out[i].Price = out[i-1].Price + offset

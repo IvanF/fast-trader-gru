@@ -6,18 +6,20 @@ import (
 	"github.com/fast-trader-gru/oms_execution/internal/models"
 )
 
-func TestBuildExitGridHybridNearTPFirst(t *testing.T) {
+func TestBuildExitGridSingleTP(t *testing.T) {
 	signal := models.TradeSignal{
-		Direction:             "SHORT",
-		Regime:                "Trending",
-		VolatilityMultiplier:  0.5,
-		TPPrices:              []float64{0.7982, 0.7983},
+		Direction:            "SHORT",
+		Regime:               "Trending",
+		VolatilityMultiplier: 0.5,
 	}
 	opts := ExitGridOptions{
-		TPBudgetPct:     0.45,
-		MinTPPct:        0.004,
-		MaxTPPct:        0.008,
-		FeeBreakevenPct: 0.002,
+		TPBudgetPct:        0.45,
+		MinTPPct:           0.004,
+		MaxTPPct:           0.008,
+		FeeBreakevenPct:    0.002,
+		EntryFeeRate:       0.00055,
+		ExitFeeRate:        0.0002,
+		TargetNetProfitPct: 0.002,
 	}
 	grid := BuildExitGrid(
 		"SHORT",
@@ -32,39 +34,40 @@ func TestBuildExitGridHybridNearTPFirst(t *testing.T) {
 		10,
 		opts,
 	)
-	if len(grid.TakeProfits) == 0 {
-		t.Fatal("expected tp levels")
+	if len(grid.TakeProfits) != 1 {
+		t.Fatalf("expected exactly 1 TP, got %d", len(grid.TakeProfits))
 	}
-	firstDist := TPDistancePct(0.805, grid.TakeProfits[0].Price)
-	if firstDist > 0.008 {
-		t.Fatalf("first tp too far: price=%v dist=%.4f", grid.TakeProfits[0].Price, firstDist)
+	tp := grid.TakeProfits[0]
+	if tp.Price >= 0.805 {
+		t.Fatalf("SHORT TP must be below entry: got %f", tp.Price)
 	}
-	if firstDist < 0.003 {
-		t.Fatalf("first tp too close: price=%v dist=%.4f", grid.TakeProfits[0].Price, firstDist)
+	if tp.Kind != "fee_aware_tp" {
+		t.Fatalf("expected kind=fee_aware_tp, got %s", tp.Kind)
 	}
-	for _, tp := range grid.TakeProfits {
-		if TPDistancePct(0.805, tp.Price) > 0.008+1e-9 {
-			t.Fatalf("tp beyond max cap: price=%v kind=%s", tp.Price, tp.Kind)
-		}
-	}
+	dist := TPDistancePct(0.805, tp.Price)
+	t.Logf("SHORT entry=0.805 TP=%f dist=%.4f%% kind=%s qty=%f", tp.Price, dist*100, tp.Kind, tp.Qty)
 }
 
-func TestBuildExitGridUsesLiquidityTPPricesWithinCap(t *testing.T) {
+func TestBuildExitGridSingleTP_Long(t *testing.T) {
 	signal := models.TradeSignal{
-		Direction: "SHORT",
-		TPPrices:  []float64{0.5252, 0.5242, 0.5232},
+		Direction:            "LONG",
+		Regime:               "Choppy",
+		VolatilityMultiplier: 1.0,
 	}
 	opts := ExitGridOptions{
-		TPBudgetPct:     0.45,
-		MinTPPct:        0.002,
-		MaxTPPct:        0.008,
-		FeeBreakevenPct: 0.0015,
+		TPBudgetPct:        0.45,
+		MinTPPct:           0.004,
+		MaxTPPct:           0.008,
+		FeeBreakevenPct:    0.002,
+		EntryFeeRate:       0.00055,
+		ExitFeeRate:        0.0002,
+		TargetNetProfitPct: 0.002,
 	}
 	grid := BuildExitGrid(
-		"SHORT",
-		0.5270,
-		0.5270,
-		0.5320,
+		"LONG",
+		2.20,
+		2.20,
+		2.18,
 		models.OrderbookSnapshot{},
 		signal,
 		0.0001,
@@ -73,11 +76,43 @@ func TestBuildExitGridUsesLiquidityTPPricesWithinCap(t *testing.T) {
 		1,
 		opts,
 	)
-	if len(grid.TakeProfits) == 0 {
-		t.Fatal("expected liquidity tp levels")
+	if len(grid.TakeProfits) != 1 {
+		t.Fatalf("expected exactly 1 TP, got %d", len(grid.TakeProfits))
 	}
-	firstDist := TPDistancePct(0.5270, grid.TakeProfits[0].Price)
-	if firstDist > 0.008 {
-		t.Fatalf("first tp too far: price=%v dist=%.4f", grid.TakeProfits[0].Price, firstDist)
+	tp := grid.TakeProfits[0]
+	if tp.Price <= 2.20 {
+		t.Fatalf("LONG TP must be above entry: got %f", tp.Price)
+	}
+	dist := TPDistancePct(2.20, tp.Price)
+	t.Logf("LONG entry=2.20 TP=%f dist=%.4f%% kind=%s qty=%f", tp.Price, dist*100, tp.Kind, tp.Qty)
+}
+
+func TestBuildExitGridSLAlwaysPresent(t *testing.T) {
+	signal := models.TradeSignal{Direction: "SHORT", VolatilityMultiplier: 1.0}
+	opts := ExitGridOptions{
+		MinSLPct:           0.003,
+		MaxSLPct:           0.005,
+		EntryFeeRate:       0.00055,
+		ExitFeeRate:        0.0002,
+		TargetNetProfitPct: 0.002,
+	}
+	grid := BuildExitGrid(
+		"SHORT",
+		100.0,
+		100.0,
+		101.0,
+		models.OrderbookSnapshot{},
+		signal,
+		0.01,
+		50,
+		1,
+		1,
+		opts,
+	)
+	if grid.StopLoss.Price <= 0 {
+		t.Fatal("SL must be set")
+	}
+	if grid.StopLoss.Price <= 100.0 {
+		t.Fatalf("SHORT SL must be above entry: got %f", grid.StopLoss.Price)
 	}
 }

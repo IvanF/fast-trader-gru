@@ -150,7 +150,7 @@ from(bucket: "{self.bucket_raw}")
   |> range(start: {start}, stop: {stop})
   |> filter(fn: (r) => r._measurement == "{TRADE_MEASUREMENT}")
   {sym_filter}
-  |> pivot(rowKey: ["_time", "symbol", "direction", "regime", "signal_id"],
+  |> pivot(rowKey: ["_time", "symbol", "direction", "regime"],
            columnKey: ["_field"], valueColumn: "_value")
 '''
         rows: list[dict[str, Any]] = []

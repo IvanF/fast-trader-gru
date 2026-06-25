@@ -25,6 +25,13 @@ func hasRemainingSize(size, minQty float64) bool {
 }
 
 func (s *Service) enforceSLPrice(ctx context.Context, pos *models.ActivePosition, slPrice, tickSize float64) float64 {
+	return s.enforceSLPriceSmart(ctx, pos, slPrice, tickSize, false)
+}
+
+func (s *Service) enforceSLPriceSmart(ctx context.Context, pos *models.ActivePosition, slPrice, tickSize float64, smartSL bool) float64 {
+	if smartSL {
+		return grid.RoundToTick(slPrice, tickSize)
+	}
 	minSLPct := s.cfg.GetMinSLPct(pos.Symbol)
 	adjusted := grid.EnforceMinSLDistance(pos.FillPrice, slPrice, pos.Direction, minSLPct, tickSize)
 	if grid.SLDistancePct(pos.FillPrice, adjusted) < minSLPct {
@@ -91,16 +98,16 @@ func (s *Service) deployExitGrid(ctx context.Context, pos *models.ActivePosition
 		pos.MinOrderQty,
 		opts,
 	)
-	slPrice := s.enforceSLPrice(ctx, pos, exitGrid.StopLoss.Price, tickSize)
+	slPrice := s.enforceSLPriceSmart(ctx, pos, exitGrid.StopLoss.Price, tickSize, exitGrid.SmartSL)
 	side := closeSide(pos.Direction)
 
-	// Place TPs first (reduce-only limits), then SL covers 100% of remaining exposure.
+	// Place TPs first (PostOnly reduce-only limits = Maker fee), then SL covers 100% of remaining exposure.
 	pos.TakeProfitOrders = nil
 	for _, tp := range exitGrid.TakeProfits {
 		if tp.Qty <= 0 {
 			continue
 		}
-		tpID, err := s.bybit.PlaceReduceLimit(ctx, pos.Symbol, side, tp.Qty, pos.QtyStep, bybit.FormatPrice(tp.Price))
+		tpID, err := s.bybit.PlaceReducePostOnlyLimit(ctx, pos.Symbol, side, tp.Qty, pos.QtyStep, bybit.FormatPrice(tp.Price))
 		if err != nil {
 			s.logger.Warn("tp limit failed", "symbol", pos.Symbol, "kind", tp.Kind, "price", tp.Price, "qty", tp.Qty, "error", err)
 			continue
@@ -677,6 +684,11 @@ func (s *Service) timeStopLimitExit(ctx context.Context, pos *models.ActivePosit
 	}
 	pos.TimeStopPlaced = true
 	s.logger.Info("time stop sl placed", "symbol", pos.Symbol, "price", price, "qty", exSize)
+
+	// Deploy new TP grid after time_stop — position still has qty, needs exit plan
+	if len(pos.TakeProfitOrders) == 0 && exSize > pos.MinOrderQty {
+		pos.ExitGridReady = false
+	}
 }
 
 func (s *Service) syncRemainingSize(ctx context.Context, pos *models.ActivePosition) (float64, bool) {

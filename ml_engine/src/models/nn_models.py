@@ -11,7 +11,7 @@ FLOW_DIM = 3
 MACRO_DIM = 14
 EMBED_DIM = 32
 STATE_DIM = 128
-MEMORY_DIM = 10
+MEMORY_DIM = 8
 MLP_IN_DIM = STATE_DIM + MEMORY_DIM
 NUM_DIRECTIONS = 3
 
@@ -88,9 +88,9 @@ class FusionModel(nn.Module):
 
 
 class DecisionMLP(nn.Module):
-    """Direction + confidence + vol heads. Dropout before the output reduces logit saturation."""
+    """Direction + confidence + vol heads. Balanced architecture for medium-data regimes."""
 
-    def __init__(self, in_dim: int = MLP_IN_DIM, out_dim: int = 5, dropout: float = 0.4) -> None:
+    def __init__(self, in_dim: int = MLP_IN_DIM, out_dim: int = 5, dropout: float = 0.45) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, 64),

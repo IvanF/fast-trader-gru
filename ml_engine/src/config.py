@@ -56,6 +56,8 @@ class Config:
     loss_penalty_weight: float
     train_device: str
     telemetry_interval_sec: int
+    bullish_trend_threshold: float
+    bullish_long_conf_threshold: float
 
     @classmethod
     def load(cls) -> "Config":
@@ -93,6 +95,8 @@ class Config:
             buffer_seconds=int(os.getenv("BUFFER_SECONDS", "300")),
             regime_interval_sec=int(os.getenv("REGIME_INTERVAL_SEC", "60")),
             correlation_threshold=float(os.getenv("CORRELATION_THRESHOLD", "0.85")),
+            bullish_trend_threshold=float(os.getenv("BULLISH_TREND_THRESHOLD", "0.0005")),
+            bullish_long_conf_threshold=float(os.getenv("BULLISH_LONG_CONF_THRESHOLD", "0.20")),
             memory_decay_days=int(os.getenv("MEMORY_DECAY_DAYS", "14")),
             faiss_persist_interval_sec=int(os.getenv("FAISS_PERSIST_INTERVAL_SEC", "300")),
             state_dim=int(os.getenv("STATE_DIM", "128")),

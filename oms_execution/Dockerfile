@@ -5,7 +5,7 @@ COPY . .
 RUN go mod tidy && go mod download
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /oms ./cmd/oms
 
-FROM alpine:3.20
+FROM alpine:latest
 RUN apk add --no-cache ca-certificates tzdata
 COPY --from=builder /oms /usr/local/bin/oms
 USER nobody

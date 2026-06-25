@@ -119,14 +119,31 @@ func AdjustSLBehindWall(wall Wall, direction string, tickSize float64) float64 {
 	return wall.Price + offset
 }
 
-// FindNearestResistance finds the nearest ask-side level above refPrice.
+// FindNearestResistance finds the nearest ask-side level with meaningful volume above refPrice.
+// Skips thin levels (size < median) to find actual resistance clusters.
 func FindNearestResistance(ob models.OrderbookSnapshot, refPrice float64) Wall {
+	var sizes []float64
+	for _, l := range ob.Asks {
+		s, _ := strconv.ParseFloat(l.Size, 64)
+		if s > 0 {
+			sizes = append(sizes, s)
+		}
+	}
+	if len(sizes) == 0 {
+		return Wall{}
+	}
+	medianSize := sizes[len(sizes)/2]
+	minSize := medianSize * 0.5
+	if minSize < 0.01 {
+		minSize = 0.01
+	}
+
 	bestDist := math.MaxFloat64
 	var best Wall
 	for _, l := range ob.Asks {
 		p, _ := strconv.ParseFloat(l.Price, 64)
 		s, _ := strconv.ParseFloat(l.Size, 64)
-		if p <= refPrice || s <= 0 {
+		if p <= refPrice || s < minSize {
 			continue
 		}
 		dist := p - refPrice
@@ -138,14 +155,30 @@ func FindNearestResistance(ob models.OrderbookSnapshot, refPrice float64) Wall {
 	return best
 }
 
-// FindNearestSupport finds the nearest bid-side level below refPrice.
+// FindNearestSupport finds the nearest bid-side level with meaningful volume below refPrice.
 func FindNearestSupport(ob models.OrderbookSnapshot, refPrice float64) Wall {
+	var sizes []float64
+	for _, l := range ob.Bids {
+		s, _ := strconv.ParseFloat(l.Size, 64)
+		if s > 0 {
+			sizes = append(sizes, s)
+		}
+	}
+	if len(sizes) == 0 {
+		return Wall{}
+	}
+	medianSize := sizes[len(sizes)/2]
+	minSize := medianSize * 0.5
+	if minSize < 0.01 {
+		minSize = 0.01
+	}
+
 	bestDist := math.MaxFloat64
 	var best Wall
 	for _, l := range ob.Bids {
 		p, _ := strconv.ParseFloat(l.Price, 64)
 		s, _ := strconv.ParseFloat(l.Size, 64)
-		if p >= refPrice || s <= 0 {
+		if p >= refPrice || s < minSize {
 			continue
 		}
 		dist := refPrice - p

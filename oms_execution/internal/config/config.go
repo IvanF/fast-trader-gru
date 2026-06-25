@@ -47,6 +47,9 @@ type Config struct {
 	ExitGridMinRedeploySec     int
 	MinHoldTimeSec             int
 	DecayMinHoldSec            int
+	EntryFeeRate               float64
+	ExitFeeRate                float64
+	TargetNetProfitPct         float64
 	SymbolOverrides            map[string]SymbolConfig
 }
 
@@ -140,6 +143,9 @@ func Load() Config {
 		ExitGridMinRedeploySec:     intEnv("EXIT_GRID_MIN_REDEPLOY_SEC", 15),
 		MinHoldTimeSec:             intEnv("MIN_HOLD_TIME_SEC", 0),
 		DecayMinHoldSec:            intEnv("DECAY_MIN_HOLD_SEC", 0),
+		EntryFeeRate:               floatEnv("ENTRY_FEE_RATE", 0.00055),
+		ExitFeeRate:                floatEnv("EXIT_FEE_RATE", 0.0002),
+		TargetNetProfitPct:         floatEnv("TARGET_NET_PROFIT_PCT", 0.002),
 		SymbolOverrides:            parseSymbolOverrides(),
 	}
 }

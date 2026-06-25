@@ -859,7 +859,17 @@ class MLEngine:
             self._stats["hold_direction"] += 1
             return None
 
-        if confidence <= self.cfg.confidence_threshold:
+        # Bullish trend detection: relax confidence for LONG to collect data
+        long_conf_threshold = self.cfg.confidence_threshold
+        trend_5m = buf.macro_trend(300)
+        trend_15m = buf.macro_trend(900)
+        bullish = trend_5m > self.cfg.bullish_trend_threshold and trend_15m > 0
+        if bullish and direction == "LONG":
+            long_conf_threshold = self.cfg.bullish_long_conf_threshold
+            logger.info("Bullish trend detected for %s: trend_5m=%.4f trend_15m=%.4f, LONG threshold lowered to %.3f",
+                       symbol, trend_5m, trend_15m, long_conf_threshold)
+
+        if confidence <= long_conf_threshold:
             self._stats["hold_low_conf"] += 1
             return None
 

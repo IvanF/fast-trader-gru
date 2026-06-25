@@ -195,7 +195,11 @@ func (s *Service) tightenExitOnWeakSignal(ctx context.Context, pos *models.Activ
 }
 
 func (s *Service) maybeRefreshExitGrid(ctx context.Context, pos *models.ActivePosition, ob models.OrderbookSnapshot) {
-	if !pos.ExitGridReady || pos.TimeStopPlaced {
+	if !pos.ExitGridReady {
+		return
+	}
+	if len(pos.TakeProfitOrders) == 0 {
+		pos.ExitGridReady = false
 		return
 	}
 	if pos.LastGridDeployAt > 0 {
@@ -238,7 +242,11 @@ func (s *Service) redeployExitGrid(
 	if plannedSL <= 0 {
 		plannedSL = plan.StopLoss
 	}
-	newSL := s.enforceSLPrice(ctx, pos, plannedSL, pos.TickSize)
+	tempGrid := grid.BuildExitGrid(
+		pos.Direction, pos.FillPrice, plannedEntry, plannedSL, ob, pos.Signal,
+		pos.TickSize, exSize, pos.QtyStep, pos.MinOrderQty, s.exitGridOptsForSymbol(pos.Symbol),
+	)
+	newSL := s.enforceSLPriceSmart(ctx, pos, tempGrid.StopLoss.Price, pos.TickSize, tempGrid.SmartSL)
 	newSL = clampSLTightenOnly(pos.Direction, pos.StopLoss, newSL)
 
 	slQty := s.slCoverQty(pos, exSize)
@@ -262,25 +270,23 @@ func (s *Service) redeployExitGrid(
 
 		var exitGrid grid.ExitGrid
 		if exSize < pos.MinOrderQty*2 {
-			tpPrice := pos.FillPrice
-			if pos.Direction == "SHORT" {
-				tpPrice = grid.FeeAwareBreakevenPrice(pos.FillPrice, "SHORT", opts.FeeBreakevenPct, pos.TickSize)
-			} else {
-				tpPrice = grid.FeeAwareBreakevenPrice(pos.FillPrice, "LONG", opts.FeeBreakevenPct, pos.TickSize)
-			}
+			var tpPrice float64
 			mid := grid.MidPrice(ob)
-			if mid > 0 {
-				if pos.Direction == "SHORT" && tpPrice >= mid {
+			if pos.Direction == "SHORT" {
+				tpPrice = grid.RoundToTick(pos.FillPrice-opts.MinSLPct*pos.FillPrice*0.3, pos.TickSize)
+				if mid > 0 && tpPrice >= mid {
 					tpPrice = grid.RoundToTick(mid-pos.FillPrice*opts.MinTPPct, pos.TickSize)
 				}
-				if pos.Direction == "LONG" && tpPrice <= mid {
+			} else {
+				tpPrice = grid.RoundToTick(pos.FillPrice+opts.MinSLPct*pos.FillPrice*0.3, pos.TickSize)
+				if mid > 0 && tpPrice <= mid {
 					tpPrice = grid.RoundToTick(mid+pos.FillPrice*opts.MinTPPct, pos.TickSize)
 				}
 			}
 			exitGrid = grid.ExitGrid{
 				StopLoss: grid.ExitLevel{Price: newSL, Kind: "stop_loss"},
 				TakeProfits: []grid.ExitLevel{
-					{Price: tpPrice, Qty: exSize, Kind: "breakeven"},
+					{Price: tpPrice, Qty: exSize, Kind: "wall"},
 				},
 			}
 		} else {
@@ -305,7 +311,12 @@ func (s *Service) redeployExitGrid(
 		}
 
 		if len(exitGrid.TakeProfits) == 0 {
-			bePrice := grid.FeeAwareBreakevenPrice(pos.FillPrice, pos.Direction, opts.FeeBreakevenPct, pos.TickSize)
+			bePrice := grid.RoundToTick(pos.FillPrice + pos.FillPrice*opts.MinSLPct*0.3*func() float64 {
+				if pos.Direction == "SHORT" {
+					return -1
+				}
+				return 1
+			}(), pos.TickSize)
 			mid := grid.MidPrice(ob)
 			if mid > 0 {
 				if pos.Direction == "SHORT" && bePrice >= mid {
@@ -317,7 +328,7 @@ func (s *Service) redeployExitGrid(
 			}
 			tpID, err := s.bybit.PlaceReduceLimit(ctx, pos.Symbol, closeSide(pos.Direction), exSize, pos.QtyStep, bybit.FormatPrice(bePrice))
 			if err == nil {
-				pos.TakeProfitOrders = []models.ExitOrder{{OrderID: tpID, Price: bePrice, Qty: exSize, Kind: "breakeven"}}
+				pos.TakeProfitOrders = []models.ExitOrder{{OrderID: tpID, Price: bePrice, Qty: exSize, Kind: "wall"}}
 				pos.LastGridDeployAt = time.Now().UnixMilli()
 				return nil
 			}
@@ -330,8 +341,8 @@ func (s *Service) redeployExitGrid(
 			"qty", exSize,
 			"tp_count", len(exitGrid.TakeProfits),
 		)
-		s.cancelTPOrdersOnly(ctx, pos)
 		side := closeSide(pos.Direction)
+		var newTPs []models.ExitOrder
 		for _, tp := range exitGrid.TakeProfits {
 			if tp.Qty <= 0 {
 				continue
@@ -341,9 +352,13 @@ func (s *Service) redeployExitGrid(
 				s.logger.Warn("tp redeploy failed", "symbol", pos.Symbol, "kind", tp.Kind, "error", err)
 				continue
 			}
-			pos.TakeProfitOrders = append(pos.TakeProfitOrders, models.ExitOrder{
+			newTPs = append(newTPs, models.ExitOrder{
 				OrderID: tpID, Price: tp.Price, Qty: tp.Qty, Kind: tp.Kind,
 			})
+		}
+		if len(newTPs) > 0 {
+			s.cancelTPOrdersOnly(ctx, pos)
+			pos.TakeProfitOrders = newTPs
 		}
 		s.syncSLToFullRemainder(ctx, pos)
 		}
@@ -354,6 +369,12 @@ func (s *Service) redeployExitGrid(
 }
 
 func (s *Service) tpGridNeedsRefresh(pos *models.ActivePosition, plan models.GridPlan, ob models.OrderbookSnapshot, exSize float64) bool {
+	if pos.LastGridDeployAt > 0 {
+		elapsed := time.Now().UnixMilli() - pos.LastGridDeployAt
+		if elapsed < int64(s.cfg.ExitGridMinRedeploySec)*1000 {
+			return false
+		}
+	}
 	actualSL := pos.StopLoss
 	if actualSL <= 0 {
 		actualSL = plan.StopLoss

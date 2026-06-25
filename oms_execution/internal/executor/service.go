@@ -57,13 +57,16 @@ func (s *Service) planOpts() grid.PlanOptions {
 
 func (s *Service) exitGridOptsForSymbol(symbol string) grid.ExitGridOptions {
 	return grid.ExitGridOptions{
-		TPBudgetPct:     s.cfg.TPBudgetPct,
-		MinTPPct:        s.cfg.MinTPPct,
-		MaxTPPct:        s.cfg.MaxTPPct,
-		FeeBreakevenPct: s.cfg.FeeBreakevenPct,
-		MinSLPct:        s.cfg.GetMinSLPct(symbol),
-		MaxSLPct:        s.cfg.GetMaxSLPct(symbol),
-		TimeStopSec:     s.cfg.GetTimeStopSeconds(symbol),
+		TPBudgetPct:        s.cfg.TPBudgetPct,
+		MinTPPct:           s.cfg.MinTPPct,
+		MaxTPPct:           s.cfg.MaxTPPct,
+		FeeBreakevenPct:    s.cfg.FeeBreakevenPct,
+		MinSLPct:           s.cfg.GetMinSLPct(symbol),
+		MaxSLPct:           s.cfg.GetMaxSLPct(symbol),
+		TimeStopSec:        s.cfg.GetTimeStopSeconds(symbol),
+		EntryFeeRate:       s.cfg.EntryFeeRate,
+		ExitFeeRate:        s.cfg.ExitFeeRate,
+		TargetNetProfitPct: s.cfg.TargetNetProfitPct,
 	}
 }
 
@@ -734,6 +737,15 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	closeSmall := false
 	if len(pos.TakeProfitOrders) == 0 && !pos.PartialTaken {
 		closeSmall = true
+		s.logger.Warn("position has NO TPs",
+			"symbol", pos.Symbol, "qty", exSize, "notional", exSize*pos.FillPrice, "direction", pos.Direction)
+	}
+	// Safety net: if grid was deployed but all TPs lost — force redeploy
+	if !closeSmall && pos.ExitGridReady && len(pos.TakeProfitOrders) == 0 && exSize > pos.MinOrderQty {
+		s.logger.Warn("TPs lost on active position, forcing redeploy",
+			"symbol", pos.Symbol, "qty", exSize, "notional", exSize*pos.FillPrice)
+		pos.ExitGridReady = false
+		pos.GridDeployFailures = 0
 	}
 	if !closeSmall {
 		allTPsFilled := true
@@ -752,7 +764,7 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 		if hasPos && exSize > 0 {
 			notional := exSize * pos.FillPrice
 			s.logger.Info("remainder check",
-				"symbol", pos.Symbol, "qty", exSize, "notional", notional, "close", notional < 15.0)
+				"symbol", pos.Symbol, "qty", exSize, "notional", notional, "close", notional < 20.0)
 			if notional < 20.0 {
 				s.logger.Warn("closing small remainder",
 					"symbol", pos.Symbol, "qty", exSize, "notional", notional)
@@ -763,6 +775,12 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 					s.tryFinalizePosition(ctx, pos, "take_profit_grid", 0)
 					return
 				}
+			} else {
+				s.logger.Warn("position WITHOUT TP but notional too large to close, triggering redeploy",
+					"symbol", pos.Symbol, "qty", exSize, "notional", notional)
+				closeSmall = false
+				pos.ExitGridReady = false
+				pos.GridDeployFailures = 0
 			}
 		}
 	}
@@ -770,16 +788,50 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	s.retryMissingTakeProfits(ctx, pos, ob)
 
 	if elapsedMs(pos.EntryTime) > int64(pos.TimeStopSec)*1000 {
-		// Infrastructure GC only — normal exits are event-driven (alpha decay, TP/SL grid).
 		s.timeStopLimitExit(ctx, pos, ob)
-		return
 	}
 
 	if s.monitorExitOrders(ctx, pos) {
 		return
 	}
 
-	s.maybeRefreshExitGrid(ctx, pos, ob)
+	// ABSOLUTE SAFETY NET: runs AFTER all other logic, guarantees every open position has TPs
+	activeTPs := 0
+	for _, tp := range pos.TakeProfitOrders {
+		if !tp.Filled {
+			activeTPs++
+		}
+	}
+	if activeTPs > 0 {
+		s.maybeRefreshExitGrid(ctx, pos, ob)
+		return
+	}
+
+	// 0 active TPs on open position — need action
+	notional := exSize * pos.FillPrice
+	if notional < 10.0 {
+		// Too small for TP grid — close immediately
+		s.logger.Warn("safety net: position too small to manage, flattening",
+			"symbol", pos.Symbol, "qty", exSize, "notional", notional)
+		s.cancelExitOrders(ctx, pos)
+		if err := s.ensureExchangeFlat(ctx, pos, "safety_net_too_small"); err != nil {
+			s.logger.Warn("safety net flatten failed", "symbol", pos.Symbol, "error", err)
+		} else {
+			s.tryFinalizePosition(ctx, pos, "safety_net_close", 0)
+			return
+		}
+	} else {
+		// Big enough for TP grid — deploy now
+		s.logger.Warn("safety net: deploying TP grid for unprotected position",
+			"symbol", pos.Symbol, "qty", exSize, "notional", notional)
+		pos.ExitGridReady = false
+		pos.GridDeployFailures = 0
+		if err := s.deployExitGrid(ctx, pos, ob, pos.PlannedEntry, pos.PlannedSL, pos.TickSize); err != nil {
+			s.logger.Warn("safety net deploy failed", "symbol", pos.Symbol, "error", err)
+			pos.GridDeployFailures++
+			pos.LastGridDeployFailure = time.Now().UnixMilli()
+		}
+	}
 }
 
 func (s *Service) handleGhostPosition(ctx context.Context, pos *models.ActivePosition) {

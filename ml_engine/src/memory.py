@@ -108,10 +108,8 @@ class ExperienceEngine:
                 short_pnl += entry.pnl * w
 
         if total_weight <= 0:
-            v = np.zeros(10, dtype=np.float32)
+            v = np.zeros(8, dtype=np.float32)
             v[0] = 0.5
-            v[8] = 0.5
-            v[9] = 0.5
             return v, {"win_rate": 0.5, "avg_pnl": 0.0, "matches": 0, "long_win_rate": 0.5, "short_win_rate": 0.5,
                        "long_avg_pnl": 0.0, "short_avg_pnl": 0.0, "long_matches": 0, "short_matches": 0}
 
@@ -133,8 +131,6 @@ class ExperienceEngine:
             1.0 if current_regime == "Trending" else 0.0,
             1.0 if current_regime == "Breakout" else 0.0,
             1.0 if current_regime == "Choppy" else 0.0,
-            long_win_rate,
-            short_win_rate,
         ], dtype=np.float32)
         return v_memory, {
             "win_rate": win_rate, "avg_pnl": avg_pnl, "matches": int(k),

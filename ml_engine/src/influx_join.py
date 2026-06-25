@@ -157,8 +157,6 @@ def build_joined_dataset(
             1.0 if outcome.get("regime", "Choppy") == "Trending" else 0.0,
             1.0 if outcome.get("regime", "Choppy") == "Breakout" else 0.0,
             1.0 if outcome.get("regime", "Choppy") == "Choppy" else 0.0,
-            (1.0 if pnl >= 0 else 0.0) if direction == "LONG" else 0.5,
-            (1.0 if pnl >= 0 else 0.0) if direction == "SHORT" else 0.5,
         ], dtype=np.float32)
 
         ob_list.append(ob_seq)
@@ -192,7 +190,7 @@ def _empty_dataset() -> dict[str, np.ndarray]:
         "flow_seq": np.zeros((0, SEQ_LEN, FLOW_DIM), dtype=np.float32),
         "macro": np.zeros((0, MACRO_DIM), dtype=np.float32),
         "state_vector": np.zeros((0, STATE_DIM), dtype=np.float32),
-        "memory": np.zeros((0, 10), dtype=np.float32),
+        "memory": np.zeros((0, 8), dtype=np.float32),
         "direction": np.zeros(0, dtype=np.int64),
         "confidence": np.zeros(0, dtype=np.float32),
         "pnl": np.zeros(0, dtype=np.float32),

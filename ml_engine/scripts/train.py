@@ -38,7 +38,7 @@ MIN_VAL_ACC = float(os.getenv("RETRAIN_MIN_VAL_ACC", "0.45"))
 # Regularization defaults — prevent confidence logit saturation (sigmoid → 1.0).
 DEFAULT_LABEL_SMOOTHING = float(os.getenv("TRAIN_LABEL_SMOOTHING", "0.1"))
 DEFAULT_CONFIDENCE_EPS = float(os.getenv("TRAIN_CONFIDENCE_LABEL_EPS", "0.05"))
-DEFAULT_WEIGHT_DECAY = float(os.getenv("TRAIN_WEIGHT_DECAY", "1e-4"))
+DEFAULT_WEIGHT_DECAY = float(os.getenv("TRAIN_WEIGHT_DECAY", "5e-4"))
 DEFAULT_MAX_GRAD_NORM = float(os.getenv("TRAIN_MAX_GRAD_NORM", "1.0"))
 
 
@@ -272,6 +272,28 @@ def main() -> int:
             parts.append(build_joined_dataset(store, start, symbol=sym))
         data = merge_datasets(parts)
         store.close()
+
+    n_before = len(data["direction"])
+    # Oversample minority direction to balance LONG/SHORT
+    dirs = np.unique(data["direction"])
+    dir_counts = {int(d): int(np.sum(data["direction"] == d)) for d in dirs}
+    if 0 in dir_counts and 1 in dir_counts:
+        n_long = dir_counts.get(0, 0)
+        n_short = dir_counts.get(1, 0)
+        if n_long > 0 and n_short > 0:
+            target = max(n_long, n_short)
+            indices_long = np.where(data["direction"] == 0)[0]
+            indices_short = np.where(data["direction"] == 1)[0]
+            oversample_long = np.random.choice(indices_long, size=target - n_long, replace=True) if target > n_long else np.array([], dtype=int)
+            oversample_short = np.random.choice(indices_short, size=target - n_short, replace=True) if target > n_short else np.array([], dtype=int)
+            oversample = np.concatenate([oversample_long, oversample_short])
+            if len(oversample) > 0:
+                for key in data:
+                    if isinstance(data[key], np.ndarray) and key not in ("symbols", "timestamps"):
+                        data[key] = np.concatenate([data[key], data[key][oversample]], axis=0)
+                    elif key == "symbols":
+                        data[key] = np.concatenate([data[key], data[key][oversample]])
+                print(f"oversampled: {n_before} → {len(data['direction'])} (balanced LONG/SHORT)")
 
     n = len(data["direction"])
     print(f"training samples: {n}")
