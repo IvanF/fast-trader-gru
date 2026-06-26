@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any, Optional
 
 import numpy as np
@@ -11,6 +12,21 @@ from .influx_store import InfluxStore
 from .models.nn_models import FLOW_DIM, MACRO_DIM, OB_DIM, SEQ_LEN, STATE_DIM
 
 FEATURE_COLS = ["obi", "bid_vol", "ask_vol", "price", "size"]
+
+MAX_PNL = 0.15
+MIN_PNL = -0.10
+MAX_PRICE = 1e9
+MAX_SIZE = 1e8
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(v):
+        return default
+    return v
 
 
 def _direction_label(direction: str, pnl: float) -> int:
@@ -51,12 +67,12 @@ def _rows_to_sequences(rows: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarr
     levels_list = []
 
     for row in rows:
-        obi = float(row.get("obi", 0) or 0)
-        bid = float(row.get("bid_vol", 0) or 0)
-        ask = float(row.get("ask_vol", 0) or 0)
-        price = float(row.get("price", 0) or 0)
-        size = float(row.get("size", 0) or 0)
-        levels = float(row.get("levels", 0) or 0)
+        obi = _safe_float(row.get("obi", 0))
+        bid = max(_safe_float(row.get("bid_vol", 0)), 0.0)
+        ask = max(_safe_float(row.get("ask_vol", 0)), 0.0)
+        price = _safe_float(row.get("price", 0))
+        size = _safe_float(row.get("size", 0))
+        levels = _safe_float(row.get("levels", 0))
         obi_vals.append([obi, bid - ask])
         bid_vols.append(bid)
         ask_vols.append(ask)
@@ -132,9 +148,13 @@ def build_joined_dataset(
     for outcome in outcomes:
         sym = str(outcome.get("symbol", ""))
         t = outcome["_time"]
-        pnl = float(outcome.get("net_pnl", 0) or 0)
+        pnl = _safe_float(outcome.get("net_pnl", 0))
+        if pnl > MAX_PNL or pnl < MIN_PNL:
+            continue
         direction = str(outcome.get("direction", "HOLD"))
-        entry = float(outcome.get("entry_price", 0) or 0)
+        entry = _safe_float(outcome.get("entry_price", 0))
+        if entry <= 0:
+            continue
 
         feature_rows = store.query_market_features_window(sym, t, feature_window_sec)
         ob_seq, flow_seq, macro = _rows_to_sequences(feature_rows)
@@ -144,6 +164,8 @@ def build_joined_dataset(
             state_vec = np.array(json.loads(state_json), dtype=np.float32)
         except (json.JSONDecodeError, TypeError):
             state_vec = np.zeros(STATE_DIM, dtype=np.float32)
+        if not np.all(np.isfinite(state_vec)):
+            state_vec = np.nan_to_num(state_vec, nan=0.0, posinf=0.0, neginf=0.0)
         if state_vec.size < STATE_DIM:
             state_vec = np.pad(state_vec, (0, STATE_DIM - state_vec.size))
         state_vec = state_vec[:STATE_DIM]
@@ -170,18 +192,19 @@ def build_joined_dataset(
         ts_list.append(t.timestamp())
         sym_list.append(sym)
 
-    return {
-        "ob_seq": np.stack(ob_list),
-        "flow_seq": np.stack(flow_list),
-        "macro": np.stack(macro_list),
-        "state_vector": np.stack(state_list),
-        "memory": np.stack(memory_list),
+    result = {
+        "ob_seq": np.nan_to_num(np.stack(ob_list), nan=0.0, posinf=0.0, neginf=0.0),
+        "flow_seq": np.nan_to_num(np.stack(flow_list), nan=0.0, posinf=0.0, neginf=0.0),
+        "macro": np.nan_to_num(np.stack(macro_list), nan=0.0, posinf=0.0, neginf=0.0),
+        "state_vector": np.nan_to_num(np.stack(state_list), nan=0.0, posinf=0.0, neginf=0.0),
+        "memory": np.nan_to_num(np.stack(memory_list), nan=0.0, posinf=0.0, neginf=0.0),
         "direction": np.array(dir_list, dtype=np.int64),
         "confidence": np.array(conf_list, dtype=np.float32),
         "pnl": np.array(pnl_list, dtype=np.float32),
         "timestamps": np.array(ts_list, dtype=np.float64),
         "symbols": np.array(sym_list),
     }
+    return result
 
 
 def _empty_dataset() -> dict[str, np.ndarray]:

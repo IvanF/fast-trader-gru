@@ -58,6 +58,7 @@ class Config:
     telemetry_interval_sec: int
     bullish_trend_threshold: float
     bullish_long_conf_threshold: float
+    long_confidence_threshold: float
 
     @classmethod
     def load(cls) -> "Config":
@@ -78,7 +79,7 @@ class Config:
             metrics_addr=os.getenv("METRICS_ADDR", ":9103"),
             model_dir=os.getenv("MODEL_DIR", "/app/models"),
             faiss_path=os.getenv("FAISS_PATH", "/app/data/faiss_index"),
-            confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.85")),
+            confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.30")),
             kill_confidence_threshold=float(os.getenv("KILL_CONFIDENCE_THRESHOLD", "0.35")),
             entry_abort_threshold=float(os.getenv("ENTRY_ABORT_THRESHOLD", "0.50")),
             adverse_confirm_ticks=int(os.getenv("ADVERSE_CONFIRM_TICKS", os.getenv("DECAY_OBI_MIN_TICKS", "3"))),
@@ -97,6 +98,7 @@ class Config:
             correlation_threshold=float(os.getenv("CORRELATION_THRESHOLD", "0.85")),
             bullish_trend_threshold=float(os.getenv("BULLISH_TREND_THRESHOLD", "0.0005")),
             bullish_long_conf_threshold=float(os.getenv("BULLISH_LONG_CONF_THRESHOLD", "0.20")),
+            long_confidence_threshold=float(os.getenv("LONG_CONFIDENCE_THRESHOLD", "0.50")),
             memory_decay_days=int(os.getenv("MEMORY_DECAY_DAYS", "14")),
             faiss_persist_interval_sec=int(os.getenv("FAISS_PERSIST_INTERVAL_SEC", "300")),
             state_dim=int(os.getenv("STATE_DIM", "128")),

@@ -1,21 +1,72 @@
-"""Exit level planner — smart adaptive SL with S/R awareness, knife detection, and macro trend."""
+"""Exit level planner — liquidity-aware TP/SL with fee compensation.
+
+Core idea:
+- TP: Place near liquidity walls where price will slow down
+- TP must compensate: entry fee + exit fee + spread + profit margin
+- SL: Place beyond support/resistance walls
+- SL must give room for noise but limit max loss
+
+Fee structure (Bybit):
+- Entry: 0.055% (taker)
+- Exit: 0.020% (taker)
+- Total round-trip: 0.075%
+- Min profitable move: ~0.10%
+"""
 
 from __future__ import annotations
 
 import math
 from typing import Any
 
-from .liquidity_tp import compute_liquidity_tp_prices
+from .liquidity_tp import (
+    compute_liquidity_tp_prices,
+    compute_liquidity_sl,
+    MIN_PROFITABLE_MOVE_PCT,
+    ENTRY_FEE_PCT,
+    EXIT_FEE_PCT,
+)
 
 
-BASE_GRID_SPACING = 0.0025
+def _level_price(level: Any) -> float:
+    if isinstance(level, dict):
+        raw = level.get("price") or level.get("Price")
+        return float(raw) if raw else 0.0
+    if isinstance(level, (list, tuple)) and level:
+        return float(level[0])
+    return 0.0
 
 
-def _cap_vol_multiplier(vol_mult: float, cap: float) -> float:
-    vm = vol_mult if vol_mult > 0 else 1.0
-    if cap > 0:
-        vm = min(vm, cap)
-    return max(vm, 0.5)
+def _level_size(level: Any) -> float:
+    if isinstance(level, dict):
+        raw = level.get("size") or level.get("Size")
+        return float(raw) if raw else 0.0
+    if isinstance(level, (list, tuple)) and len(level) > 1:
+        return float(level[1])
+    return 0.0
+
+
+def _mid(bids: list, asks: list) -> float:
+    if not bids or not asks:
+        return 0.0
+    return (_level_price(bids[0]) + _level_price(asks[0])) / 2.0
+
+
+def _round_tick(price: float, tick: float) -> float:
+    if tick <= 0:
+        return price
+    return round(price / tick) * tick
+
+
+def _infer_tick_size(price: float) -> float:
+    if price <= 0:
+        return 0.0001
+    if price >= 1000:
+        return 0.1
+    if price >= 100:
+        return 0.01
+    if price >= 1:
+        return 0.0001
+    return 0.00001
 
 
 def _aggressive_maker_entry(
@@ -49,93 +100,6 @@ def _aggressive_maker_entry(
     return 0.0
 
 
-def _level_price(level: Any) -> float:
-    if isinstance(level, dict):
-        raw = level.get("price") or level.get("Price")
-        return float(raw) if raw else 0.0
-    if isinstance(level, (list, tuple)) and level:
-        return float(level[0])
-    return 0.0
-
-
-def _level_size(level: Any) -> float:
-    if isinstance(level, dict):
-        raw = level.get("size") or level.get("Size")
-        return float(raw) if raw else 0.0
-    if isinstance(level, (list, tuple)) and len(level) > 1:
-        return float(level[1])
-    return 0.0
-
-
-def _mid(bids: list, asks: list) -> float:
-    if not bids or not asks:
-        return 0.0
-    return (_level_price(bids[0]) + _level_price(asks[0])) / 2.0
-
-
-def _round_tick(price: float, tick: float) -> float:
-    if tick <= 0:
-        return price
-    return round(price / tick) * tick
-
-
-def _find_wall(levels: list, low: float, high: float) -> tuple[float, float]:
-    prices, sizes = [], []
-    for lv in levels:
-        p, s = _level_price(lv), _level_size(lv)
-        if low <= p <= high:
-            prices.append(p)
-            sizes.append(s)
-    if not sizes:
-        return 0.0, 0.0
-    idx = max(range(len(sizes)), key=lambda i: sizes[i])
-    return prices[idx], sizes[idx]
-
-
-def _find_strongest_level(levels: list, ref: float, direction: str) -> tuple[float, float]:
-    """Find the strongest liquidity level relative to ref price.
-
-    For SHORT SL: scan asks ABOVE ref (resistance).
-    For LONG SL: scan bids BELOW ref (support).
-    Returns (price, size) of the strongest level.
-    """
-    candidates = []
-    for lv in levels:
-        p, s = _level_price(lv), _level_size(lv)
-        if s <= 0:
-            continue
-        if direction == "SHORT" and p > ref:
-            candidates.append((p, s))
-        elif direction == "LONG" and p < ref:
-            candidates.append((p, s))
-    if not candidates:
-        return 0.0, 0.0
-    idx = max(range(len(candidates)), key=lambda i: candidates[i][1])
-    return candidates[idx]
-
-
-def _find_nearest_level(levels: list, ref: float, direction: str) -> tuple[float, float]:
-    """Find the nearest liquidity level relative to ref price.
-
-    For SHORT SL: scan asks ABOVE ref, return nearest.
-    For LONG SL: scan bids BELOW ref, return nearest.
-    Returns (price, size) of the nearest level.
-    """
-    candidates = []
-    for lv in levels:
-        p, s = _level_price(lv), _level_size(lv)
-        if s <= 0:
-            continue
-        if direction == "SHORT" and p > ref:
-            candidates.append((p, s))
-        elif direction == "LONG" and p < ref:
-            candidates.append((p, s))
-    if not candidates:
-        return 0.0, 0.0
-    idx = min(range(len(candidates)), key=lambda i: abs(candidates[i][0] - ref))
-    return candidates[idx]
-
-
 def _detect_knife_conditions(
     macro_trend_5m: float,
     macro_trend_15m: float,
@@ -143,11 +107,7 @@ def _detect_knife_conditions(
     regime: str,
     direction: str,
 ) -> tuple[bool, float]:
-    """Detect if market is in a knife condition (rapid adverse movement).
-
-    Returns (is_knife, tighten_factor).
-    tighten_factor: 1.0 = normal, <1.0 = tighten SL (e.g., 0.5 = half the normal SL distance).
-    """
+    """Detect if market is in a knife condition (rapid adverse movement)."""
     knife_score = 0.0
 
     if direction == "LONG":
@@ -175,90 +135,6 @@ def _detect_knife_conditions(
     return False, 1.0
 
 
-def _compute_smart_sl(
-    direction: str,
-    entry: float,
-    bids: list,
-    asks: list,
-    mid: float,
-    tick_size: float,
-    risk: float,
-    max_sl_pct: float,
-    knife_tighten: float,
-    macro_trend_15m: float,
-) -> float:
-    """Compute smart SL using S/R levels, capped by max distance, tightened for knives.
-
-    For LONG: SL below nearest support (bid wall) + 2 ticks.
-    For SHORT: SL above nearest resistance (ask wall) + 2 ticks.
-    """
-    if direction == "LONG":
-        support_price, _ = _find_nearest_level(bids, entry, "LONG")
-        if support_price > 0:
-            sl = support_price - tick_size * 2
-        else:
-            sl = entry - risk
-
-        if macro_trend_15m < -0.005:
-            trend_tighten = max(0.6, 1.0 + macro_trend_15m * 10)
-            sl = entry - (entry - sl) * trend_tighten
-
-        sl = entry - (entry - sl) * knife_tighten
-
-        max_sl_dist = entry * max_sl_pct
-        min_sl = entry - max_sl_dist
-        if sl < min_sl:
-            sl = min_sl
-
-        if sl >= entry:
-            sl = entry - risk
-
-    else:
-        resistance_price, _ = _find_nearest_level(asks, entry, "SHORT")
-        if resistance_price > 0:
-            sl = resistance_price + tick_size * 2
-        else:
-            sl = entry + risk
-
-        if macro_trend_15m > 0.005:
-            trend_tighten = max(0.6, 1.0 - macro_trend_15m * 10)
-            sl = entry + (sl - entry) * trend_tighten
-
-        sl = entry + (sl - entry) * knife_tighten
-
-        max_sl_dist = entry * max_sl_pct
-        max_sl = entry + max_sl_dist
-        if sl > max_sl:
-            sl = max_sl
-
-        if sl <= entry:
-            sl = entry + risk
-
-    return _round_tick(sl, tick_size)
-
-
-def _fee_aware_breakeven(fill: float, direction: str, fee_pct: float, tick: float) -> float:
-    if fill <= 0 or fee_pct <= 0:
-        return fill
-    if direction == "LONG":
-        return _round_tick(fill * (1 + fee_pct), tick)
-    return _round_tick(fill * (1 - fee_pct), tick)
-
-
-def _enforce_min_tp(fill: float, tp: float, direction: str, min_pct: float, tick: float) -> float:
-    if fill <= 0 or min_pct <= 0:
-        return tp
-    if direction == "LONG":
-        floor = fill * (1 + min_pct)
-        if tp <= 0 or tp < floor:
-            return _round_tick(floor, tick)
-    else:
-        ceiling = fill * (1 - min_pct)
-        if tp <= 0 or tp > ceiling:
-            return _round_tick(ceiling, tick)
-    return _round_tick(tp, tick)
-
-
 def build_exit_plan(
     direction: str,
     bids: list,
@@ -270,23 +146,33 @@ def build_exit_plan(
     fallback_mid: float = 0.0,
     vol_multiplier_cap: float = 2.0,
     entry_maker_ticks: int = 2,
-    min_tp_pct: float = 0.002,
-    fee_breakeven_pct: float = 0.0015,
-    max_tp_pct: float = 0.008,
-    max_sl_pct: float = 0.012,
+    min_tp_pct: float = 0.001,
+    fee_breakeven_pct: float = 0.00075,
+    max_tp_pct: float = 0.020,
+    max_sl_pct: float = 0.015,
     macro_trend_5m: float = 0.0,
     macro_trend_15m: float = 0.0,
 ) -> dict[str, Any]:
-    """Compute entry anchor, smart SL (S/R-aware + knife detection), TP ladder from NN regime/vol."""
+    """Compute entry, SL, and TP using liquidity-aware algorithm.
+
+    TP Logic:
+    1. Find liquidity walls in order book (large orders where price slows)
+    2. Place TP just before walls (1-2 ticks before)
+    3. Only include TPs that cover fees + spread + min profit
+    4. Sort by distance (closest first) and take top N
+
+    SL Logic:
+    1. Find support/resistance walls (opposite side of trade)
+    2. Place SL beyond the wall (2 ticks past)
+    3. Cap at max_sl_pct to limit loss
+    """
     mid = _mid(bids, asks)
     if mid <= 0 and fallback_mid > 0:
         mid = fallback_mid
     if mid <= 0:
         return {}
 
-    vm = _cap_vol_multiplier(vol_mult, vol_multiplier_cap)
-    spacing = BASE_GRID_SPACING * vm
-    risk = spacing * mid
+    tick = tick_size if tick_size > 0 else _infer_tick_size(mid)
 
     obi = 0.0
     if bids and asks:
@@ -300,67 +186,79 @@ def build_exit_plan(
         macro_trend_5m, macro_trend_15m, obi, regime, direction,
     )
 
-    maker_entry = _aggressive_maker_entry(direction, bids, asks, tick_size, entry_maker_ticks)
+    # Entry price
+    maker_entry = _aggressive_maker_entry(direction, bids, asks, tick, entry_maker_ticks)
     if direction == "LONG":
-        entry = maker_entry if maker_entry > 0 else mid - spacing * mid
+        entry = maker_entry if maker_entry > 0 else mid - _round_tick(mid * 0.0005, tick)
     else:
-        entry = maker_entry if maker_entry > 0 else mid + spacing * mid
+        entry = maker_entry if maker_entry > 0 else mid + _round_tick(mid * 0.0005, tick)
 
-    sl = _compute_smart_sl(
-        direction, entry, bids, asks, mid, tick_size, risk,
-        max_sl_pct, knife_tighten, macro_trend_15m,
+    entry = _round_tick(entry, tick)
+
+    # SL: liquidity-aware, beyond support/resistance walls
+    sl = compute_liquidity_sl(
+        direction, bids, asks, entry, tick,
+        min_sl_distance_pct=0.005,
+        max_sl_distance_pct=max_sl_pct,
     )
-
-    if is_knife:
-        risk = abs(entry - sl)
-
-    r_mult = {"Trending": 2.5, "Breakout": 3.0, "Choppy": 1.5}.get(regime, 2.0) * vm
-    conf_scale = 0.85 + 0.15 * min(confidence, 1.0)
-    if direction == "LONG":
-        tps = [entry + risk, entry + risk * 2, entry + risk * 3]
-        tps.append(entry + risk * r_mult * conf_scale)
-    else:
-        tps = [entry - risk, entry - risk * 2, entry - risk * 3]
-        tps.append(entry - risk * r_mult * conf_scale)
-
-    entry = _round_tick(entry, tick_size)
-    anchor = entry if entry > 0 else mid
-    tps = [
-        _enforce_min_tp(anchor, tp, direction, min_tp_pct, tick_size)
-        for tp in tps
-        if tp > 0
-    ]
-    if tps:
-        be = _fee_aware_breakeven(anchor, direction, fee_breakeven_pct, tick_size)
+    if sl <= 0:
+        # Fallback: use percentage-based SL
         if direction == "LONG":
-            tps[0] = max(tps[0], be)
+            sl = _round_tick(entry * (1 - max_sl_pct), tick)
         else:
-            tps[0] = min(tps[0], be)
-    tps = [_round_tick(tp, tick_size) for tp in tps if tp > 0]
+            sl = _round_tick(entry * (1 + max_sl_pct), tick)
 
+    # Knife: tighten SL
+    if is_knife and knife_tighten < 1.0:
+        sl_dist = abs(entry - sl)
+        if direction == "LONG":
+            sl = entry - sl_dist * knife_tighten
+        else:
+            sl = entry + sl_dist * knife_tighten
+
+    # TP: liquidity-aware, near walls, fee-compensated
     tp_prices = compute_liquidity_tp_prices(
-        direction,
-        bids,
-        asks,
-        entry_price=entry,
-        tick_size=tick_size,
+        direction, bids, asks, entry, tick,
+        max_levels=4,
         max_distance_pct=max_tp_pct,
     )
 
-    wall_price = 0.0
-    if direction == "LONG":
-        support_p, _ = _find_nearest_level(bids, entry, "LONG")
-        wall_price = support_p
-    else:
-        resistance_p, _ = _find_nearest_level(asks, entry, "SHORT")
-        wall_price = resistance_p
+    # Fallback: if no liquidity TPs found, use fee-compensated minimum
+    if not tp_prices:
+        min_profit_pct = MIN_PROFITABLE_MOVE_PCT * 1.5  # 1.5x fees
+        if direction == "LONG":
+            tp_prices = [_round_tick(entry * (1 + min_profit_pct), tick)]
+        else:
+            tp_prices = [_round_tick(entry * (1 - min_profit_pct), tick)]
 
+    # Build result
     result = {
         "entry_price": entry,
         "stop_loss": sl,
-        "take_profits": tps,
-        "wall_price": wall_price,
+        "take_profits": tp_prices,
+        "wall_price": 0.0,
+        "fee_info": {
+            "entry_fee_pct": ENTRY_FEE_PCT,
+            "exit_fee_pct": EXIT_FEE_PCT,
+            "total_fee_pct": ENTRY_FEE_PCT + EXIT_FEE_PCT,
+            "min_profitable_pct": MIN_PROFITABLE_MOVE_PCT,
+        },
     }
-    if tp_prices:
-        result["tp_prices"] = tp_prices
+
+    # Add wall price for reference
+    if direction == "LONG" and asks:
+        # Nearest resistance wall
+        for lv in asks[:20]:
+            p, s = _level_price(lv), _level_size(lv)
+            if p > entry and s > 0:
+                result["wall_price"] = p
+                break
+    elif direction == "SHORT" and bids:
+        # Nearest support wall
+        for lv in bids[:20]:
+            p, s = _level_price(lv), _level_size(lv)
+            if p < entry and s > 0:
+                result["wall_price"] = p
+                break
+
     return result

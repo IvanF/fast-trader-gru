@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -92,6 +92,32 @@ class AsymmetricTradingLoss(nn.Module):
         wrong = (pred != direction).float()
         penalty = penalty + wrong * (self.loss_penalty - 1.0) * torch.clamp(-pnl, min=0.0)
         return (ce * weights * penalty).mean()
+
+
+def stratified_split(dataset: JoinedDataset, val_ratio: float = 0.15, min_val: int = 10) -> tuple:
+    """Stratified train/val split preserving direction distribution."""
+    n = len(dataset)
+    val_size = max(min_val, int(val_ratio * n))
+    val_size = min(val_size, n - 1)
+    labels = dataset.direction
+    classes = np.unique(labels)
+    val_indices: list[int] = []
+    train_indices: list[int] = list(range(n))
+    rng = np.random.RandomState(42)
+    for cls in classes:
+        cls_idx = np.where(labels == cls)[0]
+        n_cls_val = max(1, int(val_ratio * len(cls_idx)))
+        n_cls_val = min(n_cls_val, len(cls_idx))
+        chosen = rng.choice(cls_idx, size=n_cls_val, replace=False)
+        val_indices.extend(chosen.tolist())
+    for idx in val_indices:
+        train_indices.remove(idx)
+    if len(val_indices) < min_val:
+        extra = rng.choice(train_indices, size=min(min_val - len(val_indices), len(train_indices)), replace=False)
+        for e in extra:
+            val_indices.append(int(e))
+            train_indices.remove(int(e))
+    return Subset(dataset, train_indices), Subset(dataset, val_indices)
 
 
 class JoinedDataset(Dataset):
@@ -275,6 +301,9 @@ def main() -> int:
 
     n_before = len(data["direction"])
     # Oversample minority direction to balance LONG/SHORT
+    # Exclude outlier PnL entries from oversampling pool to avoid duplicating extremes
+    pnl_arr = data["pnl"]
+    safe_mask = (pnl_arr >= -0.05) & (pnl_arr <= 0.08)
     dirs = np.unique(data["direction"])
     dir_counts = {int(d): int(np.sum(data["direction"] == d)) for d in dirs}
     if 0 in dir_counts and 1 in dir_counts:
@@ -282,8 +311,12 @@ def main() -> int:
         n_short = dir_counts.get(1, 0)
         if n_long > 0 and n_short > 0:
             target = max(n_long, n_short)
-            indices_long = np.where(data["direction"] == 0)[0]
-            indices_short = np.where(data["direction"] == 1)[0]
+            indices_long = np.where((data["direction"] == 0) & safe_mask)[0]
+            indices_short = np.where((data["direction"] == 1) & safe_mask)[0]
+            if len(indices_long) == 0:
+                indices_long = np.where(data["direction"] == 0)[0]
+            if len(indices_short) == 0:
+                indices_short = np.where(data["direction"] == 1)[0]
             oversample_long = np.random.choice(indices_long, size=target - n_long, replace=True) if target > n_long else np.array([], dtype=int)
             oversample_short = np.random.choice(indices_short, size=target - n_short, replace=True) if target > n_short else np.array([], dtype=int)
             oversample = np.concatenate([oversample_long, oversample_short])
@@ -311,9 +344,8 @@ def main() -> int:
         return 3
 
     dataset = JoinedDataset(data)
-    val_size = max(1, int(0.15 * len(dataset)))
-    train_size = len(dataset) - val_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+    train_ds, val_ds = stratified_split(dataset, val_ratio=0.15, min_val=10)
+    print(f"split: train={len(train_ds)} val={len(val_ds)}")
     use_cuda = device.type == "cuda"
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -358,6 +390,27 @@ def main() -> int:
     if best_state:
         model.load_state_dict(best_state)
 
+    @torch.no_grad()
+    def _check_signal_rate(mdl, loader, device):
+        mdl.eval()
+        total, acted = 0, 0
+        for ob, flow, macro, memory, direction, confidence, pnl in loader:
+            ob = ob.to(device, non_blocking=True)
+            flow = flow.to(device, non_blocking=True)
+            macro = macro.to(device, non_blocking=True)
+            memory = memory.to(device, non_blocking=True)
+            _, logits = mdl(ob, flow, macro, memory)
+            pred = logits[:, :3].argmax(dim=1)
+            conf = torch.sigmoid(logits[:, 3])
+            for p, c in zip(pred.tolist(), conf.tolist()):
+                total += 1
+                if p != 2 and c >= 0.30:
+                    acted += 1
+        return acted / max(total, 1)
+
+    signal_rate = _check_signal_rate(model, val_loader, device)
+    print(f"val signal_rate={signal_rate:.3f} (min required: 0.05)")
+
     loss_delta = final_loss - initial_loss
     loss_improved = loss_delta < -0.01
 
@@ -377,7 +430,9 @@ def main() -> int:
 
     acc_improved = best_acc > prev_acc + 0.02
     acc_above_min = best_acc >= MIN_VAL_ACC
-    should_promote = (acc_improved or loss_improved) and acc_above_min
+    MIN_SIGNAL_RATE = float(os.getenv("MIN_SIGNAL_RATE", "0.05"))
+    signal_rate_ok = signal_rate >= MIN_SIGNAL_RATE
+    should_promote = (acc_improved or loss_improved) and acc_above_min and signal_rate_ok
 
     if not should_promote:
         reason = []
@@ -385,6 +440,8 @@ def main() -> int:
             reason.append(f"val_acc={best_acc:.3f} < MIN_VAL_ACC={MIN_VAL_ACC}")
         if not acc_improved and not loss_improved:
             reason.append(f"no improvement (prev={prev_acc:.3f}, new={best_acc:.3f}, loss_delta={loss_delta:.4f})")
+        if not signal_rate_ok:
+            reason.append(f"signal_rate={signal_rate:.3f} < MIN_SIGNAL_RATE={MIN_SIGNAL_RATE} (model too conservative)")
         print(f"model NOT promoted: {'; '.join(reason)}", file=sys.stderr)
         report = {
             "exit_code": 5,
@@ -430,6 +487,7 @@ def main() -> int:
         "final_loss": final_loss,
         "loss_delta": loss_delta,
         "val_acc": best_acc,
+        "signal_rate": signal_rate,
         "prev_acc": prev_acc,
         "prev_version": prev_version,
         "samples": n,
@@ -441,7 +499,7 @@ def main() -> int:
         "max_grad_norm": args.max_grad_norm,
     }
     write_report(report)
-    print(f"training complete in {duration:.1f}s loss_delta={loss_delta:.4f}")
+    print(f"training complete in {duration:.1f}s loss_delta={loss_delta:.4f} signal_rate={signal_rate:.3f}")
     return 0
 
 

@@ -30,6 +30,8 @@ class RollingRetrainWorker:
         self._running = False
         self._trades_since_retrain = 0
         self._last_retrain_at = time.time()
+        self._consecutive_losses = 0
+        self._loss_streak_retrain_cooldown = 0
 
     @property
     def trades_since_retrain(self) -> int:
@@ -44,9 +46,29 @@ class RollingRetrainWorker:
             self.cfg.retrain_epochs,
         )
 
-    async def on_trade_closed(self) -> None:
+    async def on_trade_closed(self, pnl: float = 0.0) -> None:
         self._trades_since_retrain += 1
         prom.retrain_trades_since_last.set(self._trades_since_retrain)
+
+        if pnl < 0:
+            self._consecutive_losses += 1
+        else:
+            self._consecutive_losses = 0
+
+        CONSECUTIVE_LOSS_TRIGGER = int(os.getenv("CONSECUTIVE_LOSS_THRESHOLD", "3"))
+        LOSS_STREAK_COOLDOWN = int(os.getenv("LOSS_STREAK_RETRAIN_COOLDOWN", "300"))
+        now = time.time()
+        if (self._consecutive_losses >= CONSECUTIVE_LOSS_TRIGGER
+                and now - self._loss_streak_retrain_cooldown > LOSS_STREAK_COOLDOWN):
+            logger.warning(
+                "retrain trigger: %d consecutive losses (threshold %d)",
+                self._consecutive_losses, CONSECUTIVE_LOSS_TRIGGER,
+            )
+            self._loss_streak_retrain_cooldown = now
+            self._consecutive_losses = 0
+            await self.trigger("consecutive_losses")
+            return
+
         if self._trades_since_retrain >= self.cfg.retrain_trade_threshold:
             logger.info(
                 "retrain trigger: %d trades reached threshold %d",

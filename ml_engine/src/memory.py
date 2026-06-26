@@ -48,6 +48,18 @@ class ExperienceEngine:
             json.dump([e.__dict__ for e in self.metadata], f)
 
     def add(self, vector: np.ndarray, pnl: float, regime: str, direction: str = "HOLD") -> int:
+        # Block outliers symmetrically — extreme wins and losses skew memory statistics
+        if pnl > 0.15 or pnl < -0.10:
+            return -1
+
+        # Block duplicates: check if entry with same direction+regime+rounded_pnl exists
+        rounded_pnl = round(pnl, 4)
+        for e in self.metadata:
+            if (e.direction == direction.upper() and
+                    e.regime == regime and
+                    abs(e.pnl - rounded_pnl) < 0.001):
+                return -1  # duplicate
+
         vec = vector.astype(np.float32).reshape(1, -1)
         faiss.normalize_L2(vec)
         vid = self.index.ntotal

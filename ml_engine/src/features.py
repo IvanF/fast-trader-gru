@@ -127,7 +127,10 @@ class SymbolBuffer:
         prices = [p for t, p in self.price_history if t >= cutoff]
         if len(prices) < 2:
             return 0.0
-        return (prices[-1] - prices[0]) / prices[0]
+        base = prices[0]
+        if abs(base) < 1e-10:
+            return 0.0
+        return (prices[-1] - base) / base
 
     def liquidity_features(self) -> np.ndarray:
         bid_vol = sum(_level_size(b) for b in self.latest_bids[:10]) if self.latest_bids else 0.0

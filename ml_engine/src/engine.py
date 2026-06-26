@@ -25,6 +25,7 @@ from .market_telemetry import EventStateStore, compute_telemetry_and_events
 from .movement_probability import MovementStateStore, load_weights_from_env, softmax_movement_probability
 from .regime import RegimeDetector
 from .exit_plan import build_exit_plan
+from .online_learner import OnlineLearner, CONSECUTIVE_LOSS_THRESHOLD
 from .retrain_worker import RollingRetrainWorker
 from .train_device import log_cuda_status
 
@@ -76,6 +77,10 @@ class MLEngine:
             "buffer_warming": 0,
         }
         self._last_status_log = time.time()
+        self._last_signal_at = time.time()
+        self._signal_drought_warned = False
+        self._online_learner = OnlineLearner(cfg.model_dir, cfg.state_dim)
+        self._consecutive_losses = 0
         self._retrain_worker = RollingRetrainWorker(
             cfg, symbols_provider=lambda: sorted(self.active_symbols),
         )
@@ -312,13 +317,36 @@ class MLEngine:
             pnl = float(data.get("net_pnl", 0))
             regime = data.get("regime", "Choppy")
             direction = data.get("direction", "HOLD")
-            # Filter large losses from FAISS — they skew memory avg_pnl.
-            # Keep them in InfluxDB for retraining (class weights handle balance).
+            symbol = data.get("symbol", "")
+
             if pnl >= -0.10:
                 self.memory.add(vec[: self.cfg.state_dim], pnl, regime, direction)
             else:
-                logger.info("skipping large loss from FAISS: %s pnl=%.4f", data.get("symbol"), pnl)
+                logger.info("skipping large loss from FAISS: %s pnl=%.4f", symbol, pnl)
             prom.faiss_index_size.set(self.memory.size)
+
+            dir_idx = {"LONG": 0, "SHORT": 1}.get(direction.upper(), 2)
+            self._online_learner.update(
+                v_state=vec[: self.cfg.state_dim],
+                v_memory=np.zeros(8, dtype=np.float32),
+                direction=dir_idx,
+                confidence=float(data.get("confidence", 0.5)),
+                pnl=pnl,
+                regime=regime,
+                symbol=symbol,
+            )
+
+            if pnl < 0:
+                self._consecutive_losses += 1
+                if self._consecutive_losses >= CONSECUTIVE_LOSS_THRESHOLD:
+                    logger.warning(
+                        "CONSECUTIVE LOSSES: %d in a row — triggering emergency retrain",
+                        self._consecutive_losses,
+                    )
+                    await self._retrain_worker.trigger("consecutive_losses")
+                    self._consecutive_losses = 0
+            else:
+                self._consecutive_losses = 0
 
             if self.influx is not None:
                 try:
@@ -327,16 +355,16 @@ class MLEngine:
                     logger.error("influx trade outcome write failed: %s", exc)
 
             logger.info(
-                "learned from trade %s pnl=%.4f reason=%s exchange_pnl=%s",
-                data.get("symbol"),
+                "learned from trade %s pnl=%.4f reason=%s exchange_pnl=%s online_stats=%s",
+                symbol,
                 pnl,
                 data.get("close_reason", ""),
                 data.get("exchange_pnl", False),
+                self._online_learner.stats,
             )
-            sym = data.get("symbol")
-            if sym:
-                self._open_positions.pop(sym, None)
-            await self._retrain_worker.on_trade_closed()
+            if symbol:
+                self._open_positions.pop(symbol, None)
+            await self._retrain_worker.on_trade_closed(pnl=pnl)
 
         await self._pubsub_listener("execution results", self.cfg.results_channel, handle)
 
@@ -436,7 +464,9 @@ class MLEngine:
             await asyncio.sleep(self.cfg.faiss_persist_interval_sec)
             try:
                 self.memory.persist()
-                logger.info("faiss index persisted, size=%d", self.memory.size)
+                self._online_learner.persist()
+                logger.info("faiss index persisted, size=%d online=%s",
+                            self.memory.size, self._online_learner.stats)
             except Exception as exc:
                 logger.error("faiss persist failed: %s", exc)
 
@@ -468,14 +498,16 @@ class MLEngine:
                 sym: len(self.features.get(sym).points)
                 for sym in sorted(self.active_symbols)[:8]
             }
+            drought_min = (time.time() - self._last_signal_at) / 60.0
             logger.info(
-                "status: symbols=%d market_events=%d predictions=%d signals=%d "
+                "status: symbols=%d market_events=%d predictions=%d signals=%d drought=%.0fm "
                 "holds(low_conf=%d dir=%d corr=%d warming=%d) "
                 "faiss=%d retrain_trades=%d/%d buffers=%s",
                 len(self.active_symbols),
                 self._stats["market_events"],
                 self._stats["predictions"],
                 self._stats["signals"],
+                drought_min,
                 self._stats["hold_low_conf"],
                 self._stats["hold_direction"],
                 self._stats["hold_correlation"],
@@ -485,6 +517,21 @@ class MLEngine:
                 self.cfg.retrain_trade_threshold,
                 buffer_sizes,
             )
+
+            SIGNAL_DROUGHT_WARN_MIN = int(os.getenv("SIGNAL_DROUGHT_WARN_MIN", "30"))
+            SIGNAL_DROUGHT_RETRAIN_MIN = int(os.getenv("SIGNAL_DROUGHT_RETRAIN_MIN", "60"))
+            if drought_min >= SIGNAL_DROUGHT_RETRAIN_MIN and not self._signal_drought_warned:
+                logger.warning(
+                    "SIGNAL DROUGHT %.0f min (threshold %d min) — triggering emergency retrain",
+                    drought_min, SIGNAL_DROUGHT_RETRAIN_MIN,
+                )
+                self._signal_drought_warned = True
+                await self._retrain_worker.trigger("signal_drought")
+            elif drought_min >= SIGNAL_DROUGHT_WARN_MIN and not self._signal_drought_warned:
+                logger.warning(
+                    "signal drought warning: %.0f min since last signal (threshold %d min)",
+                    drought_min, SIGNAL_DROUGHT_WARN_MIN,
+                )
 
     @staticmethod
     def _payload_list(payload: dict, *keys: str) -> list:
@@ -617,6 +664,8 @@ class MLEngine:
         await self._redis.publish(self.cfg.signals_channel, json.dumps(signal_payload))
         prom.signals_published.inc()
         self._stats["signals"] += 1
+        self._last_signal_at = time.time()
+        self._signal_drought_warned = False
         logger.info(
             "signal %s %s conf=%.3f vol=%.2f regime=%s sl=%.6f tps=%s",
             signal_payload["symbol"],
@@ -847,6 +896,18 @@ class MLEngine:
                     logger.info("EV gate: LONG→HOLD for %s (long_ev=$%.4f)",
                                 symbol, long_ev)
 
+        if direction != "HOLD":
+            should_avoid, avg_loss = self._online_learner.pattern_memory.should_avoid(
+                v_state, regime.value, direction,
+            )
+            if should_avoid:
+                logger.warning(
+                    "PATTERN MEMORY: avoiding %s %s for %s (avg_loss=%.4f from historical losses)",
+                    direction, symbol, regime.value, avg_loss,
+                )
+                self._stats["hold_direction"] += 1
+                return None
+
         prom.confidence_score.labels(symbol=symbol).set(confidence)
         prom.volatility_multiplier.labels(symbol=symbol).set(vol_mult)
         prom.tick_to_signal_latency.observe(time.time() - tick_start)
@@ -859,17 +920,27 @@ class MLEngine:
             self._stats["hold_direction"] += 1
             return None
 
-        # Bullish trend detection: relax confidence for LONG to collect data
-        long_conf_threshold = self.cfg.confidence_threshold
+        # Direction-specific thresholds: LONG needs higher bar (model is biased toward LONG)
+        long_conf_threshold = self.cfg.long_confidence_threshold
         trend_5m = buf.macro_trend(300)
         trend_15m = buf.macro_trend(900)
         bullish = trend_5m > self.cfg.bullish_trend_threshold and trend_15m > 0
-        if bullish and direction == "LONG":
-            long_conf_threshold = self.cfg.bullish_long_conf_threshold
-            logger.info("Bullish trend detected for %s: trend_5m=%.4f trend_15m=%.4f, LONG threshold lowered to %.3f",
-                       symbol, trend_5m, trend_15m, long_conf_threshold)
 
-        if confidence <= long_conf_threshold:
+        # Only relax when: bullish trend + model shows positive long EV + confidence >= 0.50
+        long_ev = mem_info.get("long_avg_pnl", 0.0)
+        long_matches = mem_info.get("long_matches", 0)
+        if (bullish and direction == "LONG" and long_ev > 0 and long_matches >= 3
+                and confidence >= 0.50):
+            long_conf_threshold = self.cfg.bullish_long_conf_threshold
+            logger.info("Bullish trend + positive long EV for %s: trend_5m=%.4f long_ev=$%.4f conf=%.3f, threshold lowered to %.3f",
+                       symbol, trend_5m, long_ev, confidence, long_conf_threshold)
+
+        if direction == "SHORT":
+            threshold = self.cfg.confidence_threshold
+        else:
+            threshold = long_conf_threshold
+
+        if confidence <= threshold:
             self._stats["hold_low_conf"] += 1
             return None
 
