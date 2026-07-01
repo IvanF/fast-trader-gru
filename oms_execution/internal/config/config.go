@@ -52,6 +52,7 @@ type Config struct {
 	TargetNetProfitPct         float64
 	SymbolOverrides            map[string]SymbolConfig
 	ShadowMode                 bool
+	ShadowAlwaysEnabled        bool
 	ShadowTimeStopSec          int
 }
 
@@ -150,6 +151,7 @@ func Load() Config {
 		TargetNetProfitPct:         floatEnv("TARGET_NET_PROFIT_PCT", 0.002),
 		SymbolOverrides:            parseSymbolOverrides(),
 		ShadowMode:                 envOr("SHADOW_MODE", "false") == "true",
+		ShadowAlwaysEnabled:        envOr("SHADOW_ALWAYS_ENABLED", "false") == "true",
 		ShadowTimeStopSec:          intEnv("SHADOW_TIME_STOP_SEC", 1800),
 	}
 }

@@ -83,7 +83,7 @@ func (se *ShadowEngine) ProcessPriceUpdate(ctx context.Context, symbol string, p
 
 	if pos.Direction == "LONG" {
 		if price <= pos.StopLoss {
-			closePrice = pos.StopLoss
+			closePrice = pos.StopLoss * 1.0002
 			closeReason = "stop_loss"
 			closed = true
 		} else if price >= pos.TakeProfit {
@@ -93,7 +93,7 @@ func (se *ShadowEngine) ProcessPriceUpdate(ctx context.Context, symbol string, p
 		}
 	} else {
 		if price >= pos.StopLoss {
-			closePrice = pos.StopLoss
+			closePrice = pos.StopLoss * 0.9998
 			closeReason = "stop_loss"
 			closed = true
 		} else if price <= pos.TakeProfit {
@@ -146,13 +146,19 @@ func (se *ShadowEngine) ProcessPriceUpdate(ctx context.Context, symbol string, p
 func calcShadowPnL(pos *ShadowPosition, exitPrice float64) float64 {
 	notional := pos.Qty * pos.EntryPrice
 	entryFee := notional * 0.00055
-	exitFee := pos.Qty * exitPrice * 0.0002
+	exitFee := pos.Qty * exitPrice * 0.00055
+
+	// Realistic spread simulation (0.03% average for mid-cap alts)
+	spreadCost := notional * 0.0003
+
+	// Slippage simulation for market orders (0.02% average)
+	slippageCost := notional * 0.0002
 
 	var pnl float64
 	if pos.Direction == "LONG" {
-		pnl = (exitPrice-pos.EntryPrice)*pos.Qty - entryFee - exitFee
+		pnl = (exitPrice-pos.EntryPrice)*pos.Qty - entryFee - exitFee - spreadCost - slippageCost
 	} else {
-		pnl = (pos.EntryPrice-exitPrice)*pos.Qty - entryFee - exitFee
+		pnl = (pos.EntryPrice-exitPrice)*pos.Qty - entryFee - exitFee - spreadCost - slippageCost
 	}
 	return math.Round(pnl*10000) / 10000
 }

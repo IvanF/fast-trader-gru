@@ -52,6 +52,9 @@ func New(cfg config.Config, bc *bybit.Client, rc *redisx.Client, iw *influx.Writ
 	if cfg.ShadowMode {
 		s.shadow = NewShadowEngine(logger, cfg.ResultsChannel)
 		logger.Info("SHADOW MODE ENABLED — no real orders will be placed")
+	} else if cfg.ShadowAlwaysEnabled {
+		s.shadow = NewShadowEngine(logger, cfg.ResultsChannel)
+		logger.Info("SHADOW ALWAYS ENABLED — shadow trades run alongside real execution")
 	}
 	return s
 }
@@ -88,6 +91,9 @@ func (s *Service) Run(ctx context.Context) error {
 		go s.runShadowPriceMonitor(ctx)
 	} else {
 		go s.runFillMonitor(ctx)
+		if s.cfg.ShadowAlwaysEnabled {
+			go s.runShadowPriceMonitor(ctx)
+		}
 	}
 	go s.runPositionMonitor(ctx)
 
@@ -170,6 +176,11 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 
 	if s.cfg.ShadowMode {
 		return s.shadowOpen(ctx, signal, recvAt)
+	}
+
+	// Shadow always enabled: run shadow alongside real execution
+	if s.cfg.ShadowAlwaysEnabled && s.shadow != nil {
+		go s.shadowOpen(ctx, signal, recvAt)
 	}
 
 	// Guard against TOCTOU: exchange may already have a position while local map is empty.

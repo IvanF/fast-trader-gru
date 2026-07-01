@@ -234,6 +234,7 @@ services:
       MIN_HOLD_TIME_SEC: ${MIN_HOLD_TIME_SEC:-0}
       DECAY_MIN_HOLD_SEC: ${DECAY_MIN_HOLD_SEC:-0}
       SHADOW_MODE: ${SHADOW_MODE:-false}
+      SHADOW_ALWAYS_ENABLED: ${SHADOW_ALWAYS_ENABLED:-false}
       INFLUX_URL: http://influxdb:8086
       INFLUX_TOKEN: ${INFLUX_TOKEN:-ftg-super-secret-token-change-me}
       INFLUX_ORG: ${INFLUX_ORG:-fasttrader}
