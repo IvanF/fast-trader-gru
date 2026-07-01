@@ -63,13 +63,8 @@ class ExperienceEngine:
         if abs(pnl) < 0.001:
             return -1
 
-        # Block duplicates: check if entry with same direction+regime+rounded_pnl exists
-        rounded_pnl = round(pnl, 4)
-        for e in self.metadata:
-            if (e.direction == direction.upper() and
-                    e.regime == regime and
-                    abs(e.pnl - rounded_pnl) < 0.001):
-                return -1  # duplicate
+        # Duplicate filter disabled — shadow trades cluster at same PnL (TP hits),
+        # blocking 100% of entries. Vector similarity in FAISS already handles diversity.
 
         # Compute optimal SL/TP from MAE/MFE
         optimal_sl = abs(mae_pct) * 1.1 if mae_pct != 0 else 0.0
