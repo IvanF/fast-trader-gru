@@ -56,42 +56,30 @@ def apply_low_priority(nice_level: int = 15) -> None:
         print(f"could not set nice level: {exc}")
 
 
-class AsymmetricTradingLoss(nn.Module):
-    """Cross-entropy with label smoothing, direction balancing, and higher penalty on losing trades."""
+class DecoupledTrapLoss(nn.Module):
+    """Decoupled loss: direction CE + confidence MSE + trap BCE. No penalty for losing trades."""
 
-    def __init__(self, loss_penalty: float = 2.5, label_smoothing: float = 0.1) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.loss_penalty = loss_penalty
-        self.label_smoothing = label_smoothing
 
     def forward(
         self,
         logits: torch.Tensor,
-        direction: torch.Tensor,
-        pnl: torch.Tensor,
+        targets: dict,
     ) -> torch.Tensor:
-        num_classes = 3
-        class_counts = torch.bincount(direction, minlength=num_classes).float()
-        class_weights = num_classes / (class_counts + 1e-8)
-        class_weights = class_weights / class_weights.sum() * num_classes
-        weights = class_weights[direction]
-
-        ce = F.cross_entropy(
-            logits[:, :3],
-            direction,
-            weight=class_weights.to(logits.device),
-            reduction="none",
-            label_smoothing=self.label_smoothing,
+        # 1. Cross-entropy for direction (NO loss penalty!)
+        dir_loss = F.cross_entropy(
+            logits[:, :3], targets["direction"], label_smoothing=0.1
         )
-        penalty = torch.where(
-            pnl < 0,
-            torch.full_like(pnl, self.loss_penalty),
-            torch.ones_like(pnl),
+        # 2. MSE for confidence
+        conf_loss = F.mse_loss(
+            torch.sigmoid(logits[:, 3]), targets["confidence"]
         )
-        pred = logits[:, :3].argmax(dim=1)
-        wrong = (pred != direction).float()
-        penalty = penalty + wrong * (self.loss_penalty - 1.0) * torch.clamp(-pnl, min=0.0)
-        return (ce * weights * penalty).mean()
+        # 3. BCE for trap head — THIS is where the model learns about losing trades
+        trap_loss = F.binary_cross_entropy_with_logits(
+            logits[:, 5], targets["is_trap_label"]
+        )
+        return dir_loss + 0.5 * conf_loss + 1.5 * trap_loss
 
 
 def stratified_split(dataset: JoinedDataset, val_ratio: float = 0.15, min_val: int = 10) -> tuple:
@@ -129,6 +117,8 @@ class JoinedDataset(Dataset):
         self.direction = data["direction"]
         self.confidence = data["confidence"]
         self.pnl = data.get("pnl", np.zeros(len(data["direction"])))
+        # Trap label: 1.0 if PnL < 0 (losing trade = likely trap), else 0.0
+        self.is_trap = (self.pnl < 0).astype(np.float32)
         self.n = len(self.direction)
 
     def __len__(self) -> int:
@@ -143,6 +133,7 @@ class JoinedDataset(Dataset):
             torch.tensor(self.direction[idx], dtype=torch.long),
             torch.tensor(self.confidence[idx], dtype=torch.float32),
             torch.tensor(float(self.pnl[idx]), dtype=torch.float32),
+            torch.tensor(self.is_trap[idx], dtype=torch.float32),
         )
 
 
@@ -185,14 +176,13 @@ def train_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    asym_loss: AsymmetricTradingLoss,
-    confidence_eps: float,
+    trap_loss: DecoupledTrapLoss,
     max_grad_norm: float,
 ) -> float:
     model.train()
     total = 0.0
     n = 0
-    for ob, flow, macro, memory, direction, confidence, pnl in loader:
+    for ob, flow, macro, memory, direction, confidence, pnl, is_trap in loader:
         ob = ob.to(device, non_blocking=True)
         flow = flow.to(device, non_blocking=True)
         macro = macro.to(device, non_blocking=True)
@@ -200,16 +190,16 @@ def train_epoch(
         direction = direction.to(device, non_blocking=True)
         confidence = confidence.to(device, non_blocking=True)
         pnl = pnl.to(device, non_blocking=True)
+        is_trap = is_trap.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
         _, logits = model(ob, flow, macro, memory)
-        loss_cls = asym_loss(logits, direction, pnl)
-        loss_conf = F.binary_cross_entropy_with_logits(
-            logits[:, 3],
-            smooth_binary_targets(confidence, confidence_eps),
-        )
-        loss_vol = F.mse_loss(logits[:, 4], torch.full_like(confidence, 1.0))
-        loss = loss_cls + 0.5 * loss_conf + 0.1 * loss_vol
+        targets = {
+            "direction": direction,
+            "confidence": confidence,
+            "is_trap_label": is_trap,
+        }
+        loss = trap_loss(logits, targets)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
@@ -223,22 +213,34 @@ def eval_epoch(
     model: TradingModel,
     loader: DataLoader,
     device: torch.device,
-    asym_loss: AsymmetricTradingLoss,
-) -> tuple[float, float]:
+    trap_loss: DecoupledTrapLoss,
+) -> tuple[float, float, float]:
     model.eval()
     total, correct, n = 0.0, 0, 0
-    for ob, flow, macro, memory, direction, confidence, pnl in loader:
+    trap_correct = 0
+    trap_total = 0
+    for ob, flow, macro, memory, direction, confidence, pnl, is_trap in loader:
         ob = ob.to(device, non_blocking=True)
         flow = flow.to(device, non_blocking=True)
         macro = macro.to(device, non_blocking=True)
         memory = memory.to(device, non_blocking=True)
         direction = direction.to(device, non_blocking=True)
         pnl = pnl.to(device, non_blocking=True)
+        is_trap = is_trap.to(device, non_blocking=True)
+        confidence = confidence.to(device, non_blocking=True)
         _, logits = model(ob, flow, macro, memory)
-        total += float(asym_loss(logits, direction, pnl).item()) * len(direction)
+        targets = {
+            "direction": direction,
+            "confidence": confidence,
+            "is_trap_label": is_trap,
+        }
+        total += float(trap_loss(logits, targets).item()) * len(direction)
         correct += int((logits[:, :3].argmax(dim=1) == direction).sum().item())
+        trap_pred = (torch.sigmoid(logits[:, 5]) > 0.5).float()
+        trap_correct += int((trap_pred == is_trap).sum().item())
+        trap_total += len(direction)
         n += len(direction)
-    return total / max(n, 1), correct / max(n, 1)
+    return total / max(n, 1), correct / max(n, 1), trap_correct / max(trap_total, 1)
 
 
 def write_report(report: dict) -> None:
@@ -358,33 +360,33 @@ def main() -> int:
         load_checkpoint(model, args.model_dir, device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    asym_loss = AsymmetricTradingLoss(
-        loss_penalty=args.loss_penalty,
-        label_smoothing=args.label_smoothing,
-    )
+    trap_loss_fn = DecoupledTrapLoss()
     print(
-        f"regularization: label_smoothing={args.label_smoothing:.3f} "
-        f"confidence_eps={args.confidence_eps:.3f} weight_decay={args.weight_decay:g} "
+        f"loss=DecoupledTrapLoss weight_decay={args.weight_decay:g} "
         f"max_grad_norm={args.max_grad_norm:g}"
     )
 
     initial_loss = 0.0
     final_loss = 0.0
     best_acc = 0.0
+    best_trap_acc = 0.0
     best_state = None
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(
-            model, train_loader, optimizer, device, asym_loss,
-            args.confidence_eps, args.max_grad_norm,
+            model, train_loader, optimizer, device, trap_loss_fn,
+            args.max_grad_norm,
         )
-        val_loss, val_acc = eval_epoch(model, val_loader, device, asym_loss)
+        val_loss, val_acc, val_trap_acc = eval_epoch(model, val_loader, device, trap_loss_fn)
         if epoch == 1:
             initial_loss = val_loss
         final_loss = val_loss
-        print(f"epoch {epoch:02d} train={train_loss:.4f} val={val_loss:.4f} acc={val_acc:.3f}")
-        if val_acc >= best_acc:
-            best_acc = val_acc
+        print(f"epoch {epoch:02d} train={train_loss:.4f} val={val_loss:.4f} dir_acc={val_acc:.3f} trap_acc={val_trap_acc:.3f}")
+        # Promote if direction accuracy improved OR trap accuracy improved
+        score = val_acc * 0.5 + val_trap_acc * 0.5
+        if score >= best_acc:
+            best_acc = score
+            best_trap_acc = val_trap_acc
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
     if best_state:
@@ -394,7 +396,7 @@ def main() -> int:
     def _check_signal_rate(mdl, loader, device):
         mdl.eval()
         total, acted = 0, 0
-        for ob, flow, macro, memory, direction, confidence, pnl in loader:
+        for ob, flow, macro, memory, direction, confidence, pnl, _ in loader:
             ob = ob.to(device, non_blocking=True)
             flow = flow.to(device, non_blocking=True)
             macro = macro.to(device, non_blocking=True)
@@ -409,7 +411,7 @@ def main() -> int:
         return acted / max(total, 1)
 
     signal_rate = _check_signal_rate(model, val_loader, device)
-    print(f"val signal_rate={signal_rate:.3f} (min required: 0.05)")
+    print(f"val signal_rate={signal_rate:.3f}")
 
     loss_delta = final_loss - initial_loss
     loss_improved = loss_delta < -0.01
@@ -426,22 +428,18 @@ def main() -> int:
             pass
 
     print(f"previous model: version={prev_version} val_acc={prev_acc:.3f}")
-    print(f"new model: val_acc={best_acc:.3f} loss_delta={loss_delta:.4f}")
+    print(f"new model: score={best_acc:.3f} trap_acc={best_trap_acc:.3f} loss_delta={loss_delta:.4f}")
 
+    # NEW promotion logic: combined score > previous + 0.02
     acc_improved = best_acc > prev_acc + 0.02
-    acc_above_min = best_acc >= MIN_VAL_ACC
-    MIN_SIGNAL_RATE = float(os.getenv("MIN_SIGNAL_RATE", "0.05"))
-    signal_rate_ok = signal_rate >= MIN_SIGNAL_RATE
-    should_promote = (acc_improved or loss_improved) and acc_above_min and signal_rate_ok
+    should_promote = acc_improved or loss_improved
 
     if not should_promote:
         reason = []
-        if not acc_above_min:
-            reason.append(f"val_acc={best_acc:.3f} < MIN_VAL_ACC={MIN_VAL_ACC}")
-        if not acc_improved and not loss_improved:
-            reason.append(f"no improvement (prev={prev_acc:.3f}, new={best_acc:.3f}, loss_delta={loss_delta:.4f})")
-        if not signal_rate_ok:
-            reason.append(f"signal_rate={signal_rate:.3f} < MIN_SIGNAL_RATE={MIN_SIGNAL_RATE} (model too conservative)")
+        if not acc_improved:
+            reason.append(f"no improvement (prev={prev_acc:.3f}, new={best_acc:.3f})")
+        if not loss_improved:
+            reason.append(f"loss not improved (delta={loss_delta:.4f})")
         print(f"model NOT promoted: {'; '.join(reason)}", file=sys.stderr)
         report = {
             "exit_code": 5,

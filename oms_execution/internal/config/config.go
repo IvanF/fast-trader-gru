@@ -51,6 +51,8 @@ type Config struct {
 	ExitFeeRate                float64
 	TargetNetProfitPct         float64
 	SymbolOverrides            map[string]SymbolConfig
+	ShadowMode                 bool
+	ShadowTimeStopSec          int
 }
 
 type SymbolConfig struct {
@@ -134,7 +136,7 @@ func Load() Config {
 		EntryMakerTicks:            intEnv("ENTRY_MAKER_TICKS", 2),
 		VolMultiplierCap:           floatEnv("VOL_MULTIPLIER_CAP", 2.0),
 		PendingVolRepriceDelta:     floatEnv("PENDING_VOL_REPRICE_DELTA", 0.5),
-		MinSLPct:                   floatEnv("MIN_SL_PCT", 0.005),
+		MinSLPct:                   floatEnv("MIN_SL_PCT", 0.003),
 		MaxSLPct:                   floatEnv("MAX_SL_PCT", 0.012),
 		MinTPPct:                   floatEnv("MIN_TP_PCT", 0.002),
 		MaxTPPct:                   floatEnv("MAX_TP_PCT", 0.008),
@@ -147,6 +149,8 @@ func Load() Config {
 		ExitFeeRate:                floatEnv("EXIT_FEE_RATE", 0.0002),
 		TargetNetProfitPct:         floatEnv("TARGET_NET_PROFIT_PCT", 0.002),
 		SymbolOverrides:            parseSymbolOverrides(),
+		ShadowMode:                 envOr("SHADOW_MODE", "false") == "true",
+		ShadowTimeStopSec:          intEnv("SHADOW_TIME_STOP_SEC", 1800),
 	}
 }
 

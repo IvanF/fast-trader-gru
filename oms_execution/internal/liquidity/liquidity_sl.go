@@ -87,9 +87,9 @@ func computeLongSL(ob models.OrderbookSnapshot, fillPrice, tickSize, minSLDist, 
 			current = &z
 			continue
 		}
-		// Check if this level is within 0.5% of the zone top
+		// Check if this level is within 1.5% of the zone top (wider grouping for thin books)
 		zoneRangePct := (current.topPrice - lv.price) / fillPrice
-		if zoneRangePct <= 0.01 {
+		if zoneRangePct <= 0.015 {
 			current.bottomPrice = lv.price
 			current.totalSize += lv.size
 			current.count++
@@ -103,9 +103,23 @@ func computeLongSL(ob models.OrderbookSnapshot, fillPrice, tickSize, minSLDist, 
 		zones = append(zones, *current)
 	}
 
-	// Find nearest zone with enough volume (min 2 levels OR size > median)
+	// Find the nearest zone where SL behind it would be at least minSLDist away.
+	// This places SL at a real support level while respecting the minimum distance.
 	if len(zones) > 0 {
-		bestZone := zones[0]
+		var bestZone *zone
+		for i := range zones {
+			z := &zones[i]
+			slCandidate := z.bottomPrice - tickSize*2
+			slDist := fillPrice - slCandidate
+			if slDist >= minSLDist {
+				bestZone = z
+				break
+			}
+		}
+		// If no zone qualifies, use the nearest zone anyway (real S/R > artificial floor)
+		if bestZone == nil {
+			bestZone = &zones[0]
+		}
 		sl := bestZone.bottomPrice - tickSize*2
 
 		slDist := fillPrice - sl
@@ -184,7 +198,7 @@ func computeShortSL(ob models.OrderbookSnapshot, fillPrice, tickSize, minSLDist,
 			continue
 		}
 		zoneRangePct := (lv.price - current.bottomPrice) / fillPrice
-		if zoneRangePct <= 0.01 {
+		if zoneRangePct <= 0.015 {
 			current.topPrice = lv.price
 			current.totalSize += lv.size
 			current.count++
@@ -198,8 +212,21 @@ func computeShortSL(ob models.OrderbookSnapshot, fillPrice, tickSize, minSLDist,
 		zones = append(zones, *current)
 	}
 
+	// Find the nearest zone where SL behind it would be at least minSLDist away.
 	if len(zones) > 0 {
-		bestZone := zones[0]
+		var bestZone *zone
+		for i := range zones {
+			z := &zones[i]
+			slCandidate := z.topPrice + tickSize*2
+			slDist := slCandidate - fillPrice
+			if slDist >= minSLDist {
+				bestZone = z
+				break
+			}
+		}
+		if bestZone == nil {
+			bestZone = &zones[0]
+		}
 		sl := bestZone.topPrice + tickSize*2
 
 		slDist := sl - fillPrice

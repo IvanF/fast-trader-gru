@@ -66,9 +66,9 @@ def _round_tick(price: float, tick: float) -> float:
 
 def _find_liquidity_walls(
     levels: Sequence[Any],
-    top_n: int = 30,
-    window: int = 3,
-    spike_ratio: float = 1.5,
+    top_n: int = 60,
+    window: int = 5,
+    spike_ratio: float = 1.2,
 ) -> List[Tuple[float, float]]:
     """Find price levels with unusually large order sizes (walls).
 
@@ -266,8 +266,9 @@ def compute_liquidity_sl(
     asks: Sequence[Any],
     entry_price: float = 0.0,
     tick_size: float = 0.0,
-    min_sl_distance_pct: float = 0.005,
-    max_sl_distance_pct: float = 0.015,
+    min_sl_distance_pct: float = 0.003,
+    max_sl_distance_pct: float = 0.010,
+    hard_max_sl_pct: float = 0.015,
 ) -> float:
     """Find SL level near support/resistance walls.
 
@@ -278,6 +279,7 @@ def compute_liquidity_sl(
     1. Beyond a wall (so if price breaks the wall, we're out)
     2. Not too tight (avoid noise stop-outs)
     3. Not too wide (limit max loss)
+    4. Hard cap: never exceed hard_max_sl_pct regardless of vol_mult
     """
     ref = entry_price
     if ref <= 0:
@@ -285,9 +287,12 @@ def compute_liquidity_sl(
 
     tick = tick_size if tick_size > 0 else _infer_tick_size(ref)
 
+    # Hard cap: never exceed this distance regardless of vol_mult
+    effective_max = min(max_sl_distance_pct, hard_max_sl_pct)
+
     if direction == "LONG":
         # Find support walls below entry
-        walls = _find_liquidity_walls(bids, top_n=30)
+        walls = _find_liquidity_walls(bids, top_n=60)
         candidates = []
         for wall_price, wall_size in walls:
             if wall_price >= ref:
@@ -295,7 +300,7 @@ def compute_liquidity_sl(
             distance_pct = (ref - wall_price) / ref
             if distance_pct < min_sl_distance_pct:
                 continue
-            if distance_pct > max_sl_distance_pct:
+            if distance_pct > effective_max:
                 continue
             # Place SL below the wall (2 ticks below)
             sl = _round_tick(wall_price - tick * 2, tick)
@@ -304,16 +309,23 @@ def compute_liquidity_sl(
             candidates.append((sl, wall_size, distance_pct))
 
         if candidates:
-            # Prefer strongest wall that's not too far
-            candidates.sort(key=lambda x: -x[1])
-            return candidates[0][0]
+            # Prefer strongest wall closest to entry (not too far)
+            # Score: prefer walls at 0.3%-0.8% distance with large size
+            optimal_dist = 0.005
+            scored = []
+            for sl, wall_size, dist_pct in candidates:
+                dist_score = 1.0 / (1.0 + abs(dist_pct - optimal_dist) / optimal_dist)
+                size_score = min(wall_size / 500, 2.0)
+                scored.append((sl, dist_score * (1 + size_score * 0.3), wall_size))
+            scored.sort(key=lambda x: -x[1])
+            return scored[0][0]
 
-        # Fallback: use max SL distance
-        return _round_tick(ref * (1 - max_sl_distance_pct), tick)
+        # Fallback: use tight SL (0.5%)
+        return _round_tick(ref * (1 - min(effective_max, 0.005)), tick)
 
     else:  # SHORT
         # Find resistance walls above entry
-        walls = _find_liquidity_walls(asks, top_n=30)
+        walls = _find_liquidity_walls(asks, top_n=60)
         candidates = []
         for wall_price, wall_size in walls:
             if wall_price <= ref:
@@ -321,7 +333,7 @@ def compute_liquidity_sl(
             distance_pct = (wall_price - ref) / ref
             if distance_pct < min_sl_distance_pct:
                 continue
-            if distance_pct > max_sl_distance_pct:
+            if distance_pct > effective_max:
                 continue
             # Place SL above the wall (2 ticks above)
             sl = _round_tick(wall_price + tick * 2, tick)
@@ -330,9 +342,15 @@ def compute_liquidity_sl(
             candidates.append((sl, wall_size, distance_pct))
 
         if candidates:
-            # Prefer strongest wall that's not too far
-            candidates.sort(key=lambda x: -x[1])
-            return candidates[0][0]
+            # Prefer strongest wall closest to entry
+            optimal_dist = 0.005
+            scored = []
+            for sl, wall_size, dist_pct in candidates:
+                dist_score = 1.0 / (1.0 + abs(dist_pct - optimal_dist) / optimal_dist)
+                size_score = min(wall_size / 500, 2.0)
+                scored.append((sl, dist_score * (1 + size_score * 0.3), wall_size))
+            scored.sort(key=lambda x: -x[1])
+            return scored[0][0]
 
-        # Fallback: use max SL distance
-        return _round_tick(ref * (1 + max_sl_distance_pct), tick)
+        # Fallback: use tight SL (0.5%)
+        return _round_tick(ref * (1 + min(effective_max, 0.005)), tick)

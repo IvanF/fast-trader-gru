@@ -56,6 +56,7 @@ class Config:
     loss_penalty_weight: float
     train_device: str
     telemetry_interval_sec: int
+    trap_threshold: float
     bullish_trend_threshold: float
     bullish_long_conf_threshold: float
     long_confidence_threshold: float
@@ -118,6 +119,7 @@ class Config:
             loss_penalty_weight=float(os.getenv("LOSS_PENALTY_WEIGHT", "2.5")),
             train_device=os.getenv("TRAIN_DEVICE", "cuda"),
             telemetry_interval_sec=int(os.getenv("TELEMETRY_INTERVAL_SEC", "5")),
+            trap_threshold=float(os.getenv("TRAP_THRESHOLD", "0.60")),
         )
 
     @staticmethod

@@ -145,32 +145,60 @@ func BuildExitGrid(
 	minSLPct := opts.MinSLPct
 	maxSLPct := opts.MaxSLPct
 
-	// Dynamic SL: scan orderbook for liquidity cluster, place SL behind it
-	slResult := liquidity.ComputeLiquiditySL(
-		direction, fillPrice, ob, tickSize, minSLPct, maxSLPct,
-	)
-	slPrice := slResult.Price
-	smartSL := slResult.Source == "liquidity_cluster"
-
-	// Single TP at fee-aware price
-	entryFee := opts.EntryFeeRate
-	if entryFee <= 0 {
-		entryFee = 0.00055 // Bybit taker default
-	}
-	exitFee := opts.ExitFeeRate
-	if exitFee <= 0 {
-		exitFee = 0.0002 // Bybit maker (PostOnly) default
-	}
-	targetProfit := opts.TargetNetProfitPct
-	if targetProfit <= 0 {
-		targetProfit = 0.002 // 0.2% default
+	// Scale SL by volatility: calm coins get tighter SL, volatile coins get wider SL
+	if vm > 0 && vm != 1.0 {
+		slVolMult := math.Sqrt(vm)
+		minSLPct *= slVolMult
+		maxSLPct *= slVolMult
 	}
 
-	tpPrice := CalculateExitPrice(fillPrice, direction, entryFee, exitFee, targetProfit, tickSize)
+	var slPrice, tpPrice float64
+	smartSL := false
 
-	// Full position qty goes to single TP
+	// Parametric Memory: override SL/TP with dynamic values from MAE/MFE history
+	dynamicSLPct := signal.DynamicSLPct
+	dynamicTPPct := signal.DynamicTPPct
+
+	if dynamicSLPct > 0 && dynamicTPPct > 0 {
+		slPct := math.Max(math.Min(dynamicSLPct, maxSLPct), minSLPct)
+		if direction == "LONG" {
+			slPrice = fillPrice * (1.0 - slPct)
+		} else {
+			slPrice = fillPrice * (1.0 + slPct)
+		}
+		slPrice = roundToTick(slPrice, tickSize)
+
+		tpPct := math.Max(math.Min(dynamicTPPct, opts.MaxTPPct), opts.MinTPPct)
+		if direction == "LONG" {
+			tpPrice = fillPrice * (1.0 + tpPct)
+		} else {
+			tpPrice = fillPrice * (1.0 - tpPct)
+		}
+		tpPrice = roundToTick(tpPrice, tickSize)
+	} else {
+		// Dynamic SL: scan orderbook for liquidity zone, place SL behind it
+		slResult := liquidity.ComputeLiquiditySL(
+			direction, fillPrice, ob, tickSize, minSLPct, maxSLPct,
+		)
+		slPrice = slResult.Price
+		smartSL = slResult.Source == "liquidity_zone" || slResult.Source == "nearest_level"
+
+		entryFee := opts.EntryFeeRate
+		if entryFee <= 0 {
+			entryFee = 0.00055
+		}
+		exitFee := opts.ExitFeeRate
+		if exitFee <= 0 {
+			exitFee = 0.0002
+		}
+		targetProfit := opts.TargetNetProfitPct
+		if targetProfit <= 0 {
+			targetProfit = 0.002
+		}
+		tpPrice = CalculateExitPrice(fillPrice, direction, entryFee, exitFee, targetProfit, tickSize)
+	}
+
 	tpQty := bybit.NormalizeQty(totalQty, qtyStep, minQty)
-
 	grid := ExitGrid{
 		StopLoss:    ExitLevel{Price: slPrice, Qty: tpQty, Kind: "stop_loss"},
 		SmartSL:     smartSL,

@@ -208,7 +208,7 @@ class HotSwapONNXInference:
             fused = fused[: self.state_dim]
         return fused
 
-    def decide(self, v_state: np.ndarray, v_memory: np.ndarray) -> Tuple[str, float, float]:
+    def decide(self, v_state: np.ndarray, v_memory: np.ndarray) -> Tuple[str, float, float, float]:
         with self._lock:
             mlp_sess = self._bundle.mlp
 
@@ -227,8 +227,9 @@ class HotSwapONNXInference:
             direction_idx = int(np.argmax(logits[:3]))
             confidence = float(self._sigmoid(logits[3])) if len(logits) > 3 else 0.5
             vol_mult = float(np.clip(logits[4], 0.5, 3.0)) if len(logits) > 4 else 1.0
+            trap_prob = float(self._sigmoid(logits[5])) if len(logits) > 5 else 0.0
             directions = ["LONG", "SHORT", "HOLD"]
-            return directions[direction_idx], confidence, vol_mult
+            return directions[direction_idx], confidence, vol_mult, trap_prob
 
         return self._heuristic_decision(v_state, v_memory)
 

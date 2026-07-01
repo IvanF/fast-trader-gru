@@ -20,6 +20,12 @@ class MemoryEntry:
     regime: str
     won: bool
     direction: str = "HOLD"
+    optimal_sl_pct: float = 0.0
+    optimal_tp_pct: float = 0.0
+    is_salvageable: bool = False
+    mae_pct: float = 0.0
+    mfe_pct: float = 0.0
+    trade_judge: str = "UNCERTAIN"
 
 
 class ExperienceEngine:
@@ -47,9 +53,14 @@ class ExperienceEngine:
         with open(f"{self.index_path}.meta.json", "w", encoding="utf-8") as f:
             json.dump([e.__dict__ for e in self.metadata], f)
 
-    def add(self, vector: np.ndarray, pnl: float, regime: str, direction: str = "HOLD") -> int:
-        # Block outliers symmetrically — extreme wins and losses skew memory statistics
-        if pnl > 0.15 or pnl < -0.10:
+    def add(self, vector: np.ndarray, pnl: float, regime: str, direction: str = "HOLD",
+            mae_pct: float = 0.0, mfe_pct: float = 0.0, trade_judge: str = "UNCERTAIN") -> int:
+        # Block extreme outliers — allow moderate losses for learning
+        if pnl > 0.50 or pnl < -0.50:
+            return -1
+
+        # Block near-zero noise
+        if abs(pnl) < 0.001:
             return -1
 
         # Block duplicates: check if entry with same direction+regime+rounded_pnl exists
@@ -59,6 +70,11 @@ class ExperienceEngine:
                     e.regime == regime and
                     abs(e.pnl - rounded_pnl) < 0.001):
                 return -1  # duplicate
+
+        # Compute optimal SL/TP from MAE/MFE
+        optimal_sl = abs(mae_pct) * 1.1 if mae_pct != 0 else 0.0
+        optimal_tp = abs(mfe_pct) * 0.9 if mfe_pct != 0 else 0.0
+        is_salvageable = optimal_tp > (optimal_sl * 1.5) if optimal_sl > 0 else False
 
         vec = vector.astype(np.float32).reshape(1, -1)
         faiss.normalize_L2(vec)
@@ -71,6 +87,12 @@ class ExperienceEngine:
             regime=regime,
             won=pnl >= 0,
             direction=direction.upper() if direction else "HOLD",
+            optimal_sl_pct=optimal_sl,
+            optimal_tp_pct=optimal_tp,
+            is_salvageable=is_salvageable,
+            mae_pct=mae_pct,
+            mfe_pct=mfe_pct,
+            trade_judge=trade_judge,
         ))
         return vid
 
@@ -86,7 +108,8 @@ class ExperienceEngine:
             v[0] = 0.5
             v[8] = 0.5
             v[9] = 0.5
-            return v, {"win_rate": 0.5, "avg_pnl": 0.0, "matches": 0, "long_win_rate": 0.5, "short_win_rate": 0.5}
+            return v, {"win_rate": 0.5, "avg_pnl": 0.0, "matches": 0, "long_win_rate": 0.5, "short_win_rate": 0.5,
+                   "long_avg_pnl": 0.0, "short_avg_pnl": 0.0, "long_matches": 0, "short_matches": 0}
 
         vec = vector.astype(np.float32).reshape(1, -1)
         faiss.normalize_L2(vec)
@@ -145,7 +168,7 @@ class ExperienceEngine:
             1.0 if current_regime == "Choppy" else 0.0,
         ], dtype=np.float32)
         return v_memory, {
-            "win_rate": win_rate, "avg_pnl": avg_pnl, "matches": int(k),
+            "win_rate": win_rate, "avg_pnl": avg_pnl, "matches": long_matches + short_matches,
             "long_win_rate": long_win_rate, "short_win_rate": short_win_rate,
             "long_avg_pnl": long_avg_pnl, "short_avg_pnl": short_avg_pnl,
             "long_matches": long_matches, "short_matches": short_matches,
@@ -154,3 +177,55 @@ class ExperienceEngine:
     @property
     def size(self) -> int:
         return self.index.ntotal
+
+    def query_with_metadata(self, vector: np.ndarray, current_regime: str, k: int = 10) -> Tuple[np.ndarray, dict]:
+        """Query FAISS and return v_memory + per-neighbor metadata (optimal SL/TP, salvageable)."""
+        if self.index.ntotal == 0:
+            return np.zeros(8, dtype=np.float32), {"neighbors": [], "salvageable_count": 0, "unsalvageable_count": 0}
+
+        vec = vector.astype(np.float32).reshape(1, -1)
+        faiss.normalize_L2(vec)
+        k = min(k, self.index.ntotal)
+        distances, indices = self.index.search(vec, k)
+
+        neighbors = []
+        salvageable_count = 0
+        unsalvageable_count = 0
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx < 0 or idx >= len(self.metadata):
+                continue
+            entry = self.metadata[idx]
+            w = self._decay_weight(entry, current_regime) * max(float(dist), 0.01)
+            if entry.is_salvageable:
+                salvageable_count += 1
+            else:
+                unsalvageable_count += 1
+            neighbors.append({
+                "direction": entry.direction,
+                "pnl": entry.pnl,
+                "optimal_sl_pct": entry.optimal_sl_pct,
+                "optimal_tp_pct": entry.optimal_tp_pct,
+                "is_salvageable": entry.is_salvageable,
+                "weight": w,
+                "regime": entry.regime,
+                "mae_pct": entry.mae_pct,
+                "mfe_pct": entry.mfe_pct,
+            })
+
+        v_memory, info = self.query(vector, current_regime, k)
+        info["neighbors"] = neighbors
+        info["salvageable_count"] = salvageable_count
+        info["unsalvageable_count"] = unsalvageable_count
+
+        # Compute dynamic SL/TP from salvageable neighbors
+        salvageable = [n for n in neighbors if n["is_salvageable"]]
+        if salvageable:
+            avg_optimal_sl = sum(n["optimal_sl_pct"] for n in salvageable) / len(salvageable)
+            avg_optimal_tp = sum(n["optimal_tp_pct"] for n in salvageable) / len(salvageable)
+            info["dynamic_sl_pct"] = avg_optimal_sl
+            info["dynamic_tp_pct"] = avg_optimal_tp
+        else:
+            info["dynamic_sl_pct"] = 0.0
+            info["dynamic_tp_pct"] = 0.0
+
+        return v_memory, info

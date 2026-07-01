@@ -126,6 +126,41 @@ def _rows_to_sequences(rows: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarr
     avg_fill = np.mean([s for s in sizes if s > 0]) if any(s > 0 for s in sizes) else 0.0
     macro[13] = avg_fill / (total_depth / 10.0) if total_depth > 0 else 0.0
 
+    # Trap features (14-16)
+    if len(obi_vals) >= 2:
+        obi_arr = np.array([v[0] for v in obi_vals], dtype=np.float32)
+        macro[14] = float(np.max(obi_arr) - np.min(obi_arr))  # obi_reversal
+    else:
+        macro[14] = 0.0
+
+    pre_entry_sweep = 0.0
+    if len(flow_vals) >= 5:
+        recent_sizes = [abs(v[0]) for v in flow_vals[-5:]]
+        avg_s = np.mean(recent_sizes) if recent_sizes else 0
+        max_s = max(recent_sizes) if recent_sizes else 0
+        if avg_s > 0 and max_s > avg_s * 3.0:
+            pre_entry_sweep = 1.0
+    macro[15] = pre_entry_sweep
+
+    if len(flow_vals) >= 2:
+        delays = [flow_vals[i][1] - flow_vals[i-1][1] for i in range(1, min(len(flow_vals), 60))]
+        valid_delays = [d for d in delays if d > 0]
+        if valid_delays:
+            macro[16] = float(np.clip(np.mean(valid_delays) / 60.0, 0.0, 1.0))
+        else:
+            macro[16] = 0.5
+    else:
+        macro[16] = 0.5
+
+    # Multi-timeframe trends (17-19)
+    if len(prices) >= 2:
+        macro[17] = (prices[-1] - prices[0]) / max(prices[0], 1e-8)  # trend_5m
+    if len(prices) >= 10:
+        q = len(prices) // 4
+        macro[18] = (prices[-1] - prices[q]) / max(prices[q], 1e-8)  # trend_4h
+    if len(prices) >= 20:
+        macro[19] = (prices[-1] - prices[0]) / max(prices[0], 1e-8)  # trend_1d
+
     return ob_seq, flow_seq, macro
 
 
@@ -159,6 +194,10 @@ def build_joined_dataset(
         feature_rows = store.query_market_features_window(sym, t, feature_window_sec)
         ob_seq, flow_seq, macro = _rows_to_sequences(feature_rows)
 
+        # Skip if no features available for this symbol
+        if ob_seq.sum() == 0 and flow_seq.sum() == 0:
+            continue
+
         state_json = outcome.get("state_vector_json", "[]")
         try:
             state_vec = np.array(json.loads(state_json), dtype=np.float32)
@@ -191,6 +230,9 @@ def build_joined_dataset(
         pnl_list.append(pnl)
         ts_list.append(t.timestamp())
         sym_list.append(sym)
+
+    if not ob_list:
+        return _empty_dataset()
 
     result = {
         "ob_seq": np.nan_to_num(np.stack(ob_list), nan=0.0, posinf=0.0, neginf=0.0),

@@ -11,8 +11,8 @@ import numpy as np
 
 INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "/app/data/faiss_index")
 MAX_IMBALANCE = 2.0
-MAX_PNL = 0.12
-MIN_PNL = -0.03
+MAX_PNL = 0.15
+MIN_PNL = -0.50
 
 
 def main():

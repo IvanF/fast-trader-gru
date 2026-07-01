@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from typing import Dict, List, Set, TypedDict
@@ -75,8 +76,13 @@ class MLEngine:
             "hold_direction": 0,
             "hold_correlation": 0,
             "buffer_warming": 0,
+            "pattern_blocks": 0,
         }
         self._last_status_log = time.time()
+        self._pattern_block_count_this_cycle = 0
+        self._tick_cycle_predictions = 0
+        self._circuit_breaker_lock = threading.Lock()
+        self._corr_block_count_this_cycle = 0
         self._last_signal_at = time.time()
         self._signal_drought_warned = False
         self._online_learner = OnlineLearner(cfg.model_dir, cfg.state_dim)
@@ -86,6 +92,7 @@ class MLEngine:
         )
         self._open_positions: Dict[str, _OpenPosition] = {}
         self._pending_entries: Dict[str, _PendingEntry] = {}
+        self._pending_mae_mfe: Dict[str, dict] = {}
         self._event_states = EventStateStore()
         self._movement_states = MovementStateStore()
         self._movement_weights, self._movement_bias = load_weights_from_env()
@@ -241,6 +248,7 @@ class MLEngine:
             self._listen_active_symbols(),
             self._listen_market_data(),
             self._listen_execution_results(),
+            self._listen_mae_mfe(),
             self._listen_positions(),
             self._listen_pending_orders(),
             self._listen_model_reload(),
@@ -308,7 +316,15 @@ class MLEngine:
 
     async def _listen_execution_results(self) -> None:
         async def handle(msg: dict) -> None:
-            data = json.loads(msg["data"])
+            raw = msg["data"]
+            if isinstance(raw, str):
+                data = json.loads(raw)
+            elif isinstance(raw, dict):
+                data = raw
+            elif isinstance(raw, bytes):
+                data = json.loads(raw.decode())
+            else:
+                return
             vec = np.array(data.get("state_vector", []), dtype=np.float32)
             if vec.size == 0:
                 return
@@ -318,11 +334,20 @@ class MLEngine:
             regime = data.get("regime", "Choppy")
             direction = data.get("direction", "HOLD")
             symbol = data.get("symbol", "")
+            mae_pct = float(data.get("mae_pct", 0))
+            mfe_pct = float(data.get("mfe_pct", 0))
 
-            if pnl >= -0.10:
-                self.memory.add(vec[: self.cfg.state_dim], pnl, regime, direction)
-            else:
-                logger.info("skipping large loss from FAISS: %s pnl=%.4f", symbol, pnl)
+            if pnl >= -2.0:
+                self.memory.add(vec[: self.cfg.state_dim], pnl, regime, direction,
+                               mae_pct=mae_pct, mfe_pct=mfe_pct)
+            self._pending_mae_mfe[symbol] = {
+                "state_vector": vec[: self.cfg.state_dim].tolist(),
+                "regime": regime,
+                "direction": direction,
+                "pnl": pnl,
+                "close_reason": data.get("close_reason", ""),
+                "timestamp": time.time(),
+            }
             prom.faiss_index_size.set(self.memory.size)
 
             dir_idx = {"LONG": 0, "SHORT": 1}.get(direction.upper(), 2)
@@ -367,6 +392,45 @@ class MLEngine:
             await self._retrain_worker.on_trade_closed(pnl=pnl)
 
         await self._pubsub_listener("execution results", self.cfg.results_channel, handle)
+
+    async def _listen_mae_mfe(self) -> None:
+        async def handle(msg: dict) -> None:
+            data = json.loads(msg["data"])
+            symbol = data.get("symbol", "")
+            mae_pct = float(data.get("mae_pct", 0))
+            mfe_pct = float(data.get("mfe_pct", 0))
+            direction = data.get("direction", "")
+            logger.info("MAE/MFE received: %s %s MAE=%.2f%% MFE=%.2f%%",
+                        symbol, direction, mae_pct, mfe_pct)
+
+            pending = self._pending_mae_mfe.pop(symbol, None)
+            if not pending:
+                logger.warning("MAE/MFE for %s but no pending state_vector found", symbol)
+                return
+
+            vec = np.array(pending["state_vector"], dtype=np.float32)
+            regime = pending["regime"]
+            pnl = pending["pnl"]
+            close_reason = pending.get("close_reason", "")
+
+            from src.trade_judge import classify_trade
+            verdict = classify_trade(
+                entry_price=0, exit_price=0,
+                direction=direction, pnl=pnl,
+                close_reason=close_reason,
+                mae_pct=mae_pct / 100.0, mfe_pct=mfe_pct / 100.0,
+            )
+
+            if vec.size >= self.cfg.state_dim:
+                vid = self.memory.add(vec[: self.cfg.state_dim], pnl, regime, direction,
+                                      mae_pct=mae_pct / 100.0, mfe_pct=mfe_pct / 100.0,
+                                      trade_judge=verdict.judge)
+                if vid >= 0:
+                    logger.info("FAISS MAE/MFE: %s vid=%d judge=%s pnl=%.4f MAE=%.2f%% MFE=%.2f%% reason=%s",
+                                symbol, vid, verdict.judge, pnl, mae_pct, mfe_pct, verdict.reason)
+                prom.faiss_index_size.set(self.memory.size)
+
+        await self._pubsub_listener("mae_mfe", "execution:mae_mfe", handle)
 
     async def _listen_positions(self) -> None:
         async def handle(msg: dict) -> None:
@@ -501,7 +565,7 @@ class MLEngine:
             drought_min = (time.time() - self._last_signal_at) / 60.0
             logger.info(
                 "status: symbols=%d market_events=%d predictions=%d signals=%d drought=%.0fm "
-                "holds(low_conf=%d dir=%d corr=%d warming=%d) "
+                "holds(low_conf=%d dir=%d corr=%d warming=%d pattern_blocks=%d) "
                 "faiss=%d retrain_trades=%d/%d buffers=%s",
                 len(self.active_symbols),
                 self._stats["market_events"],
@@ -512,11 +576,18 @@ class MLEngine:
                 self._stats["hold_direction"],
                 self._stats["hold_correlation"],
                 self._stats["buffer_warming"],
+                self._stats["pattern_blocks"],
                 self.memory.size,
                 self._retrain_worker.trades_since_retrain,
                 self.cfg.retrain_trade_threshold,
                 buffer_sizes,
             )
+
+            # Reset circuit breaker counters each status cycle
+            with self._circuit_breaker_lock:
+                self._pattern_block_count_this_cycle = 0
+                self._tick_cycle_predictions = 0
+                self._corr_block_count_this_cycle = 0
 
             SIGNAL_DROUGHT_WARN_MIN = int(os.getenv("SIGNAL_DROUGHT_WARN_MIN", "30"))
             SIGNAL_DROUGHT_RETRAIN_MIN = int(os.getenv("SIGNAL_DROUGHT_RETRAIN_MIN", "60"))
@@ -678,18 +749,18 @@ class MLEngine:
         )
 
     def _score_symbol(self, symbol: str, buf):
-        """Run ONNX inference and return (direction, confidence, vol_mult, state_vec, regime, memory_info)."""
+        """Run ONNX inference and return (direction, confidence, vol_mult, trap_prob, state_vec, regime, memory_info)."""
         ob_seq = buf.orderbook_sequence()
         flow_seq = buf.flow_sequence()
         macro = buf.feature_vector()
 
         v_state = self.inference.infer_state_vector(ob_seq, flow_seq, macro)
         regime = self.regime.get(symbol)
-        v_memory, memory_info = self.memory.query(v_state, regime.value)
+        v_memory, memory_info = self.memory.query_with_metadata(v_state, regime.value)
 
-        direction, confidence, vol_mult = self.inference.decide(v_state, v_memory)
+        direction, confidence, vol_mult, trap_prob = self.inference.decide(v_state, v_memory)
         vol_mult = min(max(vol_mult, 0.5), self.cfg.vol_multiplier_cap)
-        return direction, confidence, vol_mult, v_state, regime, memory_info
+        return direction, confidence, vol_mult, trap_prob, v_state, regime, memory_info
 
     def _obi_against(self, direction: str, buf) -> bool:
         obi = buf.order_book_imbalance()
@@ -754,7 +825,7 @@ class MLEngine:
         if open_pos is None or open_pos.get("decay_signaled"):
             return None
 
-        direction, confidence, vol_mult, v_state, regime, _ = self._score_symbol(symbol, buf)
+        direction, confidence, vol_mult, trap_prob, v_state, regime, _ = self._score_symbol(symbol, buf)
         self._stats["predictions"] += 1
         prom.confidence_score.labels(symbol=symbol).set(confidence)
 
@@ -798,7 +869,7 @@ class MLEngine:
         if pending is None or pending.get("abort_signaled"):
             return None
 
-        direction, confidence, vol_mult, v_state, regime, _ = self._score_symbol(symbol, buf)
+        direction, confidence, vol_mult, trap_prob, v_state, regime, _ = self._score_symbol(symbol, buf)
         self._stats["predictions"] += 1
         prom.confidence_score.labels(symbol=symbol).set(confidence)
 
@@ -856,57 +927,57 @@ class MLEngine:
     def _run_tick_prediction(self, symbol: str, buf) -> dict | None:
         """CPU-bound ONNX inference — runs in a thread pool to keep the event loop responsive."""
         tick_start = time.time()
-        direction, confidence, vol_mult, v_state, regime, mem_info = self._score_symbol(symbol, buf)
+        direction, confidence, vol_mult, trap_prob, v_state, regime, mem_info = self._score_symbol(symbol, buf)
         self._stats["predictions"] += 1
+        self._tick_cycle_predictions += 1
         corr = self.features.correlation_with_btc(symbol)
         prom.btc_correlation.labels(symbol=symbol).set(corr)
 
+        # Trap Head: now in LOGGING mode — reduce position size instead of blocking
+        TRAP_THRESHOLD = float(os.getenv("TRAP_THRESHOLD", "0.60"))
+        if trap_prob > TRAP_THRESHOLD:
+            self._stats["trap_blocked"] = self._stats.get("trap_blocked", 0) + 1
+            if confidence > 0.85:
+                vol_mult *= 0.5
+                logger.info("Trap Head PARTIAL for %s: trap=%.3f conf=%.3f → vol*=0.5",
+                            symbol, trap_prob, confidence)
+            else:
+                logger.info("Trap Head LOG: %s trap=%.3f dir=%s conf=%.3f (not blocking)",
+                            symbol, trap_prob, direction, confidence)
+
         position_scale = 1.0
+        CORRELATION_BLOCK_LIMIT = int(os.getenv("CORRELATION_BLOCK_LIMIT", "8"))
+        corr_blocked = False
         if corr > self.cfg.correlation_threshold and symbol != "BTCUSDT":
-            if confidence < 0.95:
+            with self._circuit_breaker_lock:
+                corr_limit_reached = self._corr_block_count_this_cycle >= CORRELATION_BLOCK_LIMIT
+            if confidence < 0.95 and not corr_limit_reached:
                 direction = "HOLD"
                 self._stats["hold_correlation"] += 1
+                corr_blocked = True
+                with self._circuit_breaker_lock:
+                    self._corr_block_count_this_cycle += 1
             position_scale = 0.25
 
-        # Direction gate: Expected Value based — flip or block when direction is clearly unprofitable
-        if direction != "HOLD" and mem_info.get("matches", 0) >= 5:
-            short_ev = mem_info.get("short_avg_pnl", 0.0)
-            long_ev = mem_info.get("long_avg_pnl", 0.0)
-            short_matches = mem_info.get("short_matches", 0)
-            long_matches = mem_info.get("long_matches", 0)
+        # Circuit breaker: stop EV gate / pattern blocks if too many symbols already blocked this cycle
+        # Prevents death spiral where all signals get filtered
+        PATTERN_BLOCK_LIMIT = int(os.getenv("PATTERN_BLOCK_LIMIT", "10"))
+        with self._circuit_breaker_lock:
+            cycle_limit_reached = self._pattern_block_count_this_cycle >= PATTERN_BLOCK_LIMIT
 
-            if direction == "SHORT" and short_matches >= 3:
-                if short_ev < -0.01 and long_matches >= 3 and long_ev > 0:
-                    direction = "LONG"
-                    logger.info("EV gate: SHORT→LONG for %s (short_ev=$%.4f long_ev=$%.4f)",
-                                symbol, short_ev, long_ev)
-                elif short_ev < -0.05 and (long_matches < 3 or long_ev <= 0):
-                    direction = "HOLD"
-                    self._stats["hold_direction"] += 1
-                    logger.info("EV gate: SHORT→HOLD for %s (short_ev=$%.4f)",
-                                symbol, short_ev)
-            elif direction == "LONG" and long_matches >= 3:
-                if long_ev < -0.01 and short_matches >= 3 and short_ev > 0:
-                    direction = "SHORT"
-                    logger.info("EV gate: LONG→SHORT for %s (long_ev=$%.4f short_ev=$%.4f)",
-                                symbol, long_ev, short_ev)
-                elif long_ev < -0.05 and (short_matches < 3 or short_ev <= 0):
-                    direction = "HOLD"
-                    self._stats["hold_direction"] += 1
-                    logger.info("EV gate: LONG→HOLD for %s (long_ev=$%.4f)",
-                                symbol, long_ev)
+        # Direction gate: DISABLED while data insufficient
+        # When FAISS has 500+ entries, re-enable with relaxed thresholds
 
-        if direction != "HOLD":
+        # Pattern Memory: logging only — don't block while data is insufficient
+        if direction != "HOLD" and not cycle_limit_reached:
             should_avoid, avg_loss = self._online_learner.pattern_memory.should_avoid(
                 v_state, regime.value, direction,
             )
             if should_avoid:
-                logger.warning(
-                    "PATTERN MEMORY: avoiding %s %s for %s (avg_loss=%.4f from historical losses)",
+                logger.info(
+                    "PATTERN MEMORY LOG: %s %s for %s (avg_loss=%.4f, NOT blocking)",
                     direction, symbol, regime.value, avg_loss,
                 )
-                self._stats["hold_direction"] += 1
-                return None
 
         prom.confidence_score.labels(symbol=symbol).set(confidence)
         prom.volatility_multiplier.labels(symbol=symbol).set(vol_mult)
@@ -977,6 +1048,18 @@ class MLEngine:
             "timestamp": int(time.time() * 1000),
             "signal_id": str(uuid.uuid4()),
         }
+
+        dynamic_sl = mem_info.get("dynamic_sl_pct", 0.0)
+        dynamic_tp = mem_info.get("dynamic_tp_pct", 0.0)
+        salvageable = mem_info.get("salvageable_count", 0)
+        unsalvageable = mem_info.get("unsalvageable_count", 0)
+
+        if dynamic_sl > 0:
+            signal["dynamic_sl_pct"] = dynamic_sl
+            signal["dynamic_tp_pct"] = dynamic_tp
+            logger.info("Parametric Memory: %s SL=%.3f%% TP=%.3f%% (salv=%d unsalv=%d)",
+                        symbol, dynamic_sl * 100, dynamic_tp * 100, salvageable, unsalvageable)
+
         if exit_plan:
             signal["entry_price"] = exit_plan["entry_price"]
             signal["stop_loss"] = exit_plan["stop_loss"]

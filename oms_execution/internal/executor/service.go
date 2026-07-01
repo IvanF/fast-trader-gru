@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -33,10 +34,11 @@ type Service struct {
 	positions     map[string]*models.ActivePosition
 	pending   map[string]*models.PendingEntry
 	ghostCooldown map[string]int64
+	shadow        *ShadowEngine
 }
 
 func New(cfg config.Config, bc *bybit.Client, rc *redisx.Client, iw *influx.Writer, logger *slog.Logger) *Service {
-	return &Service{
+	s := &Service{
 		cfg:          cfg,
 		bybit:        bc,
 		redis:        rc,
@@ -47,6 +49,11 @@ func New(cfg config.Config, bc *bybit.Client, rc *redisx.Client, iw *influx.Writ
 		pending:      make(map[string]*models.PendingEntry),
 		ghostCooldown: make(map[string]int64),
 	}
+	if cfg.ShadowMode {
+		s.shadow = NewShadowEngine(logger, cfg.ResultsChannel)
+		logger.Info("SHADOW MODE ENABLED — no real orders will be placed")
+	}
+	return s
 }
 
 func (s *Service) planOpts() grid.PlanOptions {
@@ -77,12 +84,17 @@ func (s *Service) capSignalVol(signal models.TradeSignal) models.TradeSignal {
 
 func (s *Service) Run(ctx context.Context) error {
 	go s.runOrderbookCache(ctx)
-	go s.runFillMonitor(ctx)
+	if s.cfg.ShadowMode {
+		go s.runShadowPriceMonitor(ctx)
+	} else {
+		go s.runFillMonitor(ctx)
+	}
 	go s.runPositionMonitor(ctx)
 
-	s.reconcileOrphanEntryOrders(ctx)
-	// Adopt any open exchange positions missed before this OMS session started.
-	s.scanOrphanPositions(ctx)
+	if !s.cfg.ShadowMode {
+		s.reconcileOrphanEntryOrders(ctx)
+		s.scanOrphanPositions(ctx)
+	}
 
 	for {
 		if ctx.Err() != nil {
@@ -154,6 +166,10 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 
 	if hasPos || hasPending {
 		return s.reconcileExistingSignal(ctx, signal, recvAt)
+	}
+
+	if s.cfg.ShadowMode {
+		return s.shadowOpen(ctx, signal, recvAt)
 	}
 
 	// Guard against TOCTOU: exchange may already have a position while local map is empty.
@@ -857,13 +873,10 @@ func (s *Service) handleGhostPosition(ctx context.Context, pos *models.ActivePos
 		return
 	}
 
-	s.cleanupSymbolOrdersAfterClose(ctx, pos.Symbol, pos)
+	s.finalizeClose(ctx, pos, 0, pos.FillPrice, pos.FillPrice, "stale_tracker_removed", false)
 
 	s.mu.Lock()
-	delete(s.positions, pos.Symbol)
 	s.ghostCooldown[pos.Symbol] = time.Now().UnixMilli()+120_000
-	metrics.ActivePositions.Set(float64(len(s.positions)))
-	metrics.GridActive.WithLabelValues(pos.Symbol).Set(0)
 	s.mu.Unlock()
 	s.logger.Info("removed stale position tracker", "symbol", pos.Symbol)
 }
@@ -932,4 +945,85 @@ func minFloat(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+func (s *Service) shadowOpen(ctx context.Context, signal models.TradeSignal, recvAt time.Time) error {
+	signal = s.capSignalVol(signal)
+	marginUSD := s.cfg.TradeMarginUSD
+
+	ob, err := s.redis.GetOrderbook(ctx, signal.Symbol)
+	if err != nil {
+		s.logger.Warn("shadow: no orderbook", "symbol", signal.Symbol)
+		return nil
+	}
+
+	mid := grid.MidPrice(ob)
+	if mid <= 0 {
+		return nil
+	}
+
+	plan := grid.BuildPlan(signal, ob, 0.001, 0, s.cfg.TimeStopSeconds, s.planOpts())
+	entry := plan.EntryPrice
+	if entry <= 0 {
+		entry = mid
+	}
+
+	var qty float64
+	if s.cfg.UsesUSDSizing() {
+		qty = math.Round(marginUSD*float64(s.cfg.Leverage)/mid*1000) / 1000
+	} else {
+		qty = s.cfg.DefaultQty
+	}
+	if qty <= 0 {
+		return nil
+	}
+
+	exitOpts := s.exitGridOptsForSymbol(signal.Symbol)
+	exitGrid := grid.BuildExitGrid(
+		signal.Direction, entry, plan.EntryPrice, plan.StopLoss,
+		ob, signal, 0.001, qty, 0.001, 0.001, exitOpts,
+	)
+
+	tpPrice := entry
+	if len(exitGrid.TakeProfits) > 0 {
+		tpPrice = exitGrid.TakeProfits[0].Price
+	}
+
+	s.shadow.OpenPosition(signal, entry, exitGrid.StopLoss.Price, tpPrice, qty)
+
+	s.logger.Info("SHADOW: entry simulated",
+		"symbol", signal.Symbol, "direction", signal.Direction,
+		"entry", entry, "sl", exitGrid.StopLoss.Price, "tp", tpPrice,
+		"qty", qty, "conf", signal.Confidence,
+	)
+
+	return nil
+}
+
+func (s *Service) runShadowPriceMonitor(ctx context.Context) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if s.shadow.ActiveCount() == 0 {
+				continue
+			}
+			for _, sym := range s.shadow.Symbols() {
+				ob, err := s.redis.GetOrderbook(ctx, sym)
+				if err != nil {
+					continue
+				}
+				mid := grid.MidPrice(ob)
+				if mid > 0 {
+					s.shadow.ProcessPriceUpdate(ctx, sym, mid, func(ctx context.Context, channel string, msg interface{}) {
+						_ = s.redis.Publish(ctx, channel, msg)
+					})
+				}
+			}
+		}
+	}
 }

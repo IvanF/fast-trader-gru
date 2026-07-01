@@ -22,17 +22,19 @@ type Service struct {
 	rdb    *redis.Client
 	writer *influx.BatchWriter
 	logger *slog.Logger
+	tracker *PriceTracker
 
 	obMsgs uint64
 	trMsgs uint64
 }
 
 func New(cfg config.Config, rdb *redis.Client, writer *influx.BatchWriter, logger *slog.Logger) *Service {
-	return &Service{cfg: cfg, rdb: rdb, writer: writer, logger: logger}
+	return &Service{cfg: cfg, rdb: rdb, writer: writer, logger: logger, tracker: NewPriceTracker(rdb, "execution:mae_mfe", logger)}
 }
 
 func (s *Service) Run(ctx context.Context) error {
 	go s.statsLoop(ctx)
+	go s.listenExecutionResults(ctx)
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -105,6 +107,7 @@ func (s *Service) handleMessage(channel string, raw []byte) {
 			trade.Symbol = symbolFromChannel(channel)
 		}
 		s.writer.Enqueue(lineproto.TradeLine(trade))
+		s.tracker.UpdatePrice(trade.Symbol, trade.Price)
 	}
 }
 
@@ -121,4 +124,42 @@ func decode(raw []byte, dest any) bool {
 		return true
 	}
 	return json.Unmarshal(raw, dest) == nil
+}
+
+// ExecutionResult represents a closed trade from OMS.
+type ExecutionResult struct {
+	Symbol    string  `json:"symbol"`
+	Direction string  `json:"direction"`
+	EntryPx   float64 `json:"entry_price"`
+	ExitPx    float64 `json:"exit_price"`
+	PnL       float64 `json:"net_pnl"`
+	Reason    string  `json:"close_reason"`
+}
+
+func (s *Service) listenExecutionResults(ctx context.Context) {
+	pubsub := s.rdb.Subscribe(ctx, "execution:results")
+	ch := pubsub.Channel()
+	s.logger.Info("subscribed to execution:results for MAE/MFE tracking")
+
+	for msg := range ch {
+		if ctx.Err() != nil {
+			pubsub.Close()
+			return
+		}
+		var result ExecutionResult
+		if !decode([]byte(msg.Payload), &result) {
+			continue
+		}
+		if result.Symbol == "" || result.EntryPx <= 0 {
+			continue
+		}
+		// Start MAE/MFE tracking for 30 minutes after trade close
+		s.tracker.StartTracking(result.Symbol, result.Direction, result.EntryPx, 30*time.Minute)
+		s.logger.Info("started MAE/MFE tracking",
+			"symbol", result.Symbol,
+			"direction", result.Direction,
+			"entry", result.EntryPx,
+			"pnl", result.PnL,
+		)
+	}
 }

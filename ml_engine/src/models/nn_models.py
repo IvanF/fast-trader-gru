@@ -8,7 +8,7 @@ import torch.nn as nn
 SEQ_LEN = 60
 OB_DIM = 2
 FLOW_DIM = 3
-MACRO_DIM = 14
+MACRO_DIM = 20
 EMBED_DIM = 32
 STATE_DIM = 128
 MEMORY_DIM = 8
@@ -88,9 +88,9 @@ class FusionModel(nn.Module):
 
 
 class DecisionMLP(nn.Module):
-    """Direction + confidence + vol heads. Balanced architecture for medium-data regimes."""
+    """Direction + confidence + vol + trap heads."""
 
-    def __init__(self, in_dim: int = MLP_IN_DIM, out_dim: int = 5, dropout: float = 0.45) -> None:
+    def __init__(self, in_dim: int = MLP_IN_DIM, out_dim: int = 6, dropout: float = 0.45) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, 64),

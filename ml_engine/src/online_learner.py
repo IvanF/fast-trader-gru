@@ -29,9 +29,10 @@ EWC_LAMBDA = float(os.getenv("EWC_LAMBDA", "500.0"))
 REPLAY_BUFFER_SIZE = int(os.getenv("REPLAY_BUFFER_SIZE", "200"))
 REPLAY_BATCH = int(os.getenv("REPLAY_BATCH", "16"))
 PATTERN_MEMORY_SIZE = int(os.getenv("PATTERN_MEMORY_SIZE", "500"))
-PATTERN_SIMILARITY_THRESHOLD = float(os.getenv("PATTERN_SIMILARITY_THRESHOLD", "0.7"))
+PATTERN_SIMILARITY_THRESHOLD = float(os.getenv("PATTERN_SIMILARITY_THRESHOLD", "0.90"))
 CONSECUTIVE_LOSS_THRESHOLD = int(os.getenv("CONSECUTIVE_LOSS_THRESHOLD", "3"))
 ONLINE_UPDATE_INTERVAL = int(os.getenv("ONLINE_UPDATE_INTERVAL", "5"))
+PATTERN_TTL_HOURS = float(os.getenv("PATTERN_TTL_HOURS", "6"))
 
 
 @dataclass
@@ -63,6 +64,7 @@ class PatternMemory:
         self.max_size = max_size
         self.patterns: list[LosingPattern] = []
         self._lock = threading.Lock()
+        self._block_timestamps: dict[str, list[float]] = {}
 
     def add(self, pattern: LosingPattern) -> None:
         with self._lock:
@@ -100,15 +102,39 @@ class PatternMemory:
             return [p for _, p in scored[:k]]
 
     def should_avoid(self, v_state: np.ndarray, regime: str, direction: str) -> Tuple[bool, float]:
-        """Check if a trade pattern should be avoided based on historical losses."""
+        """Check if a trade pattern should be avoided based on historical losses.
+
+        Circuit breaker: max 2 blocks per direction per 60s window.
+        Prevents death spiral where all symbols get blocked.
+        """
+        now = time.time()
+        dir_key = f"{direction}_{regime}"
+
+        # find_similar acquires its own lock, call before our lock
         similar = self.find_similar(v_state, regime, direction)
-        if len(similar) < 2:
-            return False, 0.0
-        avg_pnl = np.mean([p.pnl for p in similar])
-        loss_count = sum(1 for p in similar if p.pnl < 0)
-        if loss_count >= 2 and avg_pnl < -0.01:
-            return True, avg_pnl
-        return False, avg_pnl
+
+        with self._lock:
+            # Per-direction cooldown: max 2 blocks per 60s
+            if dir_key in self._block_timestamps:
+                recent = [t for t in self._block_timestamps[dir_key] if now - t < 60]
+                self._block_timestamps[dir_key] = recent
+                if len(recent) >= 2:
+                    return False, 0.0
+            else:
+                self._block_timestamps[dir_key] = []
+
+            # Filter out expired patterns (TTL)
+            if PATTERN_TTL_HOURS > 0:
+                cutoff = now - PATTERN_TTL_HOURS * 3600
+                similar = [p for p in similar if p.timestamp > cutoff]
+            if len(similar) < 5:
+                return False, 0.0
+            avg_pnl = np.mean([p.pnl for p in similar])
+            loss_count = sum(1 for p in similar if p.pnl < 0)
+            if loss_count >= 5 and avg_pnl < -0.10:
+                self._block_timestamps[dir_key].append(now)
+                return True, avg_pnl
+            return False, avg_pnl
 
     def persist(self, path: str) -> None:
         with self._lock:

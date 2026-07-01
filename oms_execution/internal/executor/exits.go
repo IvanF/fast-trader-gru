@@ -285,22 +285,48 @@ func (s *Service) atomicReplaceStopLoss(ctx context.Context, pos *models.ActiveP
 	var err error
 	isMaker := kind == "confidence_decay_exit" || kind == "signal_exit"
 	if isMaker {
-		newID, err = s.bybit.PlaceReducePostOnlyLimit(ctx, pos.Symbol, side, qty, pos.QtyStep, bybit.FormatPrice(price))
+		// Retry PostOnly with progressively worse prices if cancelled by exchange
+		// (happens when price == spread and order would fill immediately)
+		for attempt := 0; attempt < 3; attempt++ {
+			newID, err = s.bybit.PlaceReducePostOnlyLimit(ctx, pos.Symbol, side, qty, pos.QtyStep, bybit.FormatPrice(price))
+			if err != nil {
+				return fmt.Errorf("atomic sl place: %w", err)
+			}
+			info, vErr := s.bybit.GetOrderRealtime(ctx, pos.Symbol, newID)
+			if vErr == nil && info.OrderID != "" && info.OrderStatus != "Rejected" && info.OrderStatus != "Cancelled" {
+				break
+			}
+			// Order was cancelled — move price further from mid and retry
+			s.logger.Warn("postonly cancelled, retrying with worse price",
+				"symbol", pos.Symbol, "attempt", attempt+1, "old_price", price)
+			_ = s.bybit.CancelOrder(ctx, pos.Symbol, newID)
+			// Move 2 ticks further from mid
+			offset := pos.TickSize * 2
+			if pos.Direction == "LONG" {
+				price -= offset
+			} else {
+				price += offset
+			}
+			price = grid.RoundToTick(price, pos.TickSize)
+		}
 	} else {
 		triggerDir := 2
 		if pos.Direction == "SHORT" {
 			triggerDir = 1
 		}
 		newID, err = s.bybit.PlaceStopMarket(ctx, pos.Symbol, side, qty, pos.QtyStep, bybit.FormatPrice(price), triggerDir)
-	}
-	if err != nil {
-		return fmt.Errorf("atomic sl place: %w", err)
+		if err != nil {
+			return fmt.Errorf("atomic sl place: %w", err)
+		}
 	}
 
-	info, err := s.bybit.GetOrderRealtime(ctx, pos.Symbol, newID)
-	if err != nil || info.OrderID == "" || info.OrderStatus == "Rejected" || info.OrderStatus == "Cancelled" {
-		_ = s.bybit.CancelOrder(ctx, pos.Symbol, newID)
-		return fmt.Errorf("atomic sl verify failed: %v status=%s", err, info.OrderStatus)
+	// Final verify (for non-maker path, or last attempt for maker)
+	if !isMaker {
+		info, err := s.bybit.GetOrderRealtime(ctx, pos.Symbol, newID)
+		if err != nil || info.OrderID == "" || info.OrderStatus == "Rejected" || info.OrderStatus == "Cancelled" {
+			_ = s.bybit.CancelOrder(ctx, pos.Symbol, newID)
+			return fmt.Errorf("atomic sl verify failed: %v status=%s", err, info.OrderStatus)
+		}
 	}
 
 	if old != nil && !old.Filled && old.OrderID != "" && old.OrderID != newID {

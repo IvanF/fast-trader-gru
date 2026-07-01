@@ -132,6 +132,50 @@ class SymbolBuffer:
             return 0.0
         return (prices[-1] - base) / base
 
+    def _obi_reversal(self) -> float:
+        ob_points = [p for p in self.points if p.side == "OB"]
+        if len(ob_points) < 5:
+            return 0.0
+        recent = ob_points[-60:]
+        obi_vals = []
+        for p in recent:
+            total = p.bid_vol + p.ask_vol
+            if total > 0:
+                obi_vals.append((p.bid_vol - p.ask_vol) / total)
+        if len(obi_vals) < 2:
+            return 0.0
+        return float(max(obi_vals) - min(obi_vals))
+
+    def _pre_entry_sweep(self) -> float:
+        trade_points = [p for p in self.points if p.side == "BUY" or p.side == "SELL"]
+        if len(trade_points) < 2:
+            return 0.0
+        recent = trade_points[-10:]
+        if not recent:
+            return 0.0
+        sizes = [abs(p.size) for p in recent]
+        if not sizes:
+            return 0.0
+        avg_size = np.mean(sizes)
+        max_size = max(sizes)
+        if max_size > avg_size * 3.0 and avg_size > 0:
+            return 1.0
+        return 0.0
+
+    def _fill_delay_norm(self) -> float:
+        trade_points = [p for p in self.points if p.side in ("BUY", "SELL")]
+        if len(trade_points) < 2:
+            return 0.5
+        delays = []
+        for i in range(1, len(trade_points)):
+            dt = trade_points[i].ts - trade_points[i-1].ts
+            if dt > 0:
+                delays.append(dt)
+        if not delays:
+            return 0.5
+        avg_delay = np.mean(delays)
+        return float(np.clip(avg_delay / 60.0, 0.0, 1.0))
+
     def liquidity_features(self) -> np.ndarray:
         bid_vol = sum(_level_size(b) for b in self.latest_bids[:10]) if self.latest_bids else 0.0
         ask_vol = sum(_level_size(a) for a in self.latest_asks[:10]) if self.latest_asks else 0.0
@@ -173,11 +217,21 @@ class SymbolBuffer:
         cvd_norm = np.tanh(self.cvd / 1e6)
         ofs = self.order_flow_speed()
         vwap_dev = self.vwap_deviation()
+        trend_5m = self.macro_trend(300)
         trend_15m = self.macro_trend(900)
         trend_1h = self.macro_trend(3600)
+        trend_4h = self.macro_trend(14400)
+        trend_1d = self.macro_trend(86400)
+
+        obi_reversal = self._obi_reversal()
+        pre_entry_sweep = self._pre_entry_sweep()
+        fill_delay_norm = self._fill_delay_norm()
+
         base = np.array([
             obi, cvd_norm, ofs, vwap_dev,
-            trend_15m, trend_1h, self.funding_rate,
+            trend_5m, trend_15m, trend_1h, trend_4h, trend_1d,
+            self.funding_rate,
+            obi_reversal, pre_entry_sweep, fill_delay_norm,
         ], dtype=np.float32)
         return np.concatenate([base, self.liquidity_features()])
 

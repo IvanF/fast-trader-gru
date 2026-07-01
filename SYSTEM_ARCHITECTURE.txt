@@ -1,16 +1,18 @@
 # Fast Trader GRU — Полная архитектура системы
-# Дата: 2026-06-25
+# Дата: 2026-06-28 (обновлено)
 
-## 1. СХЕМА ПОТОКА ДАННЫХ
+---
+
+## 1. ОБЩАЯ СХЕМА ПОТОКА ДАННЫХ
 
 ```
 ┌──────────────┐    Redis     ┌──────────────────┐
 │   SCREENER   │──────────────│   DATA INGESTION  │
-│  (Go, 1h)    │ active_syms  │  (Go, WebSocket)  │
+│  (Go)        │ active_syms  │  (Go, WebSocket)  │
 │              │              │                    │
 │ Bybit REST   │              │ Bybit WS × N sym   │
 │ → фильтры    │              │ → orderbook 50 lvl │
-│ → active_syms│              │ → public trades     │
+│ → 76 монет   │              │ → public trades     │
 └──────────────┘              └────────┬───────────┘
                                        │
                           ┌────────────┴────────────┐
@@ -23,449 +25,225 @@
               ▼                       ▼                       ▼
 ┌─────────────────────┐  ┌────────────────────┐  ┌────────────────────┐
 │   HISTORY LOGGER    │  │    ML ENGINE       │  │   OMS EXECUTION    │
-│   (Go, cpuset=7)   │  │  (Python, GPU)     │  │   (Go, cpuset=2)  │
+│   (Go)              │  │  (Python, GPU)     │  │   (Go)             │
 │                     │  │                    │  │                    │
-│ Redis → InfluxDB    │  │ 12 async loops:    │  │ Signal → Entry →   │
+│ Redis → InfluxDB    │  │ 13 async loops:    │  │ Signal → Entry →   │
 │ market_raw bucket   │  │  • features 300s   │  │ Fill → Exit Grid   │
-│ (Line Protocol)     │  │  • regime detect   │  │ → TP/SL → Monitor  │
-└──────────┬──────────┘  │  • ONNX inference  │  │ → Close → Results  │
-           │             │  • FAISS memory    │  │                    │
-           ▼             │  • signal gating   │  │ Bybit REST:        │
-┌─────────────────────┐  │  • exit plan       │  │ PlaceLimitOrder    │
-│     InfluxDB        │  │  • retrain worker  │  │ PlaceStopMarket    │
-│                     │  └────────┬───────────┘  │ PlaceReduceTP      │
-│ market_raw:         │           │              └────────┬───────────┘
-│  • orderbook_depth  │           │                       │
-│  • trades           │     ┌─────┴─────┐          ┌─────┴─────┐
-│  • trade_outcomes   │     │ Redis     │          │ Redis     │
-│                     │     │           │          │           │
-│ market_features:    │     │ orders:   │◄─────────│ execution:│
-│  • microstructure   │     │ signals   │          │ results   │
-│  • patterns         │     │           │          │ positions │
-│  • movement_prob    │     │ models:   │          │ pending   │
-│                     │     │ reload    │          │           │
-│ downsample_1m:      │     │           │          │           │
-│  market_raw →       │     └─────┬─────┘          └─────┬─────┘
-│  market_features    │           │                      │
-└─────────────────────┘           │                      │
-                    ┌─────────────┘                      │
-                    ▼                                    │
-            ┌──────────────┐                             │
-            │  FAISS Index │                             │
-            │  186 entries │◄────────────────────────────┘
-            │  state_vector│  (execution:results → memory.add)
-            │  + pnl/dir   │
-            └──────────────┘
+│                     │  │  • regime detect   │  │ → TP/SL → Monitor  │
+│                     │  │  • ONNX inference  │  │ → Close → Results  │
+│                     │  │  • FAISS memory    │  │                    │
+│                     │  │  • Trap Head       │  │ Bybit REST:        │
+│                     │  │  • signal gating   │  │ PlaceLimitOrder    │
+│                     │  │  • retrain worker  │  │ PlaceStopMarket    │
+└──────────┬──────────┘  └────────┬───────────┘  │ PlaceReducePostOnly│
+           │                      │              └────────┬───────────┘
+           ▼                      │                       │
+┌─────────────────────┐     ┌─────┴─────┐          ┌─────┴─────┐
+│     InfluxDB        │     │ Redis     │          │ Redis     │
+│  market_raw         │     │ orders:   │◄─────────│ execution:│
+│  trade_outcomes     │     │ signals   │          │ results   │
+│  market_features    │     │ models:   │          │           │
+└─────────────────────┘     │ reload    │          └───────────┘
+                            └───────────┘
 ```
 
 ---
 
-## 2. ML PIPELINE ДЕТАЛЬНО
+## 2. ML ENGINE — ПОЛНЫЙ АЛГОРИТМ
+
+### 2.1 Архитектура нейросети (nn_models.py)
 
 ```
-Bybit WS orderbook (60 ticks)
-    │
-    ▼
-┌─────────────────────────────────────────────────┐
-│              INFERENCE PIPELINE                  │
-│                                                  │
-│  ob_seq(60×2) ──→ OrderbookCNN ──→ cnn_out(32)  │
-│  flow_seq(60×3) → FlowGRU+Attn → gru_out(32)   │
-│  macro(14)     ──→ Linear(14,64) → macro(64)    │
-│                                                  │
-│  fused = [cnn, gru, macro] → state(128)          │
-│                                                  │
-│  state(128) + memory(8) → DecisionMLP(136→64→   │
-│  32→5) → logits[5]                               │
-│                                                  │
-│  direction = argmax(logits[:3])                  │
-│  confidence = sigmoid(logits[3])                 │
-│  vol_mult = clip(logits[4], 0.5, 3.0)           │
-└──────────────────────┬──────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────┐
-│              GATING PIPELINE                     │
-│                                                  │
-│  1. BTC Correlation (corr > 0.85 → HOLD)        │
-│  2. EV Gate: long_avg_pnl vs short_avg_pnl      │
-│  3. Bullish Trend (5m > 0.05% → LONG threshold  │
-│     lowered to 0.20)                             │
-│  4. Anomaly Filter (conf > 0.98 → reject)       │
-│  5. HOLD filter                                  │
-│  6. Confidence threshold (0.33 / 0.20)          │
-└──────────────────────┬──────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────┐
-│              EXIT PLAN (ML Engine)               │
-│                                                  │
-│  entry = aggressive_maker(bid+ticks / ask-ticks) │
-│  SL = liquidity_sl(entry, orderbook)             │
-│  TP = fee_aware_tp(entry, C_entry, C_exit, T)   │
-│  TP_price = entry × (1+C_entry+T) / (1-C_exit)  │
-│                                                  │
-│  Published to Redis: orders:signals              │
-└──────────────────────┬──────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────┐
-│              OMS EXECUTION                       │
-│                                                  │
-│  1. PlaceLimitOrder(PostOnly, Maker entry)       │
-│  2. FillMonitor polls every 500ms                │
-│  3. On fill → ActivePosition created             │
-│  4. deployExitGrid:                              │
-│     • TP: PostOnly limit (Maker fee 0.02%)       │
-│     • SL: StopMarket (Taker 0.055%)             │
-│  5. PositionMonitor every 500ms:                 │
-│     • Breakeven SL activation                    │
-│     • Trailing SL (0.8R at 1.5R profit)         │
-│     • Time-stop force-close                      │
-│     • TP fill monitoring                         │
-│     • Safety net: 0 TPs → redeploy or flatten    │
-│  6. On close → finalizeClose → execution:results  │
-└──────────────────────┬──────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────┐
-│           FEEDBACK LOOP                          │
-│                                                  │
-│  execution:results → ML Engine                   │
-│    ├── FAISS.add(state_vector, pnl, regime, dir) │
-│    │   (pnl >= -0.10 filter)                    │
-│    ├── InfluxDB trade_outcomes (all trades)      │
-│    └── retrain_worker.on_trade_closed()          │
-│         └── triggers train.py every 50 trades    │
-└─────────────────────────────────────────────────┘
-```
+Входы:
+  ob_seq (60×2)  → OrderbookCNN → cnn_out (32)
+  flow_seq (60×3) → FlowGRUAttention → gru_out (32)
+  macro (17)     → Linear(17→64) → macro_out (64)
 
----
+FusionModel:
+  state = [cnn_out(32), gru_out(32), macro_out(64)] = (128,)
 
-## 3. RETRAIN PIPELINE
-
-```
-Trigger: 50 trades OR 2 hours
-    │
-    ▼
-┌──────────────────────────────────────┐
-│  train.py (nice -n 15, low priority) │
-│                                      │
-│  1. build_joined_dataset()           │
-│     InfluxDB trade_outcomes          │
-│     + market_features                │
-│     → ob_seq, flow_seq, macro,       │
-│       memory, direction, conf, pnl   │
-│                                      │
-│  2. Oversample minority direction    │
-│     (balance LONG/SHORT)            │
-│                                      │
-│  3. AsymmetricTradingLoss:          │
-│     • class_weights (balance)       │
-│     • loss_penalty = 2.5x (pnl < 0)│
-│     • label_smoothing = 0.1         │
-│                                      │
-│  4. Train: 20 epochs, AdamW         │
-│     lr=5e-4, weight_decay=5e-4     │
-│                                      │
-│  5. Promote: val_acc > prev + 0.02  │
-│     AND val_acc >= 0.45             │
-│                                      │
-│  6. Export ONNX → atomic symlink    │
-│     → publish models:reload         │
-└──────────────────────────────────────┘
-    │
-    ▼
-ML Engine hot-swap (zero downtime)
-```
-
----
-
-## 4. REDIS КАНАЛЫ
-
-| Channel | Publisher | Consumer | Payload |
-|---------|-----------|----------|---------|
-| `config:active_symbols` | Screener | Ingestion, ML | ActiveSymbolsPayload |
-| `market:orderbook:*` | Ingestion | ML, OMS, Logger | OrderbookPayload (msgpack) |
-| `market:trades:*` | Ingestion | ML, Logger | TradePayload (msgpack) |
-| `orders:signals` | ML Engine | OMS | TradeSignal (JSON) |
-| `execution:results` | OMS | ML Engine | ExecutionResult (JSON) |
-| `execution:positions` | OMS | ML Engine | PositionEvent (JSON) |
-| `execution:pending_orders` | OMS | ML Engine | PendingOrderEvent (JSON) |
-| `models:reload` | train.py | ML Engine | ModelManifest (JSON) |
-
----
-
-## 5. ML MODEL ARCHITECTURE
-
-### Параметры
-```
-SEQ_LEN = 60        (длина последовательности)
-OB_DIM = 2          (orderbook: [obi, bid_vol-ask_vol])
-FLOW_DIM = 3        (trade flow: [signed_size, price, size])
-MACRO_DIM = 14      (макро-фичи)
-EMBED_DIM = 32      (CNN/GRU embedding)
-STATE_DIM = 128     (master state vector)
-MEMORY_DIM = 8      (FAISS memory vector)
-MLP_IN_DIM = 136    (STATE_DIM + MEMORY_DIM)
-```
-
-### Архитектура
-
-```
-OrderbookCNN (ONNX):
-  Input: (batch, 60, 2)
-  Conv1d(2→16, k=3) → ReLU → Conv1d(16→32, k=3) → ReLU
-  AdaptiveAvgPool1d(1) → Linear(32→32) → output(32)
-
-FlowGRUAttention (ONNX):
-  Input: (batch, 60, 3)
-  GRU(3→32) → SelfAttention(32) → MeanPool → Linear(32→32) → output(32)
-
-FusionModel (training only):
-  [cnn(32), gru(32), Linear(14→64)(macro)] → state(128)
-
-DecisionMLP (ONNX):
-  Input: [state(128), memory(8)] → (136)
+DecisionMLP:
+  [state(128), v_memory(8)] = (136,)
   Linear(136→64) → ReLU → Dropout(0.45)
   Linear(64→32) → ReLU → Dropout(0.45)
-  Linear(32→5) → logits
+  Linear(32→6) → logits
 
-  logits[:3] → argmax → direction (LONG/SHORT/HOLD)
-  logits[3] → sigmoid → confidence
-  logits[4] → clip(0.5, 3.0) → vol_mult
+Выходы (6 логитов):
+  logits[0] = LONG
+  logits[1] = SHORT
+  logits[2] = HOLD
+  logits[3] = confidence (sigmoid)
+  logits[4] = volatility_multiplier (clip 0.5-3.0)
+  logits[5] = trap_prob (sigmoid) — ГОЛОВА ЛОВУШЕК
 ```
 
-### ONNX Runtime Configuration
-- CNN + MLP: CUDA (GPU)
-- GRU: CPU only (нет CUDA kernel для PyTorch GRU)
-- Graph optimization: ORT_ENABLE_ALL
-- Threads: intra=4, inter=2 (cpuset 3-6)
-- Hot-swap: atomic symlink + manifest mtime watch + Redis notify
+### 2.2 Pipeline инференса (_run_tick_prediction)
+
+```
+1. _score_symbol(symbol, buf)
+   ├── buf.orderbook_sequence() → (60,2)
+   ├── buf.flow_sequence() → (60,3)
+   ├── buf.feature_vector() → (17,) — 17 макро-фичей
+   ├── inference.infer_state_vector() → v_state (128)
+   ├── memory.query(v_state, regime) → v_memory (8) + memory_info
+   └── inference.decide(v_state, v_memory) → (direction, conf, vol_mult, trap_prob)
+
+2. Фильтры (порядок важен!):
+   a. Trap Head: trap_prob > 0.60 → BLOCK
+   b. BTC Correlation: corr > 0.70 → HOLD
+   c. EV Gate: long_ev/short_ev → flip/block если убыточно
+   d. Pattern Memory: should_avoid() → BLOCK
+   e. Anomaly: conf > 0.98 → BLOCK
+   f. HOLD filter → BLOCK
+   g. Direction thresholds: SHORT ≥ 0.33, LONG ≥ 0.45
+      (LONG понижается до 0.20 при bullish trend + positive long EV)
+
+3. build_exit_plan() → entry, SL, TP
+4. Publish → Redis orders:signals
+```
+
+### 2.3 DecoupledTrapLoss (train.py)
+
+```python
+# Кросс-энтропия для направления — БЕЗ штрафа за убытки
+dir_loss = F.cross_entropy(logits[:,:3], targets['direction'], label_smoothing=0.1)
+
+# MSE для уверенности
+conf_loss = F.mse_loss(torch.sigmoid(logits[:, 3]), targets['confidence'])
+
+# BCE для ловушки — ГЛАВНОЕ ОБУЧЕНИЕ НА УБЫТКАХ
+# is_trap = 1.0 если pnl < 0, иначе 0.0
+trap_loss = F.binary_cross_entropy_with_logits(logits[:, 5], targets['is_trap_label'])
+
+total_loss = dir_loss + 0.5 * conf_loss + 1.5 * trap_loss
+```
+
+### 2.4 Новые фичи (MACRO_DIM = 17)
+
+| Индекс | Фича | Описание |
+|--------|------|----------|
+| 0 | obi | Order book imbalance |
+| 1 | cvd_norm | tanh(cumulative_volume_delta / 1e6) |
+| 2 | ofs | Order flow speed (trades/sec) |
+| 3 | vwap_dev | Price deviation from VWAP |
+| 4 | trend_15m | Price change over 15 min |
+| 5 | trend_1h | Price change over 1 hour |
+| 6 | funding_rate | Current funding rate |
+| 7 | depth_imbalance | (bid_vol - ask_vol) / total |
+| 8 | tanh(total_depth/1e6) | |
+| 9 | avg_depth_imbalance | 10-tick average OBI |
+| 10 | level_density | (bid_levels + ask_levels) / 20 |
+| 11 | tanh(bid_vol_std/1e4) | |
+| 12 | tanh(ask_vol_std/1e4) | |
+| 13 | fill_to_depth | avg_fill / avg_level_size |
+| 14 | obi_reversal | max(obi) - min(obi) за 60 тиков |
+| 15 | pre_entry_sweep | 1 если max_trade > 3× avg (sweep detected) |
+| 16 | fill_delay_norm | нормализованная задержка fill (0-1) |
 
 ---
 
-## 6. FAISS VECTOR MEMORY
+## 3. OMS — ПОЛНЫЙ АЛГОРИТМ
 
-- **Index:** faiss.IndexFlatIP(128) — cosine similarity after L2 normalization
-- **Storage:** /app/data/faiss_index.faiss + .meta.json
-- **Add:** execution:results с pnl >= -0.10
-- **Query:** Top-10 kNN с time decay (14 дней) + regime weight (1.0 same, 0.3 other)
-- **Memory vector (8 dims):** [win_rate, avg_pnl, tanh(avg_pnl/100), total_weight, k, is_trending, is_breakout, is_choppy]
-- **EV Gate inputs:** long_avg_pnl, short_avg_pnl, long_matches, short_matches
-
----
-
-## 7. SL/TP ЛОГИКА
-
-### TP (Take Profit) — Single Order
-```
-Формула:
-  LONG:  P_exit = P_entry × (1 + C_entry + T) / (1 - C_exit)
-  SHORT: P_exit = P_entry × (1 - C_entry - T) / (1 + C_exit)
-
-Параметры:
-  C_entry = 0.00055 (0.055% taker)
-  C_exit = 0.0002 (0.02% maker PostOnly)
-  T = 0.002 (0.2% target profit)
-
-Округление:
-  LONG → ceil (в пользу трейдера)
-  SHORT → floor (в пользу трейдера)
-```
-
-### SL (Stop Loss) — Dynamic Liquidity Zone
-```
-Алгоритм:
-  1. Сканирует стакан в направлении убытка
-  2. Группирует уровни в зоны (level ±1% от entry)
-  3. Находит ближайшую зону → SL за ней (2 ticks buffer)
-  4. Если зоны нет → fallback на min SL (0.3%)
-
-LONG:  entry → bids ниже → support zone → SL ниже зоны
-SHORT: entry → asks выше → resistance zone → SL выше зоны
-
-Фильтры:
-  - min SL distance: 0.3% (MIN_SL_PCT)
-  - max SL distance: 0.5% (MAX_SL_PCT)
-```
-
-### Entry
-```
-PostOnly Limit (Maker):
-  LONG → bid + entry_maker_ticks
-  SHORT → ask - entry_maker_ticks
-  Всегда Maker → комиссия 0.02%
-```
-
----
-
-## 8. СИГНАЛЬНЫЙ PIPELINE ДЕТАЛЬНО
-
-### Сигнал → Сделка
+### 3.1 Обработка сигнала (handleSignal)
 
 ```
-1. ML Engine: _run_tick_prediction()
-   - score_symbol() → direction, confidence, vol_mult
-   - correlation filter → HOLD если corr > 0.85
-   - EV gate → flip/block если направление убыточно
-   - bullish trend → понижает порог для LONG
-   - confidence filter (0.33 / 0.20)
-   - build_exit_plan() → entry, SL, TP
-   - Publish orders:signals
-
-2. OMS: handleSignal()
-   - Проверка бюджета маржи (used + $10 <= $150)
-   - BuildPlan + AggressiveMakerEntry
-   - PlaceLimitOrder(PostOnly)
-   - FillMonitor (500ms polling)
-   - On fill → deployExitGrid()
-     • TP: fee_aware_tp (PostOnly, Maker)
-     • SL: StopMarket (Taker)
-   - PositionMonitor (500ms)
-     • Breakeven SL
-     • Trailing SL
-     • Time-stop (1800s)
-     • Safety net
-   - On close → finalizeClose → execution:results
-
-3. ML Engine: _listen_execution_results()
-   - FAISS.add(vector, pnl, regime, dir) [pnl >= -0.10]
-   - InfluxDB trade_outcomes
-   - retrain_worker.on_trade_closed()
+1. signal.setup_action == "abort_setup"? → cancelPendingEntry()
+2. signal.exit_reason != "" && нет позиции? → skip
+3. Есть позиция или pending? → reconcileExistingSignal()
+4. На бирже есть позиция но нет трекера? → adoptExchangePosition()
+5. Нет позиции и нет pending? → placeNewEntry()
 ```
 
-### Confidence Decay Exit
+### 3.2 Вход в позицию (placeNewEntry)
+
 ```
-Если confidence < 0.35 И microstructure adverse (OBI + trend) N тиков:
-  → Publish exit signal → OMS закрывает позицию
+1. Проверка маржи: usedMargin + tradeMargin <= deposit
+2. Получение стакана из Redis кеша
+3. Получение инструмента (tickSize, lot filters)
+4. Вычисление mid, qty = notional / mid
+5. BuildPlan() → entry, SL, TP
+6. AggressiveMakerEntry() → PostOnly limit (Maker)
+7. PlaceLimitOrder(PostOnly)
+8. Отслеживание как PendingEntry
 ```
 
-### Entry Abort
+### 3.3 Деплой Exit Grid (deployExitGrid)
+
 ```
-Если direction flip с conf > 0.50, 5 тиков подряд:
-  → Publish abort → OMS отменяет pending entry
+1. cancelExitOrders + CancelAllOrders
+2. syncPositionFromExchange()
+3. BuildExitGrid():
+   ├── ComputeLiquiditySL() → SL за зоной ликвидности
+   ├── CalculateExitPrice() → TP = entry × (1+C_entry+T)/(1-C_exit)
+   └── Full qty → 1 TP order
+4. PlaceReducePostOnlyLimit(TP) — PostOnly Maker 0.02%
+5. PlaceStopMarket(SL) — StopMarket Taker
+```
+
+### 3.4 Мониторинг позиции (evaluatePosition — каждые 500ms)
+
+```
+1. syncPositionFromExchange() → ghost detection
+2. checkPositionSizeViolation() → emergency flatten if >1.5×
+3. monitorExitOrders():
+   ├── Refresh TP/SL orders
+   ├── syncPositionFromExchange()
+   ├── SL filled? → finalize
+   ├── TP filled? → breakeven SL move
+   ├── trailing SL when profit > 1.0R
+4. timeStopLimitExit() → force close after TimeStopSec
+5. retryMissingTakeProfits()
+6. Safety net:
+   ├── 0 active TPs + notional > $10 → deployExitGrid
+   ├── 0 active TPs + notional < $10 → market close
+   └── all TPs filled + PartialTaken → close remainder
+7. checkPositionSizeViolation() → emergency flatten if >1.5×
 ```
 
 ---
 
-## 9. RETRAIN PIPELINE ДЕТАЛЬНО
+## 4. FAISS MEMORY (memory.py)
 
-### Триггеры
-- Каждые 50 trades (RETRAIN_TRADE_THRESHOLD)
-- Каждые 2 часа (RETRAIN_INTERVAL_HOURS)
-
-### Loss Function: AsymmetricTradingLoss
+### Добавление (add)
 ```
-class_weights = num_classes / (class_counts + eps)  # баланс классов
-ce = cross_entropy(logits, direction, weights, label_smoothing=0.1)
-penalty = where(pnl < 0, 2.5, 1.0)                 # штраф за убыточные
-penalty += wrong * (2.5 - 1) * clamp(-pnl)          # доп. штраф за неверные
-loss = (ce * weights * penalty).mean()
+1. Блок outliers: pnl > $0.15 или < -$0.50 → return -1
+2. Блок дубликатов: (direction, regime, rounded_pnl) уже есть → return -1
+3. Add vector to FAISS index + metadata
 ```
 
-### Валидация и промоция
-- val_acc > prev_acc + 0.02
-- val_acc >= 0.45
-- Если не проходит — модель НЕ заменяется
+### Запрос (query)
+```
+1. Top-10 kNN search (cosine similarity)
+2. Weighted stats: time_decay × regime_decay × similarity
+3. Output: v_memory (8-dim) + info_dict
+4. info_dict содержит: long_avg_pnl, short_avg_pnl, long_matches, short_matches
+```
 
-### Hot-swap
-1. Export ONNX → active/{version}/
-2. Atomic symlink: current → active/{version}
-3. Write manifest.json (mtime)
-4. Publish models:reload → Redis
-5. ML Engine reloads ONNX sessions (zero downtime)
-
----
-
-## 10. ИНФРАСТРУКТУРА
-
-### Docker Services (10)
-| Service | CPU | GPU | Port | Role |
-|---------|-----|-----|------|------|
-| redis | cpuset=0 | — | 16379 | Pub/Sub bus |
-| screener | — | — | 9100 | Market scanner |
-| data_ingestion | cpuset=1 | — | 9101 | WebSocket manager |
-| history_logger | cpuset=7 | — | 9104 | Redis → InfluxDB |
-| ml_engine | cpuset=3-6 | NVIDIA | 9103 | ML inference + training |
-| oms_execution | cpuset=2 | — | 9102 | Order management |
-| influxdb | — | — | 18086 | Time-series DB |
-| prometheus | — | — | 19090 | Metrics |
-| grafana | — | — | 13000 | Dashboards |
-
-### InfluxDB Buckets
-- market_raw (14 дней) — trades, orderbook_depth, trade_outcomes
-- market_features (365 дней) — microstructure, patterns, movement_probability
-- downsample_1m: market_raw → market_features (1 min aggregate)
+### DecoupledTrapLoss для retrain
+- dir_loss: CE без штрафа за убытки
+- conf_loss: MSE для уверенности  
+- trap_loss: BCE для ловушки (1.5x вес)
 
 ---
 
-## 11. НАСТРОЙКИ (.env)
+## 5. ТЕКУЩАЯ КОНФИГУРАЦИЯ
 
-| Параметр | Значение | Назначение |
-|----------|----------|------------|
-| CONFIDENCE_THRESHOLD | 0.33 | Минимальная уверенность |
-| BULLISH_LONG_CONF_THRESHOLD | 0.20 | Пониженный порог для LONG (bullish) |
-| BULLISH_TREND_THRESHOLD | 0.0005 | Порог бычьего тренда |
-| MIN_SL_PCT | 0.003 | Минимальный SL (0.3%) |
-| MAX_SL_PCT | 0.005 | Максимальный SL (0.5%) |
-| MIN_TP_PCT | 0.001 | Минимальный TP (0.1%) |
-| MAX_TP_PCT | 0.020 | Максимальный TP (2.0%) |
-| ENTRY_FEE_RATE | 0.00055 | Taker комиссия входа |
-| EXIT_FEE_RATE | 0.0002 | Maker комиссия выхода |
-| TARGET_NET_PROFIT_PCT | 0.002 | Целевая чистая прибыль (0.2%) |
-| TRADE_MARGIN_USD | 10 | Маржа на сделку |
-| LEVERAGE | 5 | Плечо |
-| ACCOUNT_DEPOSIT_USD | 150 | Бюджет |
-| RETRAIN_TRADE_THRESHOLD | 50 | Trades до retrain |
-| RETRAIN_INTERVAL_HOURS | 2 | Интервал retrain |
-| LOSS_PENALTY_WEIGHT | 2.5 | Штраф за убыточные |
-| TIME_STOP_SECONDS | 1800 | Время жизни позиции (30 мин) |
-| CORRELATION_THRESHOLD | 0.70 | Порог BTC корреляции |
-| DECAY_OBI_THRESHOLD | 0.30 | Порог OBI для decay exit |
-| ADVERSE_CONFIRM_TICKS | 5 | Тики подряд для adverse exit |
-| DIRECTION_FLIP_CONFIRM_TICKS | 10 | Тики для direction flip exit |
-
----
-
-## 12. ТЕКУЩЕЕ СОСТОЯНИЕ
-
-| Компонент | Значение |
-|-----------|----------|
-| FAISS | 186 записей (61 LONG, 109 SHORT, 16 other) |
-| Модель | 20260624_212125 (val_acc=0.80) |
-| Retrain | 0/50 trades до следующего |
-| Bullish detector | Активен (threshold=0.0005) |
-| TP | Single fee_aware_tp (PostOnly Maker 0.02%) |
-| SL | Liquidity zone (StopMarket 0.055%) |
-| Entry | PostOnly Limit (Maker 0.02%) |
-| R:R | ~1:1 (avg_win=0.39%, avg_loss=0.38%) |
-
----
-
-## 13. ИСПРАВЛЕНИЯ ЭТОЙ СЕССИИ
-
-### TP Grid Stability
-- Safety net: activeTPs==0 → deployExitGrid или market close
-- Removed TimeStopPlaced guard из maybeRefreshExitGrid
-- timeStopLimitExit: ExitGridReady=false + без return
-
-### Single TP (refactoring)
-- Replace grid of multiple TPs → 1 fee_aware_tp
-- CalculateExitPrice: P = entry × (1+C_entry+T)/(1-C_exit)
-- PostOnly for TP, StopMarket for SL
-
-### FAISS Balance
-- Removed inverted entries
-- Clean outliers (pnl > $0.15 or < -$0.05)
-- Balance: 17 LONG : 34 SHORT → 61:109 (grown naturally)
-
-### MLP Architecture
-- Compact 136→32→5 rejected (conf < 0.33 for 99.9%)
-- Restored 136→64→32→5 with dropout=0.45
-- val_acc improved: 0.524 → 0.80
-
-### Bullish Trend Detector
-- macro_trend_5m > 0.0005 AND macro_trend_15m > 0
-- Lowers LONG confidence threshold from 0.33 to 0.20
-- Enables LONG data collection in trending markets
+| Параметр | Значение |
+|----------|----------|
+| Deposit | $2000 |
+| Margin/сделку | $10 |
+| Leverage | 5 |
+| Symbols | 76 |
+| Confidence SHORT | 0.33 |
+| Confidence LONG | 0.45 |
+| Trap Threshold | 0.60 |
+| MIN_SL_PCT | 0.003 |
+| MAX_SL_PCT | 0.008 |
+| MIN_TP_PCT | 0.001 |
+| MAX_TP_PCT | 0.020 |
+| TP | 1 fee_aware_tp (PostOnly Maker) |
+| SL | StopMarket (ComputeLiquiditySL) |
+| RETRAIN_TRADE_THRESHOLD | 15 |
+| ENTRY_FEE_RATE | 0.00055 |
+| EXIT_FEE_RATE | 0.0002 |
+| TARGET_NET_PROFIT_PCT | 0.002 |

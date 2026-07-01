@@ -195,11 +195,14 @@ def build_exit_plan(
 
     entry = _round_tick(entry, tick)
 
-    # SL: liquidity-aware, beyond support/resistance walls
+    # SL: liquidity-aware, beyond support/resistance walls, scaled by vol_mult
+    sl_min_pct = 0.003 * vol_mult
+    sl_max_pct = max_sl_pct * vol_mult
     sl = compute_liquidity_sl(
         direction, bids, asks, entry, tick,
-        min_sl_distance_pct=0.005,
-        max_sl_distance_pct=max_sl_pct,
+        min_sl_distance_pct=sl_min_pct,
+        max_sl_distance_pct=sl_max_pct,
+        hard_max_sl_pct=0.015,
     )
     if sl <= 0:
         # Fallback: use percentage-based SL
