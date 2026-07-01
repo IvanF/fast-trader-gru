@@ -128,6 +128,7 @@ func decode(raw []byte, dest any) bool {
 
 // ExecutionResult represents a closed trade from OMS.
 type ExecutionResult struct {
+	SignalID  string  `json:"signal_id"`
 	Symbol    string  `json:"symbol"`
 	Direction string  `json:"direction"`
 	EntryPx   float64 `json:"entry_price"`
@@ -154,8 +155,13 @@ func (s *Service) listenExecutionResults(ctx context.Context) {
 			continue
 		}
 		// Start MAE/MFE tracking for 30 minutes after trade close
-		s.tracker.StartTracking(result.Symbol, result.Direction, result.EntryPx, 30*time.Minute)
+		tradeID := result.SignalID
+		if tradeID == "" {
+			tradeID = result.Symbol
+		}
+		s.tracker.StartTracking(tradeID, result.Symbol, result.Direction, result.EntryPx, 30*time.Minute)
 		s.logger.Info("started MAE/MFE tracking",
+			"trade_id", tradeID,
 			"symbol", result.Symbol,
 			"direction", result.Direction,
 			"entry", result.EntryPx,

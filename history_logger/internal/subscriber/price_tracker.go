@@ -13,6 +13,7 @@ import (
 
 // MAEFEResult published to Redis after price tracking completes.
 type MAEFEResult struct {
+	TradeID   string  `json:"trade_id"`
 	Symbol    string  `json:"symbol"`
 	Direction string  `json:"direction"`
 	EntryPx   float64 `json:"entry_price"`
@@ -23,14 +24,16 @@ type MAEFEResult struct {
 }
 
 type PriceTracker struct {
-	mu       sync.Mutex
-	trackers map[string]*trackedPosition
-	rdb      *redis.Client
-	channel  string
-	logger   *slog.Logger
+	mu             sync.Mutex
+	trackers       map[string]*trackedPosition // key: tradeID
+	symbolTrackers map[string][]string         // key: symbol -> []tradeID (secondary index)
+	rdb            *redis.Client
+	channel        string
+	logger         *slog.Logger
 }
 
 type trackedPosition struct {
+	tradeID   string
 	symbol    string
 	direction string
 	entryPx   float64
@@ -41,18 +44,20 @@ type trackedPosition struct {
 
 func NewPriceTracker(rdb *redis.Client, channel string, logger *slog.Logger) *PriceTracker {
 	return &PriceTracker{
-		trackers: make(map[string]*trackedPosition),
-		rdb:      rdb,
-		channel:  channel,
-		logger:   logger,
+		trackers:       make(map[string]*trackedPosition),
+		symbolTrackers: make(map[string][]string),
+		rdb:            rdb,
+		channel:        channel,
+		logger:         logger,
 	}
 }
 
-func (pt *PriceTracker) StartTracking(symbol, direction string, entryPx float64, duration time.Duration) {
+func (pt *PriceTracker) StartTracking(tradeID, symbol, direction string, entryPx float64, duration time.Duration) {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 
-	pt.trackers[symbol] = &trackedPosition{
+	pt.trackers[tradeID] = &trackedPosition{
+		tradeID:   tradeID,
 		symbol:    symbol,
 		direction: direction,
 		entryPx:   entryPx,
@@ -60,11 +65,12 @@ func (pt *PriceTracker) StartTracking(symbol, direction string, entryPx float64,
 		lowPx:     entryPx,
 		highPx:    entryPx,
 	}
+	pt.symbolTrackers[symbol] = append(pt.symbolTrackers[symbol], tradeID)
 
-	go pt.trackLoop(symbol, duration)
+	go pt.trackLoop(tradeID, duration)
 }
 
-func (pt *PriceTracker) trackLoop(symbol string, duration time.Duration) {
+func (pt *PriceTracker) trackLoop(tradeID string, duration time.Duration) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	endTime := time.Now().Add(duration)
@@ -73,11 +79,11 @@ func (pt *PriceTracker) trackLoop(symbol string, duration time.Duration) {
 		select {
 		case <-ticker.C:
 			pt.mu.Lock()
-			_, ok := pt.trackers[symbol]
+			_, ok := pt.trackers[tradeID]
 			pt.mu.Unlock()
 
 			if !ok || time.Now().After(endTime) {
-				pt.finishTracking(symbol)
+				pt.finishTracking(tradeID)
 				return
 			}
 		}
@@ -88,27 +94,47 @@ func (pt *PriceTracker) UpdatePrice(symbol string, price float64) {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 
-	tp, ok := pt.trackers[symbol]
-	if !ok || price <= 0 {
+	if price <= 0 {
 		return
 	}
 
-	if price < tp.lowPx {
-		tp.lowPx = price
+	tradeIDs, ok := pt.symbolTrackers[symbol]
+	if !ok {
+		return
 	}
-	if price > tp.highPx {
-		tp.highPx = price
+	for _, tid := range tradeIDs {
+		tp, exists := pt.trackers[tid]
+		if !exists {
+			continue
+		}
+		if price < tp.lowPx {
+			tp.lowPx = price
+		}
+		if price > tp.highPx {
+			tp.highPx = price
+		}
 	}
 }
 
-func (pt *PriceTracker) finishTracking(symbol string) {
+func (pt *PriceTracker) finishTracking(tradeID string) {
 	pt.mu.Lock()
-	tp, ok := pt.trackers[symbol]
+	tp, ok := pt.trackers[tradeID]
 	if !ok {
 		pt.mu.Unlock()
 		return
 	}
-	delete(pt.trackers, symbol)
+	delete(pt.trackers, tradeID)
+	symbol := tp.symbol
+	ids := pt.symbolTrackers[symbol]
+	for i, id := range ids {
+		if id == tradeID {
+			pt.symbolTrackers[symbol] = append(ids[:i], ids[i+1:]...)
+			break
+		}
+	}
+	if len(pt.symbolTrackers[symbol]) == 0 {
+		delete(pt.symbolTrackers, symbol)
+	}
 	pt.mu.Unlock()
 
 	if tp.entryPx <= 0 {
@@ -138,6 +164,7 @@ func (pt *PriceTracker) finishTracking(symbol string) {
 	)
 
 	result := MAEFEResult{
+		TradeID:   tradeID,
 		Symbol:    symbol,
 		Direction: tp.direction,
 		EntryPx:   tp.entryPx,

@@ -334,13 +334,15 @@ class MLEngine:
             regime = data.get("regime", "Choppy")
             direction = data.get("direction", "HOLD")
             symbol = data.get("symbol", "")
+            signal_id = data.get("signal_id", "")
             mae_pct = float(data.get("mae_pct", 0))
             mfe_pct = float(data.get("mfe_pct", 0))
 
             if pnl >= -2.0:
                 self.memory.add(vec[: self.cfg.state_dim], pnl, regime, direction,
                                mae_pct=mae_pct, mfe_pct=mfe_pct)
-            self._pending_mae_mfe[symbol] = {
+            lookup_key = signal_id or symbol
+            self._pending_mae_mfe[lookup_key] = {
                 "state_vector": vec[: self.cfg.state_dim].tolist(),
                 "regime": regime,
                 "direction": direction,
@@ -397,13 +399,15 @@ class MLEngine:
         async def handle(msg: dict) -> None:
             data = json.loads(msg["data"])
             symbol = data.get("symbol", "")
+            trade_id = data.get("trade_id", "")
             mae_pct = float(data.get("mae_pct", 0))
             mfe_pct = float(data.get("mfe_pct", 0))
             direction = data.get("direction", "")
-            logger.info("MAE/MFE received: %s %s MAE=%.2f%% MFE=%.2f%%",
-                        symbol, direction, mae_pct, mfe_pct)
+            logger.info("MAE/MFE received: %s %s trade_id=%s MAE=%.2f%% MFE=%.2f%%",
+                        symbol, direction, trade_id, mae_pct, mfe_pct)
 
-            pending = self._pending_mae_mfe.pop(symbol, None)
+            lookup_key = trade_id or symbol
+            pending = self._pending_mae_mfe.pop(lookup_key, None)
             if not pending:
                 logger.warning("MAE/MFE for %s but no pending state_vector found", symbol)
                 return
