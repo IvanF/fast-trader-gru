@@ -146,7 +146,7 @@ func (se *ShadowEngine) ProcessPriceUpdate(ctx context.Context, symbol string, p
 func calcShadowPnL(pos *ShadowPosition, exitPrice float64) float64 {
 	notional := pos.Qty * pos.EntryPrice
 	entryFee := notional * 0.00055
-	exitFee := pos.Qty * exitPrice * 0.00055
+	exitFee := pos.Qty * exitPrice * 0.00020
 
 	// Realistic spread simulation (0.03% average for mid-cap alts)
 	spreadCost := notional * 0.0003

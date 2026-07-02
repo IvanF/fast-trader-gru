@@ -13,8 +13,8 @@ from .models.nn_models import FLOW_DIM, MACRO_DIM, OB_DIM, SEQ_LEN, STATE_DIM
 
 FEATURE_COLS = ["obi", "bid_vol", "ask_vol", "price", "size"]
 
-MAX_PNL = 0.15
-MIN_PNL = -0.10
+MAX_PNL = 2.0
+MIN_PNL = -2.0
 MAX_PRICE = 1e9
 MAX_SIZE = 1e8
 
@@ -39,15 +39,44 @@ def _direction_label(direction: str, pnl: float) -> int:
     return 2
 
 
-def _confidence_label(pnl: float, entry: float) -> float:
+def _confidence_label(
+    pnl: float,
+    entry: float,
+    direction: str,
+    obi: float = 0.0,
+    regime: str = "Choppy",
+) -> float:
+    """Confidence = how well-aligned the trade was with market microstructure.
+
+    High confidence when: direction matches OBI sign AND trade was profitable.
+    Low confidence when: direction contradicts OBI OR trade lost money.
+    This teaches the model to output confidence based on market conditions, not PnL.
+    """
     if entry <= 0:
         return 0.5
-    raw = abs(pnl / entry)
-    if raw < 0.001:
-        return 0.1
-    if pnl > 0:
-        return float(np.clip(0.5 + raw * 10, 0.5, 1.0))
-    return float(np.clip(0.5 - raw * 10, 0.0, 0.5))
+
+    dir_aligned = (
+        (direction == "LONG" and obi > 0.02) or
+        (direction == "SHORT" and obi < -0.02)
+    )
+    won = pnl >= 0
+
+    if dir_aligned and won:
+        base = 0.85
+    elif dir_aligned and not won:
+        base = 0.55
+    elif not dir_aligned and won:
+        base = 0.50
+    else:
+        base = 0.25
+
+    regime_bonus = {
+        "Trending": 0.10,
+        "Breakout": 0.05,
+        "Choppy": -0.05,
+    }.get(regime, 0.0)
+
+    return float(np.clip(base + regime_bonus, 0.1, 0.95))
 
 
 def _rows_to_sequences(rows: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -180,6 +209,8 @@ def build_joined_dataset(
     dir_list, conf_list, pnl_list = [], [], []
     ts_list, sym_list = [], []
 
+    raw_trades = []
+
     for outcome in outcomes:
         sym = str(outcome.get("symbol", ""))
         t = outcome["_time"]
@@ -194,7 +225,6 @@ def build_joined_dataset(
         feature_rows = store.query_market_features_window(sym, t, feature_window_sec)
         ob_seq, flow_seq, macro = _rows_to_sequences(feature_rows)
 
-        # Skip if no features available for this symbol
         if ob_seq.sum() == 0 and flow_seq.sum() == 0:
             continue
 
@@ -209,27 +239,73 @@ def build_joined_dataset(
             state_vec = np.pad(state_vec, (0, STATE_DIM - state_vec.size))
         state_vec = state_vec[:STATE_DIM]
 
+        regime = outcome.get("regime", "Choppy")
+        obi = macro[0] if len(macro) > 0 else 0.0
+
+        raw_trades.append({
+            "ob_seq": ob_seq,
+            "flow_seq": flow_seq,
+            "macro": macro,
+            "state_vec": state_vec,
+            "direction": direction,
+            "regime": regime,
+            "pnl": pnl,
+            "entry": entry,
+            "obi": obi,
+            "ts": t.timestamp(),
+            "sym": sym,
+        })
+
+    if not raw_trades:
+        return _empty_dataset()
+
+    n = len(raw_trades)
+
+    for i, trade in enumerate(raw_trades):
+        neighbor_mask = np.zeros(n, dtype=bool)
+        neighbor_mask[max(0, i - 5):min(n, i + 6)] = True
+        neighbor_mask[i] = True
+
+        neighbor_indices = np.where(neighbor_mask)[0]
+        if len(neighbor_indices) == 0:
+            neighbor_indices = np.array([i])
+
+        weighted_pnl = 0.0
+        weighted_wins = 0.0
+        total_weight = 0.0
+        for j in neighbor_indices:
+            w = 1.0 / (1.0 + abs(i - j))
+            weighted_pnl += raw_trades[j]["pnl"] * w
+            weighted_wins += (1.0 if raw_trades[j]["pnl"] >= 0 else 0.0) * w
+            total_weight += w
+
+        win_rate = weighted_wins / max(total_weight, 1e-8)
+        avg_pnl = weighted_pnl / max(total_weight, 1e-8)
+
         memory_vec = np.array([
-            1.0 if pnl >= 0 else 0.0,
-            float(pnl),
-            float(np.tanh(pnl / 100)),
-            1.0,
-            1.0,
-            1.0 if outcome.get("regime", "Choppy") == "Trending" else 0.0,
-            1.0 if outcome.get("regime", "Choppy") == "Breakout" else 0.0,
-            1.0 if outcome.get("regime", "Choppy") == "Choppy" else 0.0,
+            win_rate,
+            avg_pnl,
+            float(np.tanh(avg_pnl / 100)),
+            total_weight,
+            float(len(neighbor_indices)),
+            1.0 if trade["regime"] == "Trending" else 0.0,
+            1.0 if trade["regime"] == "Breakout" else 0.0,
+            1.0 if trade["regime"] == "Choppy" else 0.0,
         ], dtype=np.float32)
 
-        ob_list.append(ob_seq)
-        flow_list.append(flow_seq)
-        macro_list.append(macro)
-        state_list.append(state_vec)
+        ob_list.append(trade["ob_seq"])
+        flow_list.append(trade["flow_seq"])
+        macro_list.append(trade["macro"])
+        state_list.append(trade["state_vec"])
         memory_list.append(memory_vec)
-        dir_list.append(_direction_label(direction, pnl))
-        conf_list.append(_confidence_label(pnl, entry))
-        pnl_list.append(pnl)
-        ts_list.append(t.timestamp())
-        sym_list.append(sym)
+        dir_list.append(_direction_label(trade["direction"], trade["pnl"]))
+        conf_list.append(_confidence_label(
+            trade["pnl"], trade["entry"], trade["direction"],
+            trade["obi"], trade["regime"],
+        ))
+        pnl_list.append(trade["pnl"])
+        ts_list.append(trade["ts"])
+        sym_list.append(trade["sym"])
 
     if not ob_list:
         return _empty_dataset()

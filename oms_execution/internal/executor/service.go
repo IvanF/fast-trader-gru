@@ -816,6 +816,8 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 
 	if elapsedMs(pos.EntryTime) > int64(pos.TimeStopSec)*1000 {
 		s.timeStopLimitExit(ctx, pos, ob)
+	} else {
+		s.maybeExitBreakevenTimed(ctx, pos, ob)
 	}
 
 	if s.monitorExitOrders(ctx, pos) {
@@ -874,7 +876,51 @@ func (s *Service) handleGhostPosition(ctx context.Context, pos *models.ActivePos
 				"symbol", pos.Symbol, "ex_size", exSize,
 			)
 		}
-		s.finalizeClose(ctx, pos, closed.ClosedPnL, closed.AvgEntryPrice, closed.AvgExitPrice, "exchange_closed", true)
+
+		closeReason := "exchange_closed"
+		for _, tp := range pos.TakeProfitOrders {
+			if tp.Price > 0 {
+				tpDist := math.Abs(closed.AvgExitPrice-tp.Price) / tp.Price
+				if tpDist < 0.002 {
+					closeReason = "take_profit"
+					s.logger.Info("TP triggered (exit≈tp)",
+						"symbol", pos.Symbol,
+						"exit", closed.AvgExitPrice,
+						"tp", tp.Price,
+						"tp_dist", tpDist,
+					)
+					break
+				}
+			}
+		}
+		if closeReason == "exchange_closed" {
+			if pos.StopLossOrder != nil && pos.StopLossOrder.Price > 0 {
+				slDist := math.Abs(closed.AvgExitPrice-pos.StopLossOrder.Price) / pos.StopLossOrder.Price
+				if slDist < 0.002 {
+					closeReason = "stop_loss"
+					s.logger.Info("SL triggered (exit≈sl)",
+						"symbol", pos.Symbol,
+						"exit", closed.AvgExitPrice,
+						"sl", pos.StopLossOrder.Price,
+						"sl_dist", slDist,
+					)
+				}
+			}
+			if closeReason == "exchange_closed" && pos.StopLoss > 0 {
+				slDist := math.Abs(closed.AvgExitPrice-pos.StopLoss) / pos.StopLoss
+				if slDist < 0.002 {
+					closeReason = "stop_loss"
+					s.logger.Info("SL triggered (exit≈sl)",
+						"symbol", pos.Symbol,
+						"exit", closed.AvgExitPrice,
+						"sl", pos.StopLoss,
+						"sl_dist", slDist,
+					)
+				}
+			}
+		}
+
+		s.finalizeClose(ctx, pos, closed.ClosedPnL, closed.AvgEntryPrice, closed.AvgExitPrice, closeReason, true)
 		s.mu.Lock()
 		delete(s.positions, pos.Symbol)
 		s.ghostCooldown[pos.Symbol] = time.Now().UnixMilli()+120_000
@@ -991,7 +1037,7 @@ func (s *Service) shadowOpen(ctx context.Context, signal models.TradeSignal, rec
 
 	exitOpts := s.exitGridOptsForSymbol(signal.Symbol)
 	exitGrid := grid.BuildExitGrid(
-		signal.Direction, entry, plan.EntryPrice, plan.StopLoss,
+		signal.Direction, entry, entry, plan.StopLoss,
 		ob, signal, 0.001, qty, 0.001, 0.001, exitOpts,
 	)
 

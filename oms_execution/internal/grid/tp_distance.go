@@ -51,18 +51,32 @@ func MaxTPDistance(fillPrice, vm float64, timeStopSec int, regime string) float6
 }
 
 // FeeAwareBreakevenPrice returns the minimum profitable exit (covers fees + micro-slippage).
-func FeeAwareBreakevenPrice(fillPrice float64, direction string, feePct, tickSize float64) float64 {
+func FeeAwareBreakevenPrice(fillPrice float64, direction string, feePct, tickSize float64, entryFeeRate, exitFeeRate float64) float64 {
 	if fillPrice <= 0 || feePct <= 0 {
 		return fillPrice
 	}
 	if tickSize <= 0 {
 		tickSize = 0.0001
 	}
+	if entryFeeRate <= 0 {
+		entryFeeRate = 0.00055
+	}
+	if exitFeeRate <= 0 {
+		exitFeeRate = 0.0002
+	}
 	switch direction {
 	case "LONG":
-		return roundToTick(fillPrice*(1+feePct), tickSize)
+		be := fillPrice * (1.0 + entryFeeRate) / (1.0 - exitFeeRate)
+		if be <= fillPrice {
+			be = fillPrice * (1.0 + feePct)
+		}
+		return roundToTick(be, tickSize)
 	case "SHORT":
-		return roundToTick(fillPrice*(1-feePct), tickSize)
+		be := fillPrice * (1.0 - entryFeeRate) / (1.0 + exitFeeRate)
+		if be >= fillPrice {
+			be = fillPrice * (1.0 - feePct)
+		}
+		return roundToTick(be, tickSize)
 	default:
 		return fillPrice
 	}
@@ -127,16 +141,21 @@ func applyTPPriceFloors(
 	fillPrice float64,
 	levels []ExitLevel,
 	minTPPct, feeBreakevenPct, tickSize float64,
+	entryFeeRate, exitFeeRate float64,
 ) []ExitLevel {
 	if len(levels) == 0 {
 		return levels
 	}
-	minBE := FeeAwareBreakevenPrice(fillPrice, direction, feeBreakevenPct, tickSize)
+	minBE := FeeAwareBreakevenPrice(fillPrice, direction, feeBreakevenPct, tickSize, entryFeeRate, exitFeeRate)
 	out := make([]ExitLevel, 0, len(levels))
 	for _, lv := range levels {
 		if lv.Kind == "wall" {
 			lv.Price = roundToTick(lv.Price, tickSize)
-			lv.Price = math.Max(lv.Price, fillPrice+tickSize)
+			if direction == "LONG" {
+				lv.Price = math.Max(lv.Price, fillPrice+tickSize)
+			} else {
+				lv.Price = math.Min(lv.Price, fillPrice-tickSize)
+			}
 		} else {
 			lv.Price = EnforceMinTPDistance(fillPrice, lv.Price, direction, minTPPct, tickSize)
 			if lv.Kind == "breakeven" {

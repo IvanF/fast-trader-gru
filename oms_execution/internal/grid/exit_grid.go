@@ -3,7 +3,6 @@ package grid
 import (
 	"math"
 	"sort"
-	"strconv"
 
 	"github.com/fast-trader-gru/oms_execution/internal/bybit"
 	"github.com/fast-trader-gru/oms_execution/internal/liquidity"
@@ -50,26 +49,8 @@ func computeSmartSL(
 	signal models.TradeSignal,
 	tickSize, risk, maxSLPct float64,
 ) (float64, bool) {
-	obi := 0.0
-	if len(ob.Bids) > 0 && len(ob.Asks) > 0 {
-		var bidVol, askVol float64
-		for i := 0; i < 10 && i < len(ob.Bids); i++ {
-			s, _ := strconv.ParseFloat(ob.Bids[i].Size, 64)
-			bidVol += s
-		}
-		for i := 0; i < 10 && i < len(ob.Asks); i++ {
-			s, _ := strconv.ParseFloat(ob.Asks[i].Size, 64)
-			askVol += s
-		}
-		total := bidVol + askVol
-		if total > 0 {
-			obi = (bidVol - askVol) / total
-		}
-	}
-
-	_, knifeTighten := liquidity.DetectKnife(
-		signal.MacroTrend5m, signal.MacroTrend15m, obi, signal.Regime, direction,
-	)
+	// Knife: do NOT tighten SL — entering against trend needs wider stop to avoid noise.
+	// Only TP should be tightened (quick profit capture). SL stays at S/R level.
 
 	var sl float64
 	foundSR := false
@@ -86,8 +67,6 @@ func computeSmartSL(
 			trendTighten := math.Max(0.6, 1.0+signal.MacroTrend15m*10)
 			sl = fillPrice - (fillPrice-sl)*trendTighten
 		}
-
-		sl = fillPrice - (fillPrice-sl)*knifeTighten
 
 		maxSLDist := fillPrice * maxSLPct
 		minSL := fillPrice - maxSLDist
@@ -111,8 +90,6 @@ func computeSmartSL(
 			trendTighten := math.Max(0.6, 1.0-signal.MacroTrend15m*10)
 			sl = fillPrice + (sl-fillPrice)*trendTighten
 		}
-
-		sl = fillPrice + (sl-fillPrice)*knifeTighten
 
 		maxSLDist := fillPrice * maxSLPct
 		maxSL := fillPrice + maxSLDist
@@ -154,35 +131,133 @@ func BuildExitGrid(
 
 	var slPrice, tpPrice float64
 	smartSL := false
+	tpKind := "fee_aware_tp"
 
-	// Parametric Memory: override SL/TP with dynamic values from MAE/MFE history
 	dynamicSLPct := signal.DynamicSLPct
 	dynamicTPPct := signal.DynamicTPPct
+	hasPythonTP := len(signal.TakeProfits) > 0
 
+	// === SL computation (unchanged logic) ===
 	if dynamicSLPct > 0 && dynamicTPPct > 0 {
-		slPct := math.Max(math.Min(dynamicSLPct, maxSLPct), minSLPct)
+		slPct := dynamicSLPct
+		if slPct < minSLPct {
+			slPct = minSLPct
+		}
+		if maxSLPct > 0 && slPct > maxSLPct*3 {
+			slPct = maxSLPct * 3
+		}
 		if direction == "LONG" {
 			slPrice = fillPrice * (1.0 - slPct)
 		} else {
 			slPrice = fillPrice * (1.0 + slPct)
 		}
 		slPrice = roundToTick(slPrice, tickSize)
-
-		tpPct := math.Max(math.Min(dynamicTPPct, opts.MaxTPPct), opts.MinTPPct)
-		if direction == "LONG" {
-			tpPrice = fillPrice * (1.0 + tpPct)
-		} else {
-			tpPrice = fillPrice * (1.0 - tpPct)
+	} else if signal.StopLoss > 0 {
+		slPrice = roundToTick(signal.StopLoss, tickSize)
+		if direction == "LONG" && slPrice >= fillPrice {
+			slPrice = roundToTick(fillPrice*(1.0-minSLPct), tickSize)
 		}
-		tpPrice = roundToTick(tpPrice, tickSize)
+		if direction == "SHORT" && slPrice <= fillPrice {
+			slPrice = roundToTick(fillPrice*(1.0+minSLPct), tickSize)
+		}
+		slDistPct := math.Abs(slPrice-fillPrice) / fillPrice
+		if slDistPct < minSLPct {
+			if direction == "LONG" {
+				slPrice = roundToTick(fillPrice*(1.0-minSLPct), tickSize)
+			} else {
+				slPrice = roundToTick(fillPrice*(1.0+minSLPct), tickSize)
+			}
+		}
+		if maxSLPct > 0 && slDistPct > maxSLPct {
+			if direction == "LONG" {
+				slPrice = roundToTick(fillPrice*(1.0-maxSLPct), tickSize)
+			} else {
+				slPrice = roundToTick(fillPrice*(1.0+maxSLPct), tickSize)
+			}
+		}
 	} else {
-		// Dynamic SL: scan orderbook for liquidity zone, place SL behind it
 		slResult := liquidity.ComputeLiquiditySL(
 			direction, fillPrice, ob, tickSize, minSLPct, maxSLPct,
 		)
 		slPrice = slResult.Price
 		smartSL = slResult.Source == "liquidity_zone" || slResult.Source == "nearest_level"
+	}
 
+	// === SL tick enforcement: minimum 5 ticks from entry ===
+	minSLTicks := 5.0
+	minSLFromTicks := minSLTicks * tickSize
+	if direction == "LONG" {
+		slMaxDist := fillPrice - minSLFromTicks
+		if slPrice <= 0 || slPrice > slMaxDist {
+			slPrice = roundToTick(slMaxDist, tickSize)
+		}
+	} else {
+		slMinDist := fillPrice + minSLFromTicks
+		if slPrice <= 0 || slPrice < slMinDist {
+			slPrice = roundToTick(slMinDist, tickSize)
+		}
+	}
+
+	// === TP computation — unified pipeline for ALL coins ===
+	maxTPDist := opts.MaxTPPct
+	if maxTPDist <= 0 {
+		maxTPDist = 0.015
+	}
+
+	// Priority 1: Python-computed TP from spike-detection (orderbook walls)
+	if hasPythonTP {
+		candidateTP := roundToTick(signal.TakeProfits[0], tickSize)
+		if (direction == "LONG" && candidateTP > fillPrice) ||
+			(direction == "SHORT" && candidateTP < fillPrice) {
+			tpDist := math.Abs(candidateTP-fillPrice) / fillPrice
+			if tpDist <= maxTPDist && tpDist > 0 {
+				tpPrice = candidateTP
+				tpKind = "ml_tp"
+			}
+		}
+	}
+
+	// Priority 2: Go-side nearest level from orderbook
+	if tpPrice <= 0 {
+		var levelTP float64
+		levelBuffer := tickSize * 5
+		entryFee := opts.EntryFeeRate
+		if entryFee <= 0 {
+			entryFee = 0.00055
+		}
+		exitFee := opts.ExitFeeRate
+		if exitFee <= 0 {
+			exitFee = 0.0002
+		}
+		if direction == "LONG" {
+			resistance := liquidity.FindNearestResistance(ob, fillPrice)
+			if resistance.Price > 0 {
+				levelTP = roundToTick(resistance.Price-levelBuffer, tickSize)
+				if levelTP <= fillPrice {
+					levelTP = 0
+				}
+			}
+		} else {
+			support := liquidity.FindNearestSupport(ob, fillPrice)
+			if support.Price > 0 {
+				levelTP = roundToTick(support.Price+levelBuffer, tickSize)
+				if levelTP >= fillPrice {
+					levelTP = 0
+				}
+			}
+		}
+		if levelTP > 0 {
+			levelDist := math.Abs(levelTP-fillPrice) / fillPrice
+			feeMinDist := math.Max((entryFee+exitFee)*2, 0.01) // At least 1% from entry
+			if levelDist >= feeMinDist && levelDist <= maxTPDist {
+				tpPrice = levelTP
+				tpKind = "liquidity_tp"
+			}
+		}
+	}
+
+	// Priority 3: fee-aware TP (guaranteed minimum profit)
+	if tpPrice <= 0 {
 		entryFee := opts.EntryFeeRate
 		if entryFee <= 0 {
 			entryFee = 0.00055
@@ -195,7 +270,65 @@ func BuildExitGrid(
 		if targetProfit <= 0 {
 			targetProfit = 0.002
 		}
+		if tickSize <= 0 {
+			tickSize = 0.0001
+		}
 		tpPrice = CalculateExitPrice(fillPrice, direction, entryFee, exitFee, targetProfit, tickSize)
+		if tpPrice <= 0 {
+			// Absolute fallback: fill ± (fees + 0.5%)
+			fallbackDist := fillPrice * (entryFee + exitFee + 0.005)
+			if direction == "LONG" {
+				tpPrice = roundToTick(fillPrice+fallbackDist, tickSize)
+			} else {
+				tpPrice = roundToTick(fillPrice-fallbackDist, tickSize)
+			}
+		}
+	}
+
+	// Enforce MinTPPct only for non-liquidity TPs
+	if tpKind != "liquidity_tp" && tpKind != "ml_tp" {
+		tpDist := math.Abs(tpPrice-fillPrice) / fillPrice
+		if tpDist < opts.MinTPPct {
+			if direction == "LONG" {
+				tpPrice = roundToTick(fillPrice*(1.0+opts.MinTPPct), tickSize)
+			} else {
+				tpPrice = roundToTick(fillPrice*(1.0-opts.MinTPPct), tickSize)
+			}
+		}
+	}
+
+	// === TP tick enforcement: minimum 3 ticks from entry ===
+	minTPFromTicks := 3.0 * tickSize
+	if direction == "LONG" {
+		tpMinDist := fillPrice + minTPFromTicks
+		if tpPrice <= 0 || tpPrice < tpMinDist {
+			tpPrice = roundToTick(tpMinDist, tickSize)
+		}
+	} else {
+		tpMaxDist := fillPrice - minTPFromTicks
+		if tpPrice <= 0 || tpPrice > tpMaxDist {
+			tpPrice = roundToTick(tpMaxDist, tickSize)
+		}
+	}
+
+	// === R:R enforcement: TP must be >= 0.5x SL distance ===
+	slDist := math.Abs(fillPrice - slPrice)
+	tpDistCheck := math.Abs(tpPrice - fillPrice)
+	if slDist > 0 && tpDistCheck < slDist*0.5 {
+		// TP too close relative to SL — widen to 0.5x SL
+		if direction == "LONG" {
+			tpPrice = roundToTick(fillPrice+slDist*0.5, tickSize)
+		} else {
+			tpPrice = roundToTick(fillPrice-slDist*0.5, tickSize)
+		}
+	}
+
+	// Final validation: TP must be in profit direction
+	if direction == "LONG" && tpPrice <= fillPrice {
+		tpPrice = roundToTick(fillPrice*(1.0+opts.MinTPPct), tickSize)
+	}
+	if direction == "SHORT" && tpPrice >= fillPrice {
+		tpPrice = roundToTick(fillPrice*(1.0-opts.MinTPPct), tickSize)
 	}
 
 	tpQty := bybit.NormalizeQty(totalQty, qtyStep, minQty)
@@ -203,7 +336,7 @@ func BuildExitGrid(
 		StopLoss:    ExitLevel{Price: slPrice, Qty: tpQty, Kind: "stop_loss"},
 		SmartSL:     smartSL,
 		TakeProfits: []ExitLevel{
-			{Price: tpPrice, Qty: tpQty, Kind: "fee_aware_tp"},
+			{Price: tpPrice, Qty: tpQty, Kind: tpKind},
 		},
 	}
 	return grid
@@ -309,7 +442,7 @@ func buildHeuristicTPs(
 			}
 		} else {
 			capPrice := roundToTick(strongWall.Price+wallOffset2, tickSize)
-			if capPrice > 0 && capPrice < rPrice && capPrice < fillPrice {
+			if capPrice > 0 && capPrice > rPrice && capPrice < fillPrice {
 				rPrice = capPrice
 			}
 		}

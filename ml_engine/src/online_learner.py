@@ -24,15 +24,15 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-ONLINE_LR = float(os.getenv("ONLINE_LR", "1e-5"))
-EWC_LAMBDA = float(os.getenv("EWC_LAMBDA", "500.0"))
+ONLINE_LR = float(os.getenv("ONLINE_LR", "5e-6"))
+EWC_LAMBDA = float(os.getenv("EWC_LAMBDA", "1000.0"))
 REPLAY_BUFFER_SIZE = int(os.getenv("REPLAY_BUFFER_SIZE", "200"))
 REPLAY_BATCH = int(os.getenv("REPLAY_BATCH", "16"))
 PATTERN_MEMORY_SIZE = int(os.getenv("PATTERN_MEMORY_SIZE", "500"))
 PATTERN_SIMILARITY_THRESHOLD = float(os.getenv("PATTERN_SIMILARITY_THRESHOLD", "0.90"))
-CONSECUTIVE_LOSS_THRESHOLD = int(os.getenv("CONSECUTIVE_LOSS_THRESHOLD", "3"))
-ONLINE_UPDATE_INTERVAL = int(os.getenv("ONLINE_UPDATE_INTERVAL", "5"))
-PATTERN_TTL_HOURS = float(os.getenv("PATTERN_TTL_HOURS", "6"))
+CONSECUTIVE_LOSS_THRESHOLD = int(os.getenv("CONSECUTIVE_LOSS_THRESHOLD", "10"))
+ONLINE_UPDATE_INTERVAL = int(os.getenv("ONLINE_UPDATE_INTERVAL", "15"))
+PATTERN_TTL_HOURS = float(os.getenv("PATTERN_TTL_HOURS", "12"))
 
 
 @dataclass
@@ -104,25 +104,14 @@ class PatternMemory:
     def should_avoid(self, v_state: np.ndarray, regime: str, direction: str) -> Tuple[bool, float]:
         """Check if a trade pattern should be avoided based on historical losses.
 
-        Circuit breaker: max 2 blocks per direction per 60s window.
-        Prevents death spiral where all symbols get blocked.
+        If >= 5 similar patterns have avg loss < -$0.10, block the signal.
         """
         now = time.time()
         dir_key = f"{direction}_{regime}"
 
-        # find_similar acquires its own lock, call before our lock
         similar = self.find_similar(v_state, regime, direction)
 
         with self._lock:
-            # Per-direction cooldown: max 2 blocks per 60s
-            if dir_key in self._block_timestamps:
-                recent = [t for t in self._block_timestamps[dir_key] if now - t < 60]
-                self._block_timestamps[dir_key] = recent
-                if len(recent) >= 2:
-                    return False, 0.0
-            else:
-                self._block_timestamps[dir_key] = []
-
             # Filter out expired patterns (TTL)
             if PATTERN_TTL_HOURS > 0:
                 cutoff = now - PATTERN_TTL_HOURS * 3600
@@ -132,7 +121,6 @@ class PatternMemory:
             avg_pnl = np.mean([p.pnl for p in similar])
             loss_count = sum(1 for p in similar if p.pnl < 0)
             if loss_count >= 5 and avg_pnl < -0.10:
-                self._block_timestamps[dir_key].append(now)
                 return True, avg_pnl
             return False, avg_pnl
 
@@ -349,7 +337,7 @@ class OnlineLearner:
             logits = model(inp)
 
             ce_loss = F.cross_entropy(logits[:, :3], direction_b, reduction="none")
-            penalty = torch.where(pnl_b < 0, 2.5, 1.0)
+            penalty = torch.where(pnl_b < 0, 1.5, 1.0)
             loss_cls = (ce_loss * penalty).mean()
 
             ewc_loss = torch.tensor(0.0)

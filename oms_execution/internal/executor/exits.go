@@ -88,7 +88,7 @@ func (s *Service) deployExitGrid(ctx context.Context, pos *models.ActivePosition
 	exitGrid := grid.BuildExitGrid(
 		pos.Direction,
 		tpRefPrice,
-		plannedEntry,
+		tpRefPrice,
 		plannedSL,
 		ob,
 		pos.Signal,
@@ -524,7 +524,7 @@ func (s *Service) monitorExitOrders(ctx context.Context, pos *models.ActivePosit
 	if breakevenHit && !pos.BreakevenSet {
 		pos.BreakevenSet = true
 		pos.PartialTaken = true
-		beSL := grid.FeeAwareBreakevenPrice(pos.FillPrice, pos.Direction, s.cfg.FeeBreakevenPct, pos.TickSize)
+		beSL := grid.FeeAwareBreakevenPrice(pos.FillPrice, pos.Direction, s.cfg.FeeBreakevenPct, pos.TickSize, s.cfg.EntryFeeRate, s.cfg.ExitFeeRate)
 		slQty := s.slCoverQty(pos, exSize)
 		if slQty > 0 {
 			if err := s.atomicReplaceStopLoss(ctx, pos, beSL, slQty, "stop_loss"); err != nil {
@@ -558,7 +558,10 @@ func (s *Service) monitorExitOrders(ctx context.Context, pos *models.ActivePosit
 }
 
 // maybeTrailStopLoss moves SL tighter when price has moved significantly in our favor.
-// Logic: after breakeven, if price is > 1.5R from entry, trail SL to 0.8R lock.
+// Multi-stage trailing:
+//   profit >= 1.0R: trail to 0.5R lock (conservative, holds through noise)
+//   profit >= 2.0R: trail to 1.5R lock (aggressive profit lock)
+//   profit >= 4.0R: trail to 3.0R lock (deep profit lock)
 func (s *Service) maybeTrailStopLoss(ctx context.Context, pos *models.ActivePosition, exSize float64) {
 	if pos.StopLossOrder == nil || pos.StopLossOrder.Filled {
 		return
@@ -573,29 +576,51 @@ func (s *Service) maybeTrailStopLoss(ctx context.Context, pos *models.ActivePosi
 		return
 	}
 
-	risk := math.Abs(pos.FillPrice - pos.StopLoss)
+	// Use ORIGINAL risk from PlannedSL (before breakeven move)
+	risk := math.Abs(pos.FillPrice - pos.PlannedSL)
 	if risk <= 0 {
+		// Fallback: use current SL distance but at least min SL
+		risk = math.Abs(pos.FillPrice - pos.StopLoss)
+		if risk <= pos.FillPrice*0.003 {
+			risk = pos.FillPrice * 0.003
+		}
+	}
+
+	profitDist := 0.0
+	switch pos.Direction {
+	case "LONG":
+		profitDist = mid - pos.FillPrice
+	case "SHORT":
+		profitDist = pos.FillPrice - mid
+	}
+
+	if profitDist < risk {
+		return
+	}
+
+	// Multi-stage trail: more profit = tighter lock
+	profitR := profitDist / risk
+	var lockR float64
+	switch {
+	case profitR >= 4.0:
+		lockR = 3.0 // Deep lock: 3R locked
+	case profitR >= 2.0:
+		lockR = 1.5 // Aggressive lock: 1.5R locked
+	case profitR >= 1.0:
+		lockR = 0.5 // Conservative: 0.5R locked
+	default:
 		return
 	}
 
 	var newSL float64
 	switch pos.Direction {
 	case "LONG":
-		profitDist := mid - pos.FillPrice
-		if profitDist < risk*1.0 {
-			return
-		}
-		// Trail: lock 0.8R of current profit
-		newSL = mid - risk*0.8
+		newSL = mid - risk*lockR
 		if newSL <= pos.StopLoss {
 			return
 		}
 	case "SHORT":
-		profitDist := pos.FillPrice - mid
-		if profitDist < risk*1.0 {
-			return
-		}
-		newSL = mid + risk*0.8
+		newSL = mid + risk*lockR
 		if newSL >= pos.StopLoss {
 			return
 		}
@@ -604,9 +629,8 @@ func (s *Service) maybeTrailStopLoss(ctx context.Context, pos *models.ActivePosi
 	}
 
 	newSL = grid.RoundToTick(newSL, pos.TickSize)
-	// Do NOT enforce min SL distance here — trailing SL intentionally moves SL closer to price.
 
-	// Re-check price: mid may have moved since initial fetch. Bybit rejects trigger on wrong side.
+	// Re-check price: mid may have moved since initial fetch
 	ob2, ob2Err := s.redis.GetOrderbook(ctx, pos.Symbol)
 	if ob2Err == nil {
 		now := grid.MidPrice(ob2)
@@ -635,6 +659,104 @@ func (s *Service) maybeTrailStopLoss(ctx context.Context, pos *models.ActivePosi
 		"new_sl", newSL,
 		"mid", mid,
 		"fill", pos.FillPrice,
+		"profitR", fmt.Sprintf("%.1f", profitR),
+		"lockR", fmt.Sprintf("%.1f", lockR),
+	)
+}
+
+// maybeExitBreakevenTimed — if position is stuck (>60% of TIME_STOP) and in breakeven zone,
+// tighten TP to current price for faster exit.
+func (s *Service) maybeExitBreakevenTimed(ctx context.Context, pos *models.ActivePosition, ob models.OrderbookSnapshot) {
+	if pos.StopLossOrder == nil || pos.StopLossOrder.Filled {
+		return
+	}
+	if len(pos.TakeProfitOrders) == 0 {
+		return
+	}
+	if pos.EntryTime <= 0 {
+		return
+	}
+
+	for _, tp := range pos.TakeProfitOrders {
+		if !tp.Filled && tp.Kind == "breakeven_timed" {
+			return
+		}
+	}
+
+	elapsed := float64(elapsedMs(pos.EntryTime)) / 1000.0
+	timeStopSec := float64(pos.TimeStopSec)
+	if timeStopSec <= 0 {
+		timeStopSec = 900
+	}
+	if elapsed < timeStopSec*0.6 {
+		return
+	}
+
+	mid := grid.MidPrice(ob)
+	if mid <= 0 {
+		return
+	}
+
+	feeDist := pos.FillPrice * s.cfg.FeeBreakevenPct
+	inBreakeven := false
+	switch pos.Direction {
+	case "LONG":
+		inBreakeven = mid >= pos.FillPrice+feeDist
+	case "SHORT":
+		inBreakeven = mid <= pos.FillPrice-feeDist
+	}
+	if !inBreakeven {
+		return
+	}
+
+	exSize, hasPos := s.syncRemainingSize(ctx, pos)
+	if !hasPos || exSize <= 0 {
+		return
+	}
+
+	var exitPrice float64
+	if pos.Direction == "LONG" {
+		exitPrice = liquidity.BestBid(ob)
+	} else {
+		exitPrice = liquidity.BestAsk(ob)
+	}
+	if exitPrice <= 0 {
+		exitPrice = mid
+	}
+	newTPPrice := grid.RoundToTick(exitPrice, pos.TickSize)
+	if newTPPrice <= 0 {
+		return
+	}
+
+	tpQty := bybit.NormalizeQty(exSize*0.99, pos.QtyStep, pos.MinOrderQty)
+	if tpQty <= 0 {
+		return
+	}
+
+	side := closeSide(pos.Direction)
+	s.cancelTPOrdersOnly(ctx, pos)
+
+	tpOrderID, err := s.bybit.PlaceReduceLimit(ctx, pos.Symbol, side, tpQty, pos.QtyStep, bybit.FormatPrice(newTPPrice))
+	if err != nil {
+		s.logger.Warn("breakeven timed TP failed", "symbol", pos.Symbol, "error", err)
+		return
+	}
+
+	pos.TakeProfitOrders = append(pos.TakeProfitOrders, models.ExitOrder{
+		OrderID:    tpOrderID,
+		Price:      newTPPrice,
+		Qty:        tpQty,
+		Filled:     false,
+		Kind:       "breakeven_timed",
+	})
+
+	s.logger.Info("breakeven timed — TP tightened",
+		"symbol", pos.Symbol,
+		"direction", pos.Direction,
+		"elapsed_sec", int(elapsed),
+		"mid", mid,
+		"new_tp", newTPPrice,
+		"qty", tpQty,
 	)
 }
 
@@ -689,7 +811,6 @@ func (s *Service) timeStopLimitExit(ctx context.Context, pos *models.ActivePosit
 		return
 	}
 
-	s.cancelTPOrdersOnly(ctx, pos)
 	var price float64
 	if pos.Direction == "LONG" {
 		price = liquidity.BestBid(ob)
@@ -704,6 +825,8 @@ func (s *Service) timeStopLimitExit(ctx context.Context, pos *models.ActivePosit
 		return
 	}
 
+	// Cancel TPs FIRST, then place SL for full remainder — avoids over-allocation
+	s.cancelTPOrdersOnly(ctx, pos)
 	if err := s.atomicReplaceStopLoss(ctx, pos, price, exSize, "time_stop"); err != nil {
 		s.logger.Error("time stop sl replace failed", "symbol", pos.Symbol, "error", err)
 		return
@@ -790,10 +913,16 @@ func (s *Service) calcPnL(pos *models.ActivePosition, exit float64) float64 {
 	if pos.RemainingQty > 0 {
 		qty = pos.RemainingQty
 	}
+	var grossPnL float64
 	if pos.Direction == "LONG" {
-		return (exit - pos.FillPrice) * qty
+		grossPnL = (exit - pos.FillPrice) * qty
+	} else {
+		grossPnL = (pos.FillPrice - exit) * qty
 	}
-	return (pos.FillPrice - exit) * qty
+	notional := pos.FillPrice * qty
+	entryFee := notional * s.cfg.EntryFeeRate
+	exitFee := exit * qty * s.cfg.ExitFeeRate
+	return grossPnL - entryFee - exitFee
 }
 
 func elapsedMs(since int64) int64 {

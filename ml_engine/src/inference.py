@@ -25,6 +25,7 @@ class _SessionBundle:
     cnn: Optional[ort.InferenceSession]
     gru: Optional[ort.InferenceSession]
     mlp: Optional[ort.InferenceSession]
+    exit_opt: Optional[ort.InferenceSession] = None
 
 
 class HotSwapONNXInference:
@@ -159,11 +160,24 @@ class HotSwapONNXInference:
                         logger.error("bootstrap onnx restore failed for %s: %s", path, bootstrap_exc)
                 raise exc
 
+        def load_exit_optimizer() -> Optional[ort.InferenceSession]:
+            path = os.path.join(self.model_dir, "exit_optimizer.onnx")
+            if not os.path.exists(path):
+                return None
+            try:
+                sess = ort.InferenceSession(path, opts, providers=self._providers())
+                logger.info("loaded exit_optimizer from %s", path)
+                return sess
+            except Exception as exc:
+                logger.warning("exit_optimizer load failed: %s", exc)
+                return None
+
         return _SessionBundle(
             version=manifest.version,
             cnn=load_session("orderbook_cnn"),
             gru=load_session("flow_gru_attention"),
             mlp=load_session("decision_mlp"),
+            exit_opt=load_exit_optimizer(),
         )
 
     def reload(self, force: bool = False) -> bool:
@@ -248,6 +262,42 @@ class HotSwapONNXInference:
         inp = flow_seq.reshape(1, *flow_seq.shape).astype(np.float32)
         out = sess.run(None, {sess.get_inputs()[0].name: inp})
         return out[0].flatten()[:32]
+
+    def infer_exit_params(self, v_state: np.ndarray, v_memory: np.ndarray,
+                          direction: str, regime: str, confidence: float,
+                          vol_mult: float, dynamic_sl: float = 0.0,
+                          dynamic_tp: float = 0.0, salvageable_ratio: float = 0.5) -> Tuple[float, float, float]:
+        with self._lock:
+            exit_sess = self._bundle.exit_opt
+
+        if exit_sess is None:
+            return 0.005, 0.012, 0.5
+
+        dir_onehot = [1.0, 0.0] if direction == "LONG" else [0.0, 1.0] if direction == "SHORT" else [0.0, 0.0]
+        regime_onehot = [
+            1.0 if regime == "Choppy" else 0.0,
+            1.0 if regime == "Trending" else 0.0,
+            1.0 if regime == "Breakout" else 0.0,
+        ]
+        extras = np.array(dir_onehot + regime_onehot + [
+            confidence, vol_mult, 0.0, 0.0, 0.0,
+            dynamic_sl, dynamic_tp, salvageable_ratio,
+        ], dtype=np.float32)
+        inp = np.concatenate([v_state[:128], v_memory[:8], extras]).astype(np.float32).reshape(1, -1)
+
+        expected = exit_sess.get_inputs()[0].shape[1]
+        actual = inp.shape[1]
+        if actual != expected:
+            if actual > expected:
+                inp = inp[:, :expected]
+            else:
+                inp = np.concatenate([inp, np.zeros((1, expected - actual), dtype=np.float32)], axis=1)
+
+        outputs = exit_sess.run(None, {exit_sess.get_inputs()[0].name: inp})
+        sl_pct = float(outputs[0][0])
+        tp_pct = float(outputs[1][0])
+        trade_score = float(outputs[2][0])
+        return sl_pct, tp_pct, trade_score
 
     @staticmethod
     def _sigmoid(x: float) -> float:

@@ -21,11 +21,21 @@ from typing import Any, List, Sequence, Tuple
 # Fee constants (Bybit taker fees)
 ENTRY_FEE_PCT = 0.00055  # 0.055%
 EXIT_FEE_PCT = 0.00020   # 0.020%
-SPREAD_BUFFER_PCT = 0.00010  # 0.010% typical spread
+SPREAD_BUFFER_PCT = 0.00010  # 0.010% default spread buffer
 MIN_PROFIT_MARGIN_PCT = 0.00030  # 0.030% minimum profit after fees
 
-# Total minimum move to be profitable
+# Total minimum move to be profitable (static fallback)
 MIN_PROFITABLE_MOVE_PCT = ENTRY_FEE_PCT + EXIT_FEE_PCT + SPREAD_BUFFER_PCT + MIN_PROFIT_MARGIN_PCT
+
+
+def _compute_min_profitable_move(ref_price: float, best_bid: float, best_ask: float) -> float:
+    """Compute minimum profitable move accounting for actual spread."""
+    if best_bid > 0 and best_ask > 0 and ref_price > 0:
+        actual_spread_pct = (best_ask - best_bid) / ref_price
+        spread_buffer = actual_spread_pct * 0.5  # Half-spread as buffer
+    else:
+        spread_buffer = SPREAD_BUFFER_PCT
+    return ENTRY_FEE_PCT + EXIT_FEE_PCT + spread_buffer + MIN_PROFIT_MARGIN_PCT
 
 
 def _level_price(level: Any) -> float:
@@ -115,6 +125,7 @@ def _cluster_walls(
     """Cluster nearby walls and sum their sizes.
 
     Returns (price, total_size, wall_count) for each cluster.
+    Adaptive: cluster range = max(3 ticks, cluster_pct * price)
     """
     if not walls:
         return []
@@ -125,7 +136,8 @@ def _cluster_walls(
     for price, size in sorted_walls[1:]:
         last_cluster = clusters[-1]
         last_price = last_cluster[-1][0]
-        if abs(price - last_price) / max(last_price, 1e-8) <= cluster_pct:
+        cluster_range = max(tick * 3, abs(last_price) * cluster_pct)
+        if abs(price - last_price) <= cluster_range:
             last_cluster.append((price, size))
         else:
             clusters.append([(price, size)])
@@ -167,14 +179,17 @@ def compute_liquidity_tp_prices(
         return []
 
     ref = entry_price
+    best_bid = _level_price(bids[0]) if bids else 0.0
+    best_ask = _level_price(asks[0]) if asks else 0.0
     if ref <= 0:
-        best_bid = _level_price(bids[0]) if bids else 0.0
-        best_ask = _level_price(asks[0]) if asks else 0.0
         ref = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0.0
     if ref <= 0:
         return []
 
     tick = tick_size if tick_size > 0 else _infer_tick_size(ref)
+
+    # Dynamic min profitable move based on actual spread (W12 fix)
+    min_profitable = _compute_min_profitable_move(ref, best_bid, best_ask)
     offset = max(1, tick_offset) * tick
 
     # Find walls in the profit direction
@@ -188,6 +203,9 @@ def compute_liquidity_tp_prices(
 
     # Cluster nearby walls
     clustered = _cluster_walls(walls, tick)
+
+    # Compute average wall size for relative scoring (W7 fix)
+    avg_wall_size = sum(s for _, s in walls) / len(walls) if walls else 1.0
 
     # Filter and score walls
     candidates: List[Tuple[float, float, float]] = []
@@ -211,8 +229,8 @@ def compute_liquidity_tp_prices(
             if tp >= ref:
                 continue
 
-        # Must be profitable after fees
-        if distance_pct < MIN_PROFITABLE_MOVE_PCT:
+        # Must be profitable after fees — min 1% from entry
+        if distance_pct < min_profitable or distance_pct < 0.01:
             continue
 
         # Must be within max distance
@@ -223,7 +241,7 @@ def compute_liquidity_tp_prices(
         # Prefer walls that are 0.3%-1.5% away (sweet spot)
         optimal_dist = 0.008  # 0.8%
         dist_score = 1.0 / (1.0 + abs(distance_pct - optimal_dist) / optimal_dist)
-        size_score = min(wall_size / 1000, 2.0)  # Normalize size
+        size_score = min(wall_size / max(avg_wall_size, 1e-8), 3.0)  # Relative to avg size
         count_score = min(wall_count / 2, 1.5)  # Cluster bonus
         total_score = dist_score * (1 + size_score * 0.3 + count_score * 0.2)
 
@@ -266,9 +284,9 @@ def compute_liquidity_sl(
     asks: Sequence[Any],
     entry_price: float = 0.0,
     tick_size: float = 0.0,
-    min_sl_distance_pct: float = 0.003,
-    max_sl_distance_pct: float = 0.010,
-    hard_max_sl_pct: float = 0.015,
+    min_sl_distance_pct: float = 0.004,
+    max_sl_distance_pct: float = 0.008,
+    hard_max_sl_pct: float = 0.008,
 ) -> float:
     """Find SL level near support/resistance walls.
 

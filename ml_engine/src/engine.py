@@ -97,6 +97,7 @@ class MLEngine:
         self._movement_states = MovementStateStore()
         self._movement_weights, self._movement_bias = load_weights_from_env()
         self._movement_funding_prior = float(os.getenv("MOVEMENT_PROB_FUNDING_PRIOR_SCALE", "50"))
+        self._started_at = time.time()
         self._last_telemetry: Dict[str, float] = {}
 
     async def connect_redis(self) -> None:
@@ -217,6 +218,10 @@ class MLEngine:
 
         port = int(self.cfg.metrics_addr.split(":")[-1])
         prom.start_metrics_server(port)
+        health_port = port + 1000
+        prom.register_health_check(self._health_check)
+        prom.register_exit_plan_handler(self._handle_exit_plan_request)
+        prom.start_health_server(health_port)
         prom.faiss_index_size.set(self.memory.size)
         manifest = ModelManifest.from_dir(self.cfg.model_dir)
         prom.set_model_version(manifest.version, manifest.updated_at)
@@ -259,6 +264,62 @@ class MLEngine:
             self._metrics_loop(),
             self._status_loop(),
         )
+
+    def _health_check(self) -> dict:
+        checks = {}
+
+        redis_ok = self._redis is not None
+        checks["redis"] = "ok" if redis_ok else "disconnected"
+
+        faiss_size = self.memory.size
+        checks["faiss"] = "ok" if faiss_size > 0 else "empty"
+
+        model_ok = self.inference._bundle.mlp is not None
+        checks["model"] = "ok" if model_ok else "missing"
+
+        checks["symbols"] = len(self.active_symbols)
+        checks["open_positions"] = len(self._open_positions)
+        checks["uptime_sec"] = int(time.time() - self._started_at) if hasattr(self, "_started_at") else 0
+
+        healthy = redis_ok and model_ok
+        return {"status": "ok" if healthy else "degraded", **checks}
+
+    def _handle_exit_plan_request(self, request: dict) -> dict:
+        direction = request.get("direction", "SHORT")
+        bids = request.get("bids", [])
+        asks = request.get("asks", [])
+        tick_size = request.get("tick_size", 0.0001)
+        vol_mult = request.get("volatility_multiplier", 1.0)
+        regime = request.get("regime", "Choppy")
+        confidence = request.get("confidence", self.cfg.confidence_threshold)
+
+        if not bids or not asks:
+            return {"error": "empty orderbook"}
+
+        mid = (float(bids[0].get("price", 0)) + float(asks[0].get("price", 0))) / 2.0
+        if mid <= 0:
+            return {"error": "invalid mid price"}
+
+        exit_sl = self.cfg.max_sl_pct
+        exit_tp = self.cfg.max_tp_pct
+
+        plan = build_exit_plan(
+            direction,
+            bids,
+            asks,
+            vol_mult,
+            regime,
+            confidence,
+            tick_size=tick_size,
+            fallback_mid=mid,
+            vol_multiplier_cap=self.cfg.vol_multiplier_cap,
+            entry_maker_ticks=self.cfg.entry_maker_ticks,
+            min_tp_pct=exit_tp * 0.8,
+            fee_breakeven_pct=self.cfg.fee_breakeven_pct,
+            max_tp_pct=exit_tp,
+            max_sl_pct=exit_sl,
+        )
+        return plan or {"error": "exit_plan_computation_failed"}
 
     async def _listen_active_symbols(self) -> None:
         async def handle(msg: dict) -> None:
@@ -337,19 +398,31 @@ class MLEngine:
             signal_id = data.get("signal_id", "")
             mae_pct = float(data.get("mae_pct", 0))
             mfe_pct = float(data.get("mfe_pct", 0))
+            exchange_pnl = data.get("exchange_pnl", True)
+            weight = 1.0 if exchange_pnl else 0.3
 
-            if pnl >= -2.0:
-                self.memory.add(vec[: self.cfg.state_dim], pnl, regime, direction,
-                               mae_pct=mae_pct, mfe_pct=mfe_pct)
-            lookup_key = signal_id or symbol
-            self._pending_mae_mfe[lookup_key] = {
+            # Don't add to FAISS here — wait for MAE/MFE from PriceTracker.
+            # Store state_vector in Redis for persistence across restarts.
+            lookup_key = f"{signal_id}:{exchange_pnl}" if signal_id else f"{symbol}:{exchange_pnl}"
+            pending_data = {
                 "state_vector": vec[: self.cfg.state_dim].tolist(),
                 "regime": regime,
                 "direction": direction,
+                "symbol": symbol,
                 "pnl": pnl,
                 "close_reason": data.get("close_reason", ""),
+                "exchange_pnl": exchange_pnl,
                 "timestamp": time.time(),
             }
+            self._pending_mae_mfe[lookup_key] = pending_data
+            try:
+                await self._redis.setex(
+                    f"mae_mfe_pending:{lookup_key}",
+                    2100,  # 35 min TTL
+                    json.dumps(pending_data),
+                )
+            except Exception:
+                pass
             prom.faiss_index_size.set(self.memory.size)
 
             dir_idx = {"LONG": 0, "SHORT": 1}.get(direction.upper(), 2)
@@ -396,7 +469,21 @@ class MLEngine:
         await self._pubsub_listener("execution results", self.cfg.results_channel, handle)
 
     async def _listen_mae_mfe(self) -> None:
+        stale_cutoff = time.time() - 2100  # 35 min TTL
+
         async def handle(msg: dict) -> None:
+            # Cleanup stale pending entries (>35 min) — add to FAISS without MAE/MFE as fallback
+            stale_cutoff = time.time() - 2100
+            stale_keys = [k for k, v in self._pending_mae_mfe.items() if v.get("timestamp", 0) < stale_cutoff]
+            for k in stale_keys:
+                stale = self._pending_mae_mfe.pop(k, None)
+                if stale and stale.get("state_vector"):
+                    vec = np.array(stale["state_vector"], dtype=np.float32)
+                    if vec.size >= self.cfg.state_dim:
+                        self.memory.add(vec[: self.cfg.state_dim], stale["pnl"], stale["regime"],
+                                        stale["direction"], symbol=stale.get("symbol", ""))
+                        logger.info("Added stale entry to FAISS: %s pnl=%.4f", k, stale["pnl"])
+
             data = json.loads(msg["data"])
             symbol = data.get("symbol", "")
             trade_id = data.get("trade_id", "")
@@ -407,7 +494,22 @@ class MLEngine:
                         symbol, direction, trade_id, mae_pct, mfe_pct)
 
             lookup_key = trade_id or symbol
-            pending = self._pending_mae_mfe.pop(lookup_key, None)
+            pending = self._pending_mae_mfe.pop(lookup_key, None) or \
+                      self._pending_mae_mfe.pop(f"{lookup_key}:True", None) or \
+                      self._pending_mae_mfe.pop(f"{lookup_key}:False", None)
+
+            # Fallback: try Redis if in-memory cache miss (survived restart)
+            if not pending:
+                for suffix in ["", ":True", ":False"]:
+                    try:
+                        raw = await self._redis.get(f"mae_mfe_pending:{lookup_key}{suffix}")
+                        if raw:
+                            pending = json.loads(raw)
+                            await self._redis.delete(f"mae_mfe_pending:{lookup_key}{suffix}")
+                            break
+                    except Exception:
+                        pass
+
             if not pending:
                 logger.warning("MAE/MFE for %s but no pending state_vector found", symbol)
                 return
@@ -426,9 +528,10 @@ class MLEngine:
             )
 
             if vec.size >= self.cfg.state_dim:
+                weight = 1.0 if pending.get("exchange_pnl", True) else 0.3
                 vid = self.memory.add(vec[: self.cfg.state_dim], pnl, regime, direction,
-                                      mae_pct=mae_pct / 100.0, mfe_pct=mfe_pct / 100.0,
-                                      trade_judge=verdict.judge)
+                                      symbol=symbol, mae_pct=mae_pct / 100.0, mfe_pct=mfe_pct / 100.0,
+                                      trade_judge=verdict.judge, weight=weight)
                 if vid >= 0:
                     logger.info("FAISS MAE/MFE: %s vid=%d judge=%s pnl=%.4f MAE=%.2f%% MFE=%.2f%% reason=%s",
                                 symbol, vid, verdict.judge, pnl, mae_pct, mfe_pct, verdict.reason)
@@ -742,7 +845,7 @@ class MLEngine:
         self._last_signal_at = time.time()
         self._signal_drought_warned = False
         logger.info(
-            "signal %s %s conf=%.3f vol=%.2f regime=%s sl=%.6f tps=%s",
+            "signal %s %s conf=%.3f vol=%.2f regime=%s sl=%.6f tps=%s trend_5m=%.4f%% trend_15m=%.4f%%",
             signal_payload["symbol"],
             signal_payload["direction"],
             signal_payload["confidence"],
@@ -750,21 +853,23 @@ class MLEngine:
             signal_payload["regime"],
             signal_payload.get("stop_loss", 0.0),
             signal_payload.get("tp_prices") or signal_payload.get("take_profits", []),
+            signal_payload.get("macro_trend_5m", 0.0) * 100,
+            signal_payload.get("macro_trend_15m", 0.0) * 100,
         )
 
     def _score_symbol(self, symbol: str, buf):
-        """Run ONNX inference and return (direction, confidence, vol_mult, trap_prob, state_vec, regime, memory_info)."""
+        """Run ONNX inference and return (direction, confidence, vol_mult, trap_prob, state_vec, regime, memory_info, v_memory)."""
         ob_seq = buf.orderbook_sequence()
         flow_seq = buf.flow_sequence()
         macro = buf.feature_vector()
 
         v_state = self.inference.infer_state_vector(ob_seq, flow_seq, macro)
         regime = self.regime.get(symbol)
-        v_memory, memory_info = self.memory.query_with_metadata(v_state, regime.value)
+        v_memory, memory_info = self.memory.query_with_metadata(v_state, regime.value, symbol=symbol)
 
         direction, confidence, vol_mult, trap_prob = self.inference.decide(v_state, v_memory)
         vol_mult = min(max(vol_mult, 0.5), self.cfg.vol_multiplier_cap)
-        return direction, confidence, vol_mult, trap_prob, v_state, regime, memory_info
+        return direction, confidence, vol_mult, trap_prob, v_state, regime, memory_info, v_memory
 
     def _obi_against(self, direction: str, buf) -> bool:
         obi = buf.order_book_imbalance()
@@ -829,7 +934,7 @@ class MLEngine:
         if open_pos is None or open_pos.get("decay_signaled"):
             return None
 
-        direction, confidence, vol_mult, trap_prob, v_state, regime, _ = self._score_symbol(symbol, buf)
+        direction, confidence, vol_mult, trap_prob, v_state, regime, _, _ = self._score_symbol(symbol, buf)
         self._stats["predictions"] += 1
         prom.confidence_score.labels(symbol=symbol).set(confidence)
 
@@ -873,7 +978,7 @@ class MLEngine:
         if pending is None or pending.get("abort_signaled"):
             return None
 
-        direction, confidence, vol_mult, trap_prob, v_state, regime, _ = self._score_symbol(symbol, buf)
+        direction, confidence, vol_mult, trap_prob, v_state, regime, _, _ = self._score_symbol(symbol, buf)
         self._stats["predictions"] += 1
         prom.confidence_score.labels(symbol=symbol).set(confidence)
 
@@ -931,7 +1036,7 @@ class MLEngine:
     def _run_tick_prediction(self, symbol: str, buf) -> dict | None:
         """CPU-bound ONNX inference — runs in a thread pool to keep the event loop responsive."""
         tick_start = time.time()
-        direction, confidence, vol_mult, trap_prob, v_state, regime, mem_info = self._score_symbol(symbol, buf)
+        direction, confidence, vol_mult, trap_prob, v_state, regime, mem_info, v_memory = self._score_symbol(symbol, buf)
         self._stats["predictions"] += 1
         self._tick_cycle_predictions += 1
         corr = self.features.correlation_with_btc(symbol)
@@ -972,16 +1077,18 @@ class MLEngine:
         # Direction gate: DISABLED while data insufficient
         # When FAISS has 500+ entries, re-enable with relaxed thresholds
 
-        # Pattern Memory: logging only — don't block while data is insufficient
+        # Pattern Memory: block trades with similar losing patterns
         if direction != "HOLD" and not cycle_limit_reached:
             should_avoid, avg_loss = self._online_learner.pattern_memory.should_avoid(
                 v_state, regime.value, direction,
             )
             if should_avoid:
-                logger.info(
-                    "PATTERN MEMORY LOG: %s %s for %s (avg_loss=%.4f, NOT blocking)",
+                self._stats["pattern_blocks"] += 1
+                logger.warning(
+                    "PATTERN MEMORY BLOCK: %s %s for %s (avg_loss=%.4f)",
                     direction, symbol, regime.value, avg_loss,
                 )
+                return None
 
         prom.confidence_score.labels(symbol=symbol).set(confidence)
         prom.volatility_multiplier.labels(symbol=symbol).set(vol_mult)
@@ -1001,6 +1108,17 @@ class MLEngine:
         trend_15m = buf.macro_trend(900)
         bullish = trend_5m > self.cfg.bullish_trend_threshold and trend_15m > 0
 
+        # Hard trend filter: block SHORT in strong uptrend, LONG in strong downtrend
+        # Counter-trend flip: if SHORT blocked by uptrend, try LONG instead
+        if direction == "SHORT" and trend_5m > 0.003:
+            logger.info("Trend flip: %s SHORT→LONG (trend_5m=%.4f%% > 0.3%%)",
+                       symbol, trend_5m * 100)
+            direction = "LONG"
+        if direction == "LONG" and trend_5m < -0.003:
+            logger.info("Trend flip: %s LONG→SHORT (trend_5m=%.4f%% < -0.3%%)",
+                       symbol, trend_5m * 100)
+            direction = "SHORT"
+
         # Only relax when: bullish trend + model shows positive long EV + confidence >= 0.50
         long_ev = mem_info.get("long_avg_pnl", 0.0)
         long_matches = mem_info.get("long_matches", 0)
@@ -1019,6 +1137,29 @@ class MLEngine:
             self._stats["hold_low_conf"] += 1
             return None
 
+        dynamic_sl = mem_info.get("dynamic_sl_pct", 0.0)
+        dynamic_tp = mem_info.get("dynamic_tp_pct", 0.0)
+        salvageable = mem_info.get("salvageable_count", 0)
+        unsalvageable = mem_info.get("unsalvageable_count", 0)
+        salvageable_ratio = salvageable / max(salvageable + unsalvageable, 1)
+
+        exit_sl, exit_tp, trade_score = self.inference.infer_exit_params(
+            v_state, v_memory[:8] if len(v_memory) >= 8 else np.zeros(8),
+            direction, regime.value, confidence, vol_mult,
+            dynamic_sl, dynamic_tp, salvageable_ratio,
+        )
+
+        exit_sl = max(min(exit_sl, self.cfg.max_sl_pct), self.cfg.min_sl_pct)
+        exit_tp = max(min(exit_tp, self.cfg.max_tp_pct), self.cfg.min_tp_pct)
+
+        if dynamic_sl > 0 and dynamic_sl < exit_sl and dynamic_sl >= self.cfg.min_sl_pct:
+            exit_sl = dynamic_sl
+        if dynamic_tp > 0 and dynamic_tp < exit_tp and dynamic_tp >= self.cfg.min_tp_pct:
+            exit_tp = dynamic_tp
+
+        logger.info("ExitOptimizer: %s sl=%.3f%% tp=%.3f%% score=%.3f (regime=%s conf=%.3f)",
+                    symbol, exit_sl * 100, exit_tp * 100, trade_score, regime.value, confidence)
+
         exit_plan = build_exit_plan(
             direction,
             buf.latest_bids,
@@ -1029,10 +1170,10 @@ class MLEngine:
             fallback_mid=buf.last_mid(),
             vol_multiplier_cap=self.cfg.vol_multiplier_cap,
             entry_maker_ticks=self.cfg.entry_maker_ticks,
-            min_tp_pct=self.cfg.min_tp_pct,
+            min_tp_pct=exit_tp * 0.8,
             fee_breakeven_pct=self.cfg.fee_breakeven_pct,
-            max_tp_pct=self.cfg.max_tp_pct,
-            max_sl_pct=self.cfg.max_sl_pct,
+            max_tp_pct=exit_tp,
+            max_sl_pct=exit_sl,
             macro_trend_5m=buf.macro_trend(300),
             macro_trend_15m=buf.macro_trend(900),
         )
@@ -1056,9 +1197,14 @@ class MLEngine:
         dynamic_sl = mem_info.get("dynamic_sl_pct", 0.0)
         dynamic_tp = mem_info.get("dynamic_tp_pct", 0.0)
         salvageable = mem_info.get("salvageable_count", 0)
-        unsalvageable = mem_info.get("unsalvageable_count", 0)
+        unsalvageable = mem_info.get("unsalvage_count", 0)
 
-        if dynamic_sl > 0:
+        if exit_sl > 0 and exit_tp > 0:
+            signal["dynamic_sl_pct"] = exit_sl
+            signal["dynamic_tp_pct"] = exit_tp
+            logger.info("ExitOptimizer: %s SL=%.3f%% TP=%.3f%% score=%.3f",
+                        symbol, exit_sl * 100, exit_tp * 100, trade_score)
+        elif dynamic_sl > 0:
             signal["dynamic_sl_pct"] = dynamic_sl
             signal["dynamic_tp_pct"] = dynamic_tp
             logger.info("Parametric Memory: %s SL=%.3f%% TP=%.3f%% (salv=%d unsalv=%d)",
@@ -1071,4 +1217,21 @@ class MLEngine:
             if exit_plan.get("tp_prices"):
                 signal["tp_prices"] = exit_plan["tp_prices"]
             signal["wall_price"] = exit_plan.get("wall_price", 0.0)
+            trend_penalty = exit_plan.get("trend_penalty", 0.0)
+            if trend_penalty > 0:
+                trade_score = max(0.0, trade_score - trend_penalty)
+                signal["trade_score"] = trade_score
+                logger.info("Trend penalty applied: %s penalty=%.3f adjusted_score=%.3f",
+                           symbol, trend_penalty, trade_score)
+
+        signal["exit_opt_sl_pct"] = exit_sl
+        signal["exit_opt_tp_pct"] = exit_tp
+        signal["exit_trade_score"] = trade_score
+
+        if trade_score < 0.3:
+            self._stats["hold_low_conf"] += 1
+            logger.info("ExitOptimizer LOW SCORE: %s score=%.3f sl=%.3f%% tp=%.3f%% (signal blocked)",
+                        symbol, trade_score, exit_sl * 100, exit_tp * 100)
+            return None
+
         return signal

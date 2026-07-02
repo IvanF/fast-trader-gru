@@ -2,7 +2,97 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any, Callable
+
 from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
+
+logger = logging.getLogger(__name__)
+
+_health_check: Callable[[], dict[str, Any]] | None = None
+_exit_plan_handler: Callable[[dict], dict[str, Any]] | None = None
+_httpd: HTTPServer | None = None
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        if self.path not in ("/health", "/healthz"):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        if _health_check is None:
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "error", "reason": "health_check_not_registered"}).encode())
+            return
+
+        try:
+            status = _health_check()
+        except Exception as exc:
+            status = {"status": "error", "reason": str(exc)}
+
+        healthy = status.get("status") == "ok"
+        code = 200 if healthy else 503
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(status).encode())
+
+    def do_POST(self) -> None:
+        if self.path != "/exit-plan":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        if _exit_plan_handler is None:
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "exit_plan_handler_not_registered"}).encode())
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            request = json.loads(body) if body else {}
+            result = _exit_plan_handler(request)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        except Exception as exc:
+            logger.exception("exit-plan handler error")
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(exc)}).encode())
+
+
+def register_health_check(check: Callable[[], dict[str, Any]]) -> None:
+    global _health_check
+    _health_check = check
+
+
+def register_exit_plan_handler(handler: Callable[[dict], dict[str, Any]]) -> None:
+    global _exit_plan_handler
+    _exit_plan_handler = handler
+
+
+def start_health_server(port: int) -> None:
+    global _httpd
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    _httpd = server
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    logger.info("health server listening on :%d", port)
 
 confidence_score = Gauge("ml_confidence_score", "Latest confidence score", ["symbol"])
 volatility_multiplier = Gauge("ml_volatility_multiplier", "Latest volatility multiplier", ["symbol"])

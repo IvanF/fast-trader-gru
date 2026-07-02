@@ -32,6 +32,7 @@ class Config:
     min_tp_pct: float
     max_tp_pct: float
     fee_breakeven_pct: float
+    min_sl_pct: float
     max_sl_pct: float
     entry_maker_ticks: int
     buffer_seconds: int
@@ -80,26 +81,27 @@ class Config:
             metrics_addr=os.getenv("METRICS_ADDR", ":9103"),
             model_dir=os.getenv("MODEL_DIR", "/app/models"),
             faiss_path=os.getenv("FAISS_PATH", "/app/data/faiss_index"),
-            confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.30")),
-            kill_confidence_threshold=float(os.getenv("KILL_CONFIDENCE_THRESHOLD", "0.35")),
-            entry_abort_threshold=float(os.getenv("ENTRY_ABORT_THRESHOLD", "0.50")),
+            confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.55")),
+            kill_confidence_threshold=float(os.getenv("KILL_CONFIDENCE_THRESHOLD", "0.45")),
+            entry_abort_threshold=float(os.getenv("ENTRY_ABORT_THRESHOLD", "0.60")),
             adverse_confirm_ticks=int(os.getenv("ADVERSE_CONFIRM_TICKS", os.getenv("DECAY_OBI_MIN_TICKS", "3"))),
             direction_flip_confirm_ticks=int(os.getenv("DIRECTION_FLIP_CONFIRM_TICKS", "5")),
             decay_obi_threshold=float(os.getenv("DECAY_OBI_THRESHOLD", "0.30")),
             max_signal_confidence=float(os.getenv("MAX_SIGNAL_CONFIDENCE", "0.98")),
             blacklist_symbols=cls._parse_symbol_set(os.getenv("BLACKLIST_SYMBOLS", "")),
             vol_multiplier_cap=float(os.getenv("VOL_MULTIPLIER_CAP", "2.0")),
-            min_tp_pct=float(os.getenv("MIN_TP_PCT", "0.002")),
-            max_tp_pct=float(os.getenv("MAX_TP_PCT", "0.008")),
+            min_tp_pct=float(os.getenv("MIN_TP_PCT", "0.004")),
+            max_tp_pct=float(os.getenv("MAX_TP_PCT", "0.015")),
             fee_breakeven_pct=float(os.getenv("FEE_BREAKEVEN_PCT", "0.0015")),
-            max_sl_pct=float(os.getenv("MAX_SL_PCT", "0.012")),
+            min_sl_pct=float(os.getenv("MIN_SL_PCT", "0.004")),
+            max_sl_pct=float(os.getenv("MAX_SL_PCT", "0.008")),
             entry_maker_ticks=int(os.getenv("ENTRY_MAKER_TICKS", "2")),
             buffer_seconds=int(os.getenv("BUFFER_SECONDS", "300")),
             regime_interval_sec=int(os.getenv("REGIME_INTERVAL_SEC", "60")),
             correlation_threshold=float(os.getenv("CORRELATION_THRESHOLD", "0.85")),
             bullish_trend_threshold=float(os.getenv("BULLISH_TREND_THRESHOLD", "0.0005")),
-            bullish_long_conf_threshold=float(os.getenv("BULLISH_LONG_CONF_THRESHOLD", "0.20")),
-            long_confidence_threshold=float(os.getenv("LONG_CONFIDENCE_THRESHOLD", "0.50")),
+            bullish_long_conf_threshold=float(os.getenv("BULLISH_LONG_CONF_THRESHOLD", "0.55")),
+            long_confidence_threshold=float(os.getenv("LONG_CONFIDENCE_THRESHOLD", "0.65")),
             memory_decay_days=int(os.getenv("MEMORY_DECAY_DAYS", "14")),
             faiss_persist_interval_sec=int(os.getenv("FAISS_PERSIST_INTERVAL_SEC", "300")),
             state_dim=int(os.getenv("STATE_DIM", "128")),

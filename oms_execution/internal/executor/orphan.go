@@ -1,7 +1,11 @@
 package executor
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
+	"net/http"
 	"time"
 
 	"github.com/fast-trader-gru/oms_execution/internal/bybit"
@@ -60,6 +64,73 @@ func (s *Service) tryAdoptOrphan(ctx context.Context, exPos bybit.PositionInfo) 
 	s.adoptExchangePosition(ctx, exPos, "orphan_scan")
 }
 
+func (s *Service) requestExitPlanFromML(ctx context.Context, symbol, direction string, ob models.OrderbookSnapshot, tickSize float64) map[string]interface{} {
+	mlURL := "http://ftg-ml-engine:10103/exit-plan"
+	s.logger.Info("requesting exit plan from ML", "symbol", symbol, "direction", direction)
+
+	type orderbookLevel struct {
+		Price string `json:"price"`
+		Size  string `json:"size"`
+	}
+	type exitPlanRequest struct {
+		Direction     string           `json:"direction"`
+		Bids          []orderbookLevel `json:"bids"`
+		Asks          []orderbookLevel `json:"asks"`
+		TickSize      float64          `json:"tick_size"`
+		VolMultiplier float64          `json:"volatility_multiplier"`
+		Regime        string           `json:"regime"`
+		Confidence    float64          `json:"confidence"`
+	}
+
+	req := exitPlanRequest{
+		Direction:     direction,
+		TickSize:      tickSize,
+		VolMultiplier: 1.0,
+		Regime:        "Choppy",
+		Confidence:    s.cfg.ConfidenceThreshold,
+	}
+	for _, l := range ob.Bids {
+		req.Bids = append(req.Bids, orderbookLevel{Price: l.Price, Size: l.Size})
+	}
+	for _, l := range ob.Asks {
+		req.Asks = append(req.Asks, orderbookLevel{Price: l.Price, Size: l.Size})
+	}
+
+	body, _ := json.Marshal(req)
+	httpCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(httpCtx, "POST", mlURL, bytes.NewReader(body))
+	if err != nil {
+		s.logger.Warn("exit-plan request failed", "symbol", symbol, "error", err)
+		return nil
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		s.logger.Warn("exit-plan request failed", "symbol", symbol, "error", err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		s.logger.Warn("exit-plan request returned non-200", "symbol", symbol, "status", resp.StatusCode)
+		return nil
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		s.logger.Warn("exit-plan response parse failed", "symbol", symbol, "error", err)
+		return nil
+	}
+	if _, ok := result["error"]; ok {
+		s.logger.Warn("exit-plan returned error", "symbol", symbol, "error", result["error"])
+		return nil
+	}
+	return result
+}
+
 func (s *Service) adoptExchangePosition(ctx context.Context, exPos bybit.PositionInfo, reason string) {
 	direction := "LONG"
 	switch exPos.Side {
@@ -115,6 +186,27 @@ func (s *Service) adoptExchangePosition(ctx context.Context, exPos bybit.Positio
 		}
 	}
 	plan.StopLoss = grid.EnforceMinSLDistance(fillPrice, plan.StopLoss, direction, minSLPct, inst.TickSize)
+
+	if exitPlan := s.requestExitPlanFromML(context.Background(), exPos.Symbol, direction, ob, inst.TickSize); exitPlan != nil {
+		if sl, ok := exitPlan["stop_loss"].(float64); ok && sl > 0 {
+			plan.StopLoss = sl
+			signal.StopLoss = sl
+		}
+		if tps, ok := exitPlan["take_profits"].([]interface{}); ok && len(tps) > 0 {
+			floatTPs := make([]float64, 0, len(tps))
+			for _, tp := range tps {
+				if f, ok := tp.(float64); ok && f > 0 {
+					floatTPs = append(floatTPs, f)
+				}
+			}
+			if len(floatTPs) > 0 {
+				signal.TakeProfits = floatTPs
+				plan.TakeProfits = floatTPs
+				s.logger.Info("orphan exit plan from ML",
+					"symbol", exPos.Symbol, "tps", floatTPs, "sl", plan.StopLoss)
+			}
+		}
+	}
 
 	notional := qty * fillPrice
 	marginUSD := notional / float64(max(leverage, 1))

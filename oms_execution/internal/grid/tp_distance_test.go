@@ -6,18 +6,20 @@ import (
 )
 
 func TestFeeAwareBreakevenLong(t *testing.T) {
-	price := FeeAwareBreakevenPrice(100.0, "LONG", 0.0015, 0.01)
-	want := 100.15
-	if price < want-1e-9 {
-		t.Fatalf("fee-aware breakeven LONG: got %.4f want >= %.4f", price, want)
+	price := FeeAwareBreakevenPrice(100.0, "LONG", 0.0015, 0.01, 0.00055, 0.0002)
+	// Correct formula: 100 * (1+0.00055) / (1-0.0002) = 100.0770
+	// Old (symmetric): 100 * 1.0015 = 100.15
+	if price < 100.07-1e-9 {
+		t.Fatalf("fee-aware breakeven LONG: got %.4f want >= 100.07", price)
 	}
 }
 
 func TestFeeAwareBreakevenShort(t *testing.T) {
-	price := FeeAwareBreakevenPrice(100.0, "SHORT", 0.0015, 0.01)
-	want := 99.85
-	if price > want+1e-9 {
-		t.Fatalf("fee-aware breakeven SHORT: got %.4f want <= %.4f", price, want)
+	price := FeeAwareBreakevenPrice(100.0, "SHORT", 0.0015, 0.01, 0.00055, 0.0002)
+	// Correct formula: 100 * (1-0.00055) / (1+0.0002) = 99.9250
+	// Old (symmetric): 100 * 0.9985 = 99.85
+	if price > 99.93+1e-9 {
+		t.Fatalf("fee-aware breakeven SHORT: got %.4f want <= 99.93", price)
 	}
 }
 
@@ -44,8 +46,9 @@ func TestFilterTPLevelsByMaxDistanceShort(t *testing.T) {
 
 func TestApplyTPPriceFloorsBreakeven(t *testing.T) {
 	levels := []ExitLevel{{Price: 100.01, Qty: 1, Kind: "breakeven"}}
-	out := applyTPPriceFloors("LONG", 100.0, levels, 0.002, 0.0015, 0.01)
-	if out[0].Price < 100.15-1e-9 {
+	out := applyTPPriceFloors("LONG", 100.0, levels, 0.002, 0.0015, 0.01, 0.00055, 0.0002)
+	// Correct breakeven: 100 * (1+0.00055) / (1-0.0002) = 100.0770
+	if out[0].Price < 100.07-1e-9 {
 		t.Fatalf("breakeven floor not applied: got %.4f", out[0].Price)
 	}
 }

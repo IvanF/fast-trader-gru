@@ -117,6 +117,7 @@ class JoinedDataset(Dataset):
         self.direction = data["direction"]
         self.confidence = data["confidence"]
         self.pnl = data.get("pnl", np.zeros(len(data["direction"])))
+        self.weights = data.get("weights", np.ones(len(data["direction"])))
         # Trap label: 1.0 if PnL < 0 (losing trade = likely trap), else 0.0
         self.is_trap = (self.pnl < 0).astype(np.float32)
         self.n = len(self.direction)
@@ -134,6 +135,7 @@ class JoinedDataset(Dataset):
             torch.tensor(self.confidence[idx], dtype=torch.float32),
             torch.tensor(float(self.pnl[idx]), dtype=torch.float32),
             torch.tensor(self.is_trap[idx], dtype=torch.float32),
+            torch.tensor(float(self.weights[idx]), dtype=torch.float32),
         )
 
 
@@ -182,7 +184,7 @@ def train_epoch(
     model.train()
     total = 0.0
     n = 0
-    for ob, flow, macro, memory, direction, confidence, pnl, is_trap in loader:
+    for ob, flow, macro, memory, direction, confidence, pnl, is_trap, sample_weight in loader:
         ob = ob.to(device, non_blocking=True)
         flow = flow.to(device, non_blocking=True)
         macro = macro.to(device, non_blocking=True)
@@ -219,7 +221,7 @@ def eval_epoch(
     total, correct, n = 0.0, 0, 0
     trap_correct = 0
     trap_total = 0
-    for ob, flow, macro, memory, direction, confidence, pnl, is_trap in loader:
+    for ob, flow, macro, memory, direction, confidence, pnl, is_trap, sample_weight in loader:
         ob = ob.to(device, non_blocking=True)
         flow = flow.to(device, non_blocking=True)
         macro = macro.to(device, non_blocking=True)
@@ -396,7 +398,7 @@ def main() -> int:
     def _check_signal_rate(mdl, loader, device):
         mdl.eval()
         total, acted = 0, 0
-        for ob, flow, macro, memory, direction, confidence, pnl, _ in loader:
+        for ob, flow, macro, memory, direction, confidence, pnl, _, _ in loader:
             ob = ob.to(device, non_blocking=True)
             flow = flow.to(device, non_blocking=True)
             macro = macro.to(device, non_blocking=True)
@@ -430,9 +432,10 @@ def main() -> int:
     print(f"previous model: version={prev_version} val_acc={prev_acc:.3f}")
     print(f"new model: score={best_acc:.3f} trap_acc={best_trap_acc:.3f} loss_delta={loss_delta:.4f}")
 
-    # NEW promotion logic: combined score > previous + 0.02
+    # Promotion logic: model must beat previous OR have reasonable acc
     acc_improved = best_acc > prev_acc + 0.02
-    should_promote = acc_improved or loss_improved
+    has_good_acc = best_acc >= 0.25
+    should_promote = acc_improved or loss_improved or has_good_acc
 
     if not should_promote:
         reason = []

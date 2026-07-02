@@ -162,6 +162,7 @@ services:
       RETRAIN_LOOKBACK_HOURS: ${RETRAIN_LOOKBACK_HOURS:-6}
       RETRAIN_EPOCHS: ${RETRAIN_EPOCHS:-8}
       RETRAIN_TIMEOUT_SEC: ${RETRAIN_TIMEOUT_SEC:-3600}
+      RETRAIN_MIN_VAL_ACC: ${RETRAIN_MIN_VAL_ACC:-0.25}
       TRAIN_NICE_LEVEL: ${TRAIN_NICE_LEVEL:-15}
       TRAIN_DEVICE: ${TRAIN_DEVICE:-cuda}
       TELEMETRY_INTERVAL_SEC: ${TELEMETRY_INTERVAL_SEC:-5}
@@ -170,6 +171,7 @@ services:
       MOVEMENT_PROB_BIAS: ${MOVEMENT_PROB_BIAS:-}
       LOSS_PENALTY_WEIGHT: ${LOSS_PENALTY_WEIGHT:-2.5}
       RETRAIN_DEFAULT_SYMBOLS: ${RETRAIN_DEFAULT_SYMBOLS:-BTCUSDT,ETHUSDT}
+      HEALTH_PORT: "10103"
       NVIDIA_VISIBLE_DEVICES: all
       ORT_DISABLE_CPU_AFFINITY: "1"
       ORT_INTRA_OP_THREADS: ${ORT_INTRA_OP_THREADS:-4}
@@ -184,6 +186,14 @@ services:
         condition: service_started
       influxdb:
         condition: service_healthy
+    ports:
+      - "10103:10103"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:10103/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     cpuset: "3-6"
     networks:
       - ftg-net
@@ -240,22 +250,6 @@ services:
       INFLUX_ORG: ${INFLUX_ORG:-fasttrader}
       INFLUX_BUCKET_RAW: ${INFLUX_BUCKET_RAW:-market_raw}
       METRICS_ADDR: ":9102"
-      # Per-symbol overrides — Microcap Snipe strategy
-      LAB_MIN_SL_PCT: ${LAB_MIN_SL_PCT:-0.015}
-      LAB_MAX_SL_PCT: ${LAB_MAX_SL_PCT:-0.025}
-      LAB_TRADE_MARGIN_USD: ${LAB_TRADE_MARGIN_USD:-5}
-      LAB_LEVERAGE: ${LAB_LEVERAGE:-3}
-      LAB_TIME_STOP_SECONDS: ${LAB_TIME_STOP_SECONDS:-300}
-      BTW_MIN_SL_PCT: ${BTW_MIN_SL_PCT:-0.015}
-      BTW_MAX_SL_PCT: ${BTW_MAX_SL_PCT:-0.025}
-      BTW_TRADE_MARGIN_USD: ${BTW_TRADE_MARGIN_USD:-5}
-      BTW_LEVERAGE: ${BTW_LEVERAGE:-3}
-      BTW_TIME_STOP_SECONDS: ${BTW_TIME_STOP_SECONDS:-300}
-      UB_MIN_SL_PCT: ${UB_MIN_SL_PCT:-0.015}
-      UB_MAX_SL_PCT: ${UB_MAX_SL_PCT:-0.025}
-      UB_TRADE_MARGIN_USD: ${UB_TRADE_MARGIN_USD:-5}
-      UB_LEVERAGE: ${UB_LEVERAGE:-3}
-      UB_TIME_STOP_SECONDS: ${UB_TIME_STOP_SECONDS:-300}
     depends_on:
       redis:
         condition: service_healthy

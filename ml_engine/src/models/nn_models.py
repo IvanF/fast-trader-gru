@@ -124,3 +124,33 @@ class TradingModel(nn.Module):
         state = self.fusion(ob_seq, flow_seq, macro)
         logits = self.decision(torch.cat([state, v_memory], dim=-1))
         return state, logits
+
+
+EXIT_OPT_IN_DIM = STATE_DIM + MEMORY_DIM + 13
+
+
+class ExitOptimizer(nn.Module):
+    """Predicts optimal SL/TP distances and trade score from market state.
+
+    Input: state_vector(128) + memory(8) + extras(12) = 148
+    Output: sl_pct, tp_pct, trade_score
+    """
+
+    def __init__(self, in_dim: int = EXIT_OPT_IN_DIM, dropout: float = 0.3) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 3),
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        raw = self.net(x)
+        sl_pct = torch.sigmoid(raw[:, 0]) * 0.015
+        tp_pct = torch.sigmoid(raw[:, 1]) * 0.05
+        trade_score = torch.sigmoid(raw[:, 2])
+        return sl_pct, tp_pct, trade_score

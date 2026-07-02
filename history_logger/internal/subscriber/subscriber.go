@@ -3,6 +3,7 @@ package subscriber
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync/atomic"
@@ -128,13 +129,14 @@ func decode(raw []byte, dest any) bool {
 
 // ExecutionResult represents a closed trade from OMS.
 type ExecutionResult struct {
-	SignalID  string  `json:"signal_id"`
-	Symbol    string  `json:"symbol"`
-	Direction string  `json:"direction"`
-	EntryPx   float64 `json:"entry_price"`
-	ExitPx    float64 `json:"exit_price"`
-	PnL       float64 `json:"net_pnl"`
-	Reason    string  `json:"close_reason"`
+	SignalID    string  `json:"signal_id"`
+	Symbol      string  `json:"symbol"`
+	Direction   string  `json:"direction"`
+	EntryPx     float64 `json:"entry_price"`
+	ExitPx      float64 `json:"exit_price"`
+	PnL         float64 `json:"net_pnl"`
+	Reason      string  `json:"close_reason"`
+	ExchangePnL bool    `json:"exchange_pnl"`
 }
 
 func (s *Service) listenExecutionResults(ctx context.Context) {
@@ -159,6 +161,8 @@ func (s *Service) listenExecutionResults(ctx context.Context) {
 		if tradeID == "" {
 			tradeID = result.Symbol
 		}
+		// Composite key: exchange and shadow trades share same SignalID
+		tradeID = fmt.Sprintf("%s:%v", tradeID, result.ExchangePnL)
 		s.tracker.StartTracking(tradeID, result.Symbol, result.Direction, result.EntryPx, 30*time.Minute)
 		s.logger.Info("started MAE/MFE tracking",
 			"trade_id", tradeID,

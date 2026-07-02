@@ -106,33 +106,47 @@ def _detect_knife_conditions(
     obi: float,
     regime: str,
     direction: str,
-) -> tuple[bool, float]:
-    """Detect if market is in a knife condition (rapid adverse movement)."""
+) -> tuple[bool, float, float]:
+    """Detect if market is in a knife condition (adverse trend).
+    
+    Returns: (is_knife, tighten_factor, trend_penalty)
+    - tighten_factor: multiply SL and TP distances by this (lower = tighter)
+    - trend_penalty: subtract from trade_score (0.0 = no penalty)
+    """
     knife_score = 0.0
 
     if direction == "LONG":
-        if macro_trend_5m < -0.003:
-            knife_score += 0.4
-        if macro_trend_15m < -0.008:
+        if macro_trend_5m < -0.001:
             knife_score += 0.3
-        if obi < -0.2:
+        if macro_trend_5m < -0.003:
             knife_score += 0.2
-        if regime == "Breakout" and macro_trend_5m < -0.002:
+        if macro_trend_15m < -0.005:
+            knife_score += 0.3
+        if macro_trend_15m < -0.010:
+            knife_score += 0.1
+        if obi < -0.2:
+            knife_score += 0.1
+        if regime == "Breakout" and macro_trend_5m < -0.001:
             knife_score += 0.1
     else:
-        if macro_trend_5m > 0.003:
-            knife_score += 0.4
-        if macro_trend_15m > 0.008:
+        if macro_trend_5m > 0.001:
             knife_score += 0.3
-        if obi > 0.2:
+        if macro_trend_5m > 0.003:
             knife_score += 0.2
-        if regime == "Breakout" and macro_trend_5m > 0.002:
+        if macro_trend_15m > 0.005:
+            knife_score += 0.3
+        if macro_trend_15m > 0.010:
+            knife_score += 0.1
+        if obi > 0.2:
+            knife_score += 0.1
+        if regime == "Breakout" and macro_trend_5m > 0.001:
             knife_score += 0.1
 
-    if knife_score >= 0.5:
-        tighten = max(0.3, 1.0 - knife_score * 0.8)
-        return True, tighten
-    return False, 1.0
+    if knife_score >= 0.4:
+        tighten = max(0.25, 1.0 - knife_score * 0.8)
+        trend_penalty = min(0.3, knife_score * 0.3)
+        return True, tighten, trend_penalty
+    return False, 1.0, 0.0
 
 
 def build_exit_plan(
@@ -182,7 +196,7 @@ def build_exit_plan(
         if total > 0:
             obi = (bid_vol - ask_vol) / total
 
-    is_knife, knife_tighten = _detect_knife_conditions(
+    is_knife, knife_tighten, trend_penalty = _detect_knife_conditions(
         macro_trend_5m, macro_trend_15m, obi, regime, direction,
     )
 
@@ -196,13 +210,13 @@ def build_exit_plan(
     entry = _round_tick(entry, tick)
 
     # SL: liquidity-aware, beyond support/resistance walls, scaled by vol_mult
-    sl_min_pct = 0.003 * vol_mult
+    sl_min_pct = 0.004 * vol_mult
     sl_max_pct = max_sl_pct * vol_mult
     sl = compute_liquidity_sl(
         direction, bids, asks, entry, tick,
         min_sl_distance_pct=sl_min_pct,
         max_sl_distance_pct=sl_max_pct,
-        hard_max_sl_pct=0.015,
+        hard_max_sl_pct=0.008,
     )
     if sl <= 0:
         # Fallback: use percentage-based SL
@@ -211,13 +225,8 @@ def build_exit_plan(
         else:
             sl = _round_tick(entry * (1 + max_sl_pct), tick)
 
-    # Knife: tighten SL
-    if is_knife and knife_tighten < 1.0:
-        sl_dist = abs(entry - sl)
-        if direction == "LONG":
-            sl = entry - sl_dist * knife_tighten
-        else:
-            sl = entry + sl_dist * knife_tighten
+    # Knife: do NOT tighten SL — entering against trend needs wider stop to avoid noise.
+    # Only tighten TP to take quicker profits.
 
     # TP: liquidity-aware, near walls, fee-compensated
     tp_prices = compute_liquidity_tp_prices(
@@ -228,11 +237,23 @@ def build_exit_plan(
 
     # Fallback: if no liquidity TPs found, use fee-compensated minimum
     if not tp_prices:
-        min_profit_pct = MIN_PROFITABLE_MOVE_PCT * 1.5  # 1.5x fees
+        min_profit_pct = max(min_tp_pct, MIN_PROFITABLE_MOVE_PCT * 3.0)  # 3x fees minimum
         if direction == "LONG":
             tp_prices = [_round_tick(entry * (1 + min_profit_pct), tick)]
         else:
             tp_prices = [_round_tick(entry * (1 - min_profit_pct), tick)]
+
+    # Knife: tighten TP distances (closer to entry when against trend)
+    if is_knife and knife_tighten < 1.0:
+        tightened_tps = []
+        for tp in tp_prices:
+            tp_dist = abs(tp - entry)
+            new_dist = tp_dist * knife_tighten
+            if direction == "LONG":
+                tightened_tps.append(_round_tick(entry + new_dist, tick))
+            else:
+                tightened_tps.append(_round_tick(entry - new_dist, tick))
+        tp_prices = tightened_tps
 
     # Build result
     result = {
@@ -240,6 +261,7 @@ def build_exit_plan(
         "stop_loss": sl,
         "take_profits": tp_prices,
         "wall_price": 0.0,
+        "trend_penalty": trend_penalty,
         "fee_info": {
             "entry_fee_pct": ENTRY_FEE_PCT,
             "exit_fee_pct": EXIT_FEE_PCT,

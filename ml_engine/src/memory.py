@@ -19,6 +19,7 @@ class MemoryEntry:
     timestamp: float
     regime: str
     won: bool
+    symbol: str = ""
     direction: str = "HOLD"
     optimal_sl_pct: float = 0.0
     optimal_tp_pct: float = 0.0
@@ -26,6 +27,7 @@ class MemoryEntry:
     mae_pct: float = 0.0
     mfe_pct: float = 0.0
     trade_judge: str = "UNCERTAIN"
+    weight: float = 1.0
 
 
 class ExperienceEngine:
@@ -54,9 +56,10 @@ class ExperienceEngine:
             json.dump([e.__dict__ for e in self.metadata], f)
 
     def add(self, vector: np.ndarray, pnl: float, regime: str, direction: str = "HOLD",
-            mae_pct: float = 0.0, mfe_pct: float = 0.0, trade_judge: str = "UNCERTAIN") -> int:
-        # Block extreme outliers — allow moderate losses for learning
-        if pnl > 0.50 or pnl < -0.50:
+            symbol: str = "", mae_pct: float = 0.0, mfe_pct: float = 0.0,
+            trade_judge: str = "UNCERTAIN", weight: float = 1.0) -> int:
+        # Block extreme positive outliers (lucky wins) — allow extreme losses for learning
+        if pnl > 0.50:
             return -1
 
         # Block near-zero noise
@@ -81,6 +84,7 @@ class ExperienceEngine:
             timestamp=time.time(),
             regime=regime,
             won=pnl >= 0,
+            symbol=symbol,
             direction=direction.upper() if direction else "HOLD",
             optimal_sl_pct=optimal_sl,
             optimal_tp_pct=optimal_tp,
@@ -88,6 +92,7 @@ class ExperienceEngine:
             mae_pct=mae_pct,
             mfe_pct=mfe_pct,
             trade_judge=trade_judge,
+            weight=weight,
         ))
         return vid
 
@@ -99,12 +104,10 @@ class ExperienceEngine:
 
     def query(self, vector: np.ndarray, current_regime: str, k: int = 10) -> Tuple[np.ndarray, dict]:
         if self.index.ntotal == 0:
-            v = np.zeros(10, dtype=np.float32)
+            v = np.zeros(8, dtype=np.float32)
             v[0] = 0.5
-            v[8] = 0.5
-            v[9] = 0.5
             return v, {"win_rate": 0.5, "avg_pnl": 0.0, "matches": 0, "long_win_rate": 0.5, "short_win_rate": 0.5,
-                   "long_avg_pnl": 0.0, "short_avg_pnl": 0.0, "long_matches": 0, "short_matches": 0}
+                       "long_avg_pnl": 0.0, "short_avg_pnl": 0.0, "long_matches": 0, "short_matches": 0}
 
         vec = vector.astype(np.float32).reshape(1, -1)
         faiss.normalize_L2(vec)
@@ -173,10 +176,13 @@ class ExperienceEngine:
     def size(self) -> int:
         return self.index.ntotal
 
-    def query_with_metadata(self, vector: np.ndarray, current_regime: str, k: int = 10) -> Tuple[np.ndarray, dict]:
+    def query_with_metadata(self, vector: np.ndarray, current_regime: str, k: int = 10, symbol: str = "") -> Tuple[np.ndarray, dict]:
         """Query FAISS and return v_memory + per-neighbor metadata (optimal SL/TP, salvageable)."""
         if self.index.ntotal == 0:
-            return np.zeros(8, dtype=np.float32), {"neighbors": [], "salvageable_count": 0, "unsalvageable_count": 0}
+            v = np.zeros(8, dtype=np.float32)
+            v[0] = 0.5
+            return v, {"neighbors": [], "salvageable_count": 0, "unsalvageable_count": 0,
+                       "dynamic_sl_pct": 0.0, "dynamic_tp_pct": 0.0}
 
         vec = vector.astype(np.float32).reshape(1, -1)
         faiss.normalize_L2(vec)
@@ -196,6 +202,7 @@ class ExperienceEngine:
             else:
                 unsalvageable_count += 1
             neighbors.append({
+                "symbol": entry.symbol,
                 "direction": entry.direction,
                 "pnl": entry.pnl,
                 "optimal_sl_pct": entry.optimal_sl_pct,
@@ -212,11 +219,12 @@ class ExperienceEngine:
         info["salvageable_count"] = salvageable_count
         info["unsalvageable_count"] = unsalvageable_count
 
-        # Compute dynamic SL/TP from salvageable neighbors
+        # Compute dynamic SL/TP from salvageable neighbors OF SAME SYMBOL
         salvageable = [n for n in neighbors if n["is_salvageable"]]
-        if salvageable:
-            avg_optimal_sl = sum(n["optimal_sl_pct"] for n in salvageable) / len(salvageable)
-            avg_optimal_tp = sum(n["optimal_tp_pct"] for n in salvageable) / len(salvageable)
+        same_symbol_salvageable = [n for n in salvageable if n["symbol"] == symbol]
+        if same_symbol_salvageable:
+            avg_optimal_sl = sum(n["optimal_sl_pct"] for n in same_symbol_salvageable) / len(same_symbol_salvageable)
+            avg_optimal_tp = sum(n["optimal_tp_pct"] for n in same_symbol_salvageable) / len(same_symbol_salvageable)
             info["dynamic_sl_pct"] = avg_optimal_sl
             info["dynamic_tp_pct"] = avg_optimal_tp
         else:
