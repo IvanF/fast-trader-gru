@@ -211,6 +211,8 @@ class HotSwapONNXInference:
     ) -> np.ndarray:
         with self._lock:
             bundle = self._bundle
+
+        # _run_cnn handles batch dimension — pass raw tensor
         cnn_out = self._run_cnn(bundle.cnn, ob_seq)
         gru_out = self._run_gru(bundle.gru, flow_seq)
         fused = np.concatenate([cnn_out, gru_out, macro_features], axis=-1).astype(np.float32)

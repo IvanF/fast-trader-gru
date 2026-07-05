@@ -602,6 +602,7 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 			s.priceHistory[signal.Symbol],
 			s.cfg.AccountDepositUSD,
 			signal.VolatilityMultiplier,
+			inst.TickSize,
 		)
 		if !riskResult.Approved {
 			s.logger.Info("RiskManager REJECTED",
@@ -1273,12 +1274,18 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 
 	s.retryMissingTakeProfits(ctx, pos, ob)
 
-	// Old timeStopLimitExit disabled — PositionManager handles Time-Stop via ATR-based triggers
-	// if elapsedMs(pos.EntryTime) > int64(pos.TimeStopSec)*1000 {
-	// 	s.timeStopLimitExit(ctx, pos, ob)
-	// } else {
-	// 	s.maybeExitBreakevenTimed(ctx, pos, ob)
-	// }
+	// HARD TIME-STOP: force close after 300 seconds regardless of R-level
+	const HardTimeStopSec = 300
+	holdSec := (time.Now().UnixMilli() - pos.EntryTime) / 1000
+	if holdSec > HardTimeStopSec && !pos.TimeStopPlaced {
+		s.logger.Warn("HARD TIME-STOP triggered",
+			"symbol", pos.Symbol,
+			"hold_sec", holdSec,
+			"limit_sec", HardTimeStopSec,
+		)
+		s.timeStopLimitExit(ctx, pos, ob)
+		return
+	}
 
 	if s.monitorExitOrders(ctx, pos) {
 		return

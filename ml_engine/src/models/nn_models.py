@@ -7,6 +7,7 @@ import torch.nn as nn
 
 SEQ_LEN = 60
 OB_DIM = 2
+OB_DEPTH = 20
 FLOW_DIM = 3
 MACRO_DIM = 22
 EMBED_DIM = 32
@@ -17,21 +18,27 @@ NUM_DIRECTIONS = 3
 
 
 class OrderbookCNN(nn.Module):
-    def __init__(self, out_dim: int = EMBED_DIM) -> None:
+    """2D CNN for spatial orderbook tensor (batch, 1, depth, seq_len).
+    
+    Analyzes patterns across both depth (levels) and time simultaneously.
+    Input: (batch, 1, OB_DEPTH, SEQ_LEN) — single channel, depth×time.
+    """
+    def __init__(self, depth: int = OB_DEPTH, seq_len: int = SEQ_LEN, out_dim: int = EMBED_DIM) -> None:
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv1d(OB_DIM, 16, kernel_size=3, padding=1),
+            nn.Conv2d(1, 16, kernel_size=(3, 3), padding=(1, 1)),
             nn.ReLU(),
-            nn.Conv1d(16, 32, kernel_size=3, padding=1),
+            nn.Conv2d(16, 32, kernel_size=(3, 3), padding=(1, 1)),
             nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
+            nn.AdaptiveAvgPool2d((1, 1)),
         )
         self.fc = nn.Linear(32, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.transpose(1, 2)
-        x = self.conv(x).squeeze(-1)
-        return self.fc(x)
+        # x: (batch, 1, depth, seq_len)
+        x = self.conv(x)  # (batch, 32, 1, 1)
+        x = x.squeeze(-1).squeeze(-1)  # (batch, 32)
+        return self.fc(x)  # (batch, out_dim)
 
 
 class SelfAttention(nn.Module):
@@ -65,7 +72,12 @@ class FlowGRUAttention(nn.Module):
 
 
 class FusionModel(nn.Module):
-    """Late-fusion backbone producing the master state vector."""
+    """Late-fusion backbone producing the master state vector.
+
+    ob_seq: (batch, 1, depth=20, seq_len=60) — 2D orderbook tensor for Conv2d.
+    flow_seq: (batch, seq_len=60, flow_dim=3) — trade flow for GRU.
+    macro: (batch, macro_dim=22) — macro features.
+    """
 
     def __init__(self, state_dim: int = STATE_DIM) -> None:
         super().__init__()

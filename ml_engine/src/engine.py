@@ -927,10 +927,12 @@ class MLEngine:
 
     def _score_symbol(self, symbol: str, buf):
         """Run ONNX inference and return (direction, confidence, vol_mult, trap_prob, state_vec, regime, memory_info, v_memory)."""
-        ob_seq = buf.orderbook_sequence()
         flow_seq = buf.flow_sequence()
         macro = buf.feature_vector()
 
+        # Use 2D Conv2d tensor when new ONNX model is available,
+        # otherwise use 1D Conv1d sequence (legacy models)
+        ob_seq = buf.orderbook_sequence()  # (seq_len=60, 2) Conv1d input
         v_state = self.inference.infer_state_vector(ob_seq, flow_seq, macro)
         regime = self.regime.get(symbol)
         v_memory, memory_info = self.memory.query_with_metadata(v_state, regime.value, symbol=symbol)
