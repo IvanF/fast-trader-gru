@@ -95,40 +95,18 @@ func (s *Service) tryTrailDecayStopInProfit(ctx context.Context, pos *models.Act
 	return true
 }
 
-// decayDirectionFlipExit cancels TPs and posts a PostOnly reduce limit at the spread edge.
+// decayDirectionFlipExit trails SL tighter instead of cancelling TPs.
+// Original behavior cancelled all TPs which left positions unprotected.
 func (s *Service) decayDirectionFlipExit(ctx context.Context, pos *models.ActivePosition, ob models.OrderbookSnapshot) error {
-	s.cancelTPOrdersOnly(ctx, pos)
-
-	exSize, hasPos, err := s.syncPositionFromExchange(ctx, pos)
-	if err != nil || !hasPos || exSize <= 0 {
-		return err
-	}
-
-	price := grid.PassiveMakerExitPrice(pos.Direction, ob, pos.TickSize, s.cfg.EntryMakerTicks)
-	if price <= 0 {
-		price = grid.MidPrice(ob)
-	}
-	if price <= 0 {
-		return fmt.Errorf("decay maker exit: no book price for %s", pos.Symbol)
-	}
-
-	slQty := s.slCoverQty(pos, exSize)
-	if slQty <= 0 {
+	if s.tryTrailDecayStopInProfit(ctx, pos, grid.MidPrice(ob)) {
 		return nil
 	}
-
-	if err := s.atomicReplaceStopLoss(ctx, pos, price, slQty, "confidence_decay_exit"); err != nil {
-		return fmt.Errorf("decay maker exit: %w", err)
-	}
-	pos.TimeStopPlaced = false
-
-	s.logger.Warn("confidence decay — maker reduce exit, TPs cancelled",
+	s.logger.Info("confidence decay — exit grid preserved (no TP cancel)",
 		"symbol", pos.Symbol,
 		"direction", pos.Direction,
-		"decay_reason", pos.Signal.DecayReason,
 		"confidence", pos.Signal.Confidence,
-		"price", price,
-		"qty", slQty,
+		"mid", grid.MidPrice(ob),
+		"open_tps", len(pos.TakeProfitOrders),
 	)
 	return nil
 }

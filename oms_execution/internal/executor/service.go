@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,7 +35,65 @@ type Service struct {
 	positions     map[string]*models.ActivePosition
 	pending   map[string]*models.PendingEntry
 	ghostCooldown map[string]int64
+	_promoting    map[string]bool // symbols currently being promoted from pending → active
 	shadow        *ShadowEngine
+	priceHistory  map[string][]float64 // symbol -> rolling mid prices for ATR
+	volumeHistory map[string][]float64 // symbol -> rolling bid volume for SMA
+	symbolStats   map[string]*SymbolStats
+}
+
+type SymbolStats struct {
+	TotalTrades  int
+	Wins         int
+	Losses       int
+	ConsecLosses int
+	LastPnL      float64
+}
+
+func (ss *SymbolStats) Record(pnl float64) {
+	ss.TotalTrades++
+	ss.LastPnL = pnl
+	if pnl >= 0 {
+		ss.Wins++
+		ss.ConsecLosses = 0
+	} else {
+		ss.Losses++
+		ss.ConsecLosses++
+	}
+}
+
+func (ss *SymbolStats) WinRate() float64 {
+	if ss.TotalTrades == 0 {
+		return 0.5
+	}
+	return float64(ss.Wins) / float64(ss.TotalTrades)
+}
+
+func (ss *SymbolStats) Penalty() float64 {
+	if ss.TotalTrades < 3 {
+		return 1.0
+	}
+	wr := ss.WinRate()
+	penalty := math.Max(1.0, 3.0-2.5*(wr/0.40))
+	if penalty > 3.0 {
+		penalty = 3.0
+	}
+	if ss.ConsecLosses >= 2 {
+		streakBonus := 1.0 + float64(ss.ConsecLosses-1)*0.3
+		penalty *= streakBonus
+		if penalty > 3.75 {
+			penalty = 3.75
+		}
+	}
+	return penalty
+}
+
+func (ss *SymbolStats) EffectiveConfidence(baseConf float64) float64 {
+	effective := baseConf * ss.Penalty()
+	if effective > 0.95 {
+		effective = 0.95
+	}
+	return effective
 }
 
 func New(cfg config.Config, bc *bybit.Client, rc *redisx.Client, iw *influx.Writer, logger *slog.Logger) *Service {
@@ -48,6 +107,10 @@ func New(cfg config.Config, bc *bybit.Client, rc *redisx.Client, iw *influx.Writ
 		positions:    make(map[string]*models.ActivePosition),
 		pending:      make(map[string]*models.PendingEntry),
 		ghostCooldown: make(map[string]int64),
+		_promoting:    make(map[string]bool),
+		priceHistory:  make(map[string][]float64),
+		volumeHistory: make(map[string][]float64),
+		symbolStats:   make(map[string]*SymbolStats),
 	}
 	if cfg.ShadowMode {
 		s.shadow = NewShadowEngine(logger, cfg.ResultsChannel)
@@ -61,14 +124,25 @@ func New(cfg config.Config, bc *bybit.Client, rc *redisx.Client, iw *influx.Writ
 
 func (s *Service) planOpts() grid.PlanOptions {
 	return grid.PlanOptions{
-		VolMultiplierCap:   s.cfg.VolMultiplierCap,
+		VolMultiplierCap: s.cfg.VolMultiplierCap,
 	}
 }
 
 func (s *Service) exitGridOptsForSymbol(symbol string) grid.ExitGridOptions {
+	minTP := s.cfg.MinTPPct
+	if ob, err := s.redis.GetOrderbook(context.Background(), symbol); err == nil {
+		mid := grid.MidPrice(ob)
+		if mid > 0 {
+			if mid < 0.01 {
+				minTP = 0.01
+			} else if mid < 0.10 {
+				minTP = 0.005
+			}
+		}
+	}
 	return grid.ExitGridOptions{
 		TPBudgetPct:        s.cfg.TPBudgetPct,
-		MinTPPct:           s.cfg.MinTPPct,
+		MinTPPct:           minTP,
 		MaxTPPct:           s.cfg.MaxTPPct,
 		FeeBreakevenPct:    s.cfg.FeeBreakevenPct,
 		MinSLPct:           s.cfg.GetMinSLPct(symbol),
@@ -77,6 +151,118 @@ func (s *Service) exitGridOptsForSymbol(symbol string) grid.ExitGridOptions {
 		EntryFeeRate:       s.cfg.EntryFeeRate,
 		ExitFeeRate:        s.cfg.ExitFeeRate,
 		TargetNetProfitPct: s.cfg.TargetNetProfitPct,
+	}
+}
+
+// runPositionManager evaluates ATR-based position management triggers.
+func (s *Service) runPositionManager(ctx context.Context, pos *models.ActivePosition, ob models.OrderbookSnapshot) {
+	mid := grid.MidPrice(ob)
+	if mid <= 0 || pos.OriginalRisk <= 0 {
+		return
+	}
+
+	// Compute current candle OHLC from available data
+	candleHigh := mid
+	candleLow := mid
+	if len(ob.Bids) > 0 {
+		bestBid := grid.MidPrice(models.OrderbookSnapshot{Bids: ob.Bids[:1], Asks: ob.Asks[:1]})
+		if bestBid > candleHigh {
+			candleHigh = bestBid
+		}
+		if bestBid < candleLow {
+			candleLow = bestBid
+		}
+	}
+
+	// Volume: use rolling SMA from orderbook history
+	var currentVolume, smaVolume float64
+	if len(ob.Bids) > 0 {
+		for _, lv := range ob.Bids[:min(len(ob.Bids), 10)] {
+			var v float64
+			fmt.Sscanf(lv.Size, "%f", &v)
+			currentVolume += v
+		}
+	}
+	if vh := s.volumeHistory[pos.Symbol]; len(vh) > 0 {
+		sum := 0.0
+		for _, v := range vh {
+			sum += v
+		}
+		smaVolume = sum / float64(len(vh))
+	} else {
+		smaVolume = currentVolume
+	}
+
+	candleIdx := int(time.Now().Unix() / 60) // Approximate candle index (1-min)
+
+	tradeState := &risk.TradeState{
+		EntryPrice:     pos.FillPrice,
+		SlPrice:        pos.StopLoss,
+		OriginalRisk:   pos.OriginalRisk,
+		Direction:      pos.Direction,
+		EntryCandleIdx: pos.EntryCandleIdx,
+		Size:           pos.RemainingQty,
+		InitialSize:    pos.InitialQty,
+		ScaledOut:      pos.ScaledOut,
+		BreakevenSet:   pos.BreakevenPMSet,
+		PriceHistory:   pos.PriceHistory,
+	}
+
+	action := risk.ManageOpenTrade(tradeState, mid, candleHigh, candleLow, candleIdx, currentVolume, smaVolume)
+	if action == nil {
+		return
+	}
+
+	switch action.Type {
+	case risk.TriggerTimeStop:
+		s.logger.Info("PositionManager: Time-Stop triggered",
+			"symbol", pos.Symbol, "reason", action.Reason)
+		s.timeStopLimitExit(ctx, pos, ob)
+
+	case risk.TriggerScaleOut:
+		closeQty := pos.RemainingQty * action.ClosePct
+		closeQty = bybit.NormalizeQty(closeQty, pos.QtyStep, pos.MinOrderQty)
+		if closeQty > 0 {
+			side := closeSide(pos.Direction)
+			if _, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, closeQty, pos.QtyStep); err != nil {
+				s.logger.Warn("PositionManager: scale-out failed", "symbol", pos.Symbol, "error", err)
+			} else {
+				pos.ScaledOut = true
+				s.logger.Info("PositionManager: Scale-Out executed",
+					"symbol", pos.Symbol, "reason", action.Reason,
+					"closed_qty", closeQty,
+				)
+			}
+		}
+
+	case risk.TriggerBreakeven:
+		slQty := s.slCoverQty(pos, pos.RemainingQty)
+		if slQty > 0 {
+			newSL := grid.RoundToTick(action.SlPrice, pos.TickSize)
+			if err := s.atomicReplaceStopLoss(ctx, pos, newSL, slQty, "breakeven"); err != nil {
+				s.logger.Warn("PositionManager: breakeven failed", "symbol", pos.Symbol, "error", err)
+			} else {
+				pos.BreakevenPMSet = true
+				s.logger.Info("PositionManager: Breakeven set",
+					"symbol", pos.Symbol, "reason", action.Reason,
+					"new_sl", newSL,
+				)
+			}
+		}
+
+	case risk.TriggerChandelierExit:
+		slQty := s.slCoverQty(pos, pos.RemainingQty)
+		if slQty > 0 {
+			newSL := grid.RoundToTick(action.SlPrice, pos.TickSize)
+			if err := s.atomicReplaceStopLoss(ctx, pos, newSL, slQty, "trailing_stop"); err != nil {
+				s.logger.Warn("PositionManager: chandelier failed", "symbol", pos.Symbol, "error", err)
+			} else {
+				s.logger.Info("PositionManager: Chandelier Exit",
+					"symbol", pos.Symbol, "reason", action.Reason,
+					"new_sl", newSL,
+				)
+			}
+		}
 	}
 }
 
@@ -98,6 +284,7 @@ func (s *Service) Run(ctx context.Context) error {
 	go s.runPositionMonitor(ctx)
 
 	if !s.cfg.ShadowMode {
+		s.loadPersistedPositions(ctx)
 		s.reconcileOrphanEntryOrders(ctx)
 		s.scanOrphanPositions(ctx)
 	}
@@ -174,6 +361,14 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 		return s.reconcileExistingSignal(ctx, signal, recvAt)
 	}
 
+	// Shadow-only signal: create shadow trade for training data, no real entry
+	if signal.ShadowOnly {
+		if s.shadow != nil {
+			s.shadowOpen(ctx, signal, recvAt)
+		}
+		return nil
+	}
+
 	if s.cfg.ShadowMode {
 		return s.shadowOpen(ctx, signal, recvAt)
 	}
@@ -184,6 +379,113 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 	}
 
 	// Guard against TOCTOU: exchange may already have a position while local map is empty.
+	s.mu.Lock()
+	_, promoting := s._promoting[signal.Symbol]
+	s.mu.Unlock()
+	if promoting {
+		return nil
+	}
+
+	// Dynamic confidence: raise threshold for symbols with poor track record
+	s.mu.Lock()
+	stats := s.symbolStats[signal.Symbol]
+	s.mu.Unlock()
+	if stats != nil {
+		effectiveConf := stats.EffectiveConfidence(s.cfg.ConfidenceThreshold)
+		if signal.Confidence < effectiveConf {
+			s.logger.Info("signal rejected — dynamic confidence",
+				"symbol", signal.Symbol,
+				"confidence", fmt.Sprintf("%.3f", signal.Confidence),
+				"effective_threshold", fmt.Sprintf("%.3f", effectiveConf),
+				"wr", fmt.Sprintf("%.0f%%", stats.WinRate()*100),
+				"consec_losses", stats.ConsecLosses,
+				"penalty", fmt.Sprintf("%.2f", stats.Penalty()),
+			)
+			return nil
+		}
+	}
+
+	// Entry quality filters: momentum, volume, spread
+	ob, obErr := s.redis.GetOrderbook(ctx, signal.Symbol)
+	if obErr == nil {
+		mid := grid.MidPrice(ob)
+		if mid > 0 {
+			if len(ob.Asks) > 0 && len(ob.Bids) > 0 {
+				bestBid, _ := strconv.ParseFloat(ob.Bids[0].Price, 64)
+				bestAsk, _ := strconv.ParseFloat(ob.Asks[0].Price, 64)
+				if bestBid > 0 && bestAsk > 0 {
+					spreadPct := (bestAsk - bestBid) / bestBid
+					if spreadPct > 0.005 {
+						s.logger.Info("signal rejected — spread too wide",
+							"symbol", signal.Symbol,
+							"spread_pct", fmt.Sprintf("%.4f", spreadPct))
+						return nil
+					}
+				}
+			}
+			totalBid := 0.0
+			for _, l := range ob.Bids[:min(5, len(ob.Bids))] {
+				s, _ := strconv.ParseFloat(l.Size, 64)
+				totalBid += s
+			}
+			totalAsk := 0.0
+			for _, l := range ob.Asks[:min(5, len(ob.Asks))] {
+				s, _ := strconv.ParseFloat(l.Size, 64)
+				totalAsk += s
+			}
+			totalDepth := totalBid + totalAsk
+			if totalDepth <= 0 {
+				s.logger.Info("signal rejected — zero depth",
+					"symbol", signal.Symbol)
+				return nil
+			}
+			bidV := 0.0
+			for _, l := range ob.Bids[:min(3, len(ob.Bids))] {
+				s, _ := strconv.ParseFloat(l.Size, 64)
+				bidV += s
+			}
+			askV := 0.0
+			for _, l := range ob.Asks[:min(3, len(ob.Asks))] {
+				s, _ := strconv.ParseFloat(l.Size, 64)
+				askV += s
+			}
+			if bidV+askV > 0 {
+				obi := (bidV - askV) / (bidV + askV)
+				if signal.Direction == "SHORT" && obi < -0.2 {
+					s.logger.Info("signal rejected — momentum against SHORT",
+						"symbol", signal.Symbol, "obi", fmt.Sprintf("%.3f", obi))
+					return nil
+				}
+				if signal.Direction == "LONG" && obi > 0.2 {
+					s.logger.Info("signal rejected — momentum against LONG",
+						"symbol", signal.Symbol, "obi", fmt.Sprintf("%.3f", obi))
+					return nil
+				}
+			}
+			// Price trend filter: reject if mid moved >0.5% against signal in last 30s
+			if hist := s.priceHistory[signal.Symbol]; len(hist) >= 30 {
+				recent := hist[len(hist)-30:]
+				if len(recent) >= 2 {
+					p30 := recent[0]
+					pNow := recent[len(recent)-1]
+					if p30 > 0 {
+						move := (pNow - p30) / p30
+						if signal.Direction == "SHORT" && move > 0.005 {
+							s.logger.Info("signal rejected — price rising against SHORT",
+								"symbol", signal.Symbol, "move_30s", fmt.Sprintf("%.4f", move))
+							return nil
+						}
+						if signal.Direction == "LONG" && move < -0.005 {
+							s.logger.Info("signal rejected — price falling against LONG",
+								"symbol", signal.Symbol, "move_30s", fmt.Sprintf("%.4f", move))
+							return nil
+						}
+					}
+				}
+			}
+		}
+	}
+
 	exPos, err := s.bybit.GetPosition(ctx, signal.Symbol)
 	if err == nil && exPos.Size > 0 {
 		dir := "LONG"
@@ -283,6 +585,55 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 	} else if signal.EntryPrice > 0 {
 		plan.EntryPrice = signal.EntryPrice
 	}
+
+	// ============================================
+	// RiskManager: ATR-based SL, EV check, Kelly sizing
+	// ============================================
+	if s.priceHistory[signal.Symbol] != nil {
+		tpPrice := mid
+		if len(plan.TakeProfits) > 0 {
+			tpPrice = plan.TakeProfits[0]
+		}
+		riskResult := risk.ProcessSignal(
+			plan.Direction,
+			signal.Confidence,
+			plan.EntryPrice,
+			tpPrice,
+			s.priceHistory[signal.Symbol],
+			s.cfg.AccountDepositUSD,
+			signal.VolatilityMultiplier,
+		)
+		if !riskResult.Approved {
+			s.logger.Info("RiskManager REJECTED",
+				"symbol", signal.Symbol,
+				"reason", riskResult.RejectReason,
+				"sl_dist", fmt.Sprintf("%.3f%%", riskResult.SLDistancePct*100),
+				"rr", fmt.Sprintf("%.2f", riskResult.RewardRiskRatio),
+				"ev", fmt.Sprintf("%.4f", riskResult.EV),
+			)
+			return fmt.Errorf("risk rejected: %s", riskResult.RejectReason)
+		}
+		// Override SL and qty from RiskManager
+		plan.StopLoss = riskResult.SlPrice
+		if s.cfg.UsesUSDSizing() && riskResult.Qty > 0 {
+			riskNotional := riskResult.Qty * mid
+			riskMargin := riskNotional / float64(max(leverage, 1))
+			if riskMargin <= marginUSD {
+				notionalUSD = riskNotional
+				qty = riskResult.Qty
+				plan.Qty = qty
+			}
+		}
+		s.logger.Info("RiskManager APPROVED",
+			"symbol", signal.Symbol,
+			"sl", riskResult.SlPrice,
+			"rr", fmt.Sprintf("%.2f", riskResult.RewardRiskRatio),
+			"ev", fmt.Sprintf("%.4f", riskResult.EV),
+			"risk", fmt.Sprintf("%.2f%%", riskResult.RiskPct*100),
+			"kelly", fmt.Sprintf("%.2f%%", riskResult.KellyPct*100),
+		)
+	}
+
 	rawQty := plan.Qty
 	plan.Qty = bybit.NormalizeQty(plan.Qty, inst.Lot.QtyStep, inst.Lot.MinOrderQty)
 	if plan.Qty > inst.Lot.MaxOrderQty {
@@ -513,12 +864,14 @@ func (s *Service) positionMatchesDirection(exPos bybit.PositionInfo, direction s
 
 func (s *Service) promotePending(ctx context.Context, p *models.PendingEntry, avgPrice, qty float64) {
 	s.mu.Lock()
-	if _, still := s.pending[p.Symbol]; !still {
-		s.mu.Unlock()
-		return
+	// If pending entry was already removed (e.g. by promotePendingFromExchange),
+	// skip the check and proceed directly to position creation.
+	if _, still := s.pending[p.Symbol]; still {
+		delete(s.pending, p.Symbol)
+		s.publishPendingOrder(ctx, "filled", p)
+	} else {
+		s.publishPendingOrder(ctx, "filled", p)
 	}
-	delete(s.pending, p.Symbol)
-	s.publishPendingOrder(ctx, "filled", p)
 	if existing, ok := s.positions[p.Symbol]; ok {
 		s.mu.Unlock()
 		s.logger.Warn("promote skipped — position already tracked, syncing exchange size",
@@ -557,6 +910,20 @@ func (s *Service) promotePending(ctx context.Context, p *models.PendingEntry, av
 	plannedSL = grid.EnforceMinSLDistance(avgPrice, plannedSL, p.Direction, s.cfg.GetMinSLPct(p.Symbol), p.TickSize)
 
 	entryTime := time.Now().UnixMilli()
+	candleIdx := int(entryTime / 60000) // 1-min candle index
+
+	originalRisk := math.Abs(avgPrice - plannedSL)
+	if originalRisk <= 0 {
+		originalRisk = avgPrice * s.cfg.GetMinSLPct(p.Symbol)
+	}
+
+	// Snapshot price history for ATR computation during position lifetime
+	var priceSnap []float64
+	if hist := s.priceHistory[p.Symbol]; len(hist) > 0 {
+		priceSnap = make([]float64, len(hist))
+		copy(priceSnap, hist)
+	}
+
 	pos := &models.ActivePosition{
 		Symbol:       p.Symbol,
 		Direction:    p.Direction,
@@ -578,18 +945,38 @@ func (s *Service) promotePending(ctx context.Context, p *models.PendingEntry, av
 		Signal:       p.Signal,
 		OrderID:      p.OrderID,
 		FilledAt:     entryTime,
+		OriginalRisk: originalRisk,
+		PriceHistory: priceSnap,
+		EntryCandleIdx: candleIdx,
 	}
 
 	// Register in map before any slow I/O so concurrent signals cannot open a duplicate entry.
 	s.mu.Lock()
 	if _, exists := s.positions[p.Symbol]; exists {
+		// Position already tracked — update with new fill data and ensure exit grid exists
+		existing := s.positions[p.Symbol]
+		existing.FillPrice = avgPrice
+		existing.RemainingQty = qty
+		existing.InitialQty = qty
+		existing.OrderID = p.OrderID
+		existing.OriginalRisk = math.Abs(avgPrice - existing.StopLoss)
+		s._promoting[p.Symbol] = false
 		s.mu.Unlock()
-		s.syncActiveWithExchange(ctx, p.Symbol)
+
+		// Always deploy exit grid for reprice-halted positions (use existing SL, not pending SL)
+		ob2, obErr := s.redis.GetOrderbook(ctx, p.Symbol)
+		if obErr == nil && len(ob2.Bids) > 0 {
+			_ = s.deployExitGrid(ctx, existing, ob2, avgPrice, existing.StopLoss, p.TickSize)
+		}
+		s.publishPositionOpened(ctx, existing)
 		return
 	}
 	s.positions[p.Symbol] = pos
+	delete(s._promoting, p.Symbol)
 	metrics.ActivePositions.Set(float64(len(s.positions)))
 	s.mu.Unlock()
+
+	s.persistPosition(ctx, pos)
 
 	metrics.GridActive.WithLabelValues(p.Symbol).Set(1)
 	s.logger.Info("position opened (exchange fill confirmed)",
@@ -622,6 +1009,53 @@ func (s *Service) cancelPending(ctx context.Context, p *models.PendingEntry, rea
 	s.cancelPendingEntry(ctx, p, reason)
 }
 
+// loadPersistedPositions restores positions from Redis on startup.
+// Cross-checks with exchange to remove stale ghost positions.
+func (s *Service) loadPersistedPositions(ctx context.Context) {
+	positions, err := s.redis.LoadPositions(ctx)
+	if err != nil {
+		s.logger.Warn("failed to load persisted positions", "error", err)
+		return
+	}
+	if len(positions) == 0 {
+		s.logger.Info("no persisted positions to restore")
+		return
+	}
+	s.mu.Lock()
+	for _, pos := range positions {
+		if _, exists := s.positions[pos.Symbol]; exists {
+			continue
+		}
+		// Verify position still exists on exchange
+		exPos, exErr := s.bybit.GetPosition(ctx, pos.Symbol)
+		if exErr != nil || exPos.Size <= 0 {
+			s.logger.Info("removing stale ghost position from Redis",
+				"symbol", pos.Symbol, "exchange_size", exPos.Size)
+			go s.removePosition(context.Background(), pos.Symbol)
+			continue
+		}
+		pos.ExitGridReady = false
+		s.positions[pos.Symbol] = pos
+		metrics.ActivePositions.Set(float64(len(s.positions)))
+	}
+	s.mu.Unlock()
+	s.logger.Info("restored persisted positions", "count", len(s.positions))
+}
+
+// persistPosition saves a position to Redis (fire-and-forget).
+func (s *Service) persistPosition(ctx context.Context, pos *models.ActivePosition) {
+	if err := s.redis.SavePosition(ctx, pos); err != nil {
+		s.logger.Warn("position persist failed", "symbol", pos.Symbol, "error", err)
+	}
+}
+
+// removePosition deletes a position from Redis (fire-and-forget).
+func (s *Service) removePosition(ctx context.Context, symbol string) {
+	if err := s.redis.DeletePosition(ctx, symbol); err != nil {
+		s.logger.Warn("position remove failed", "symbol", symbol, "error", err)
+	}
+}
+
 func (s *Service) runOrderbookCache(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
@@ -644,6 +1078,31 @@ func (s *Service) runOrderbookCache(ctx context.Context) {
 			}
 			if err := s.redis.SetOrderbook(ctx, ob.Symbol, ob); err != nil {
 				s.logger.Warn("orderbook cache write failed", "symbol", ob.Symbol, "error", err)
+			}
+			// Update price history for ATR computation
+			mid := grid.MidPrice(ob)
+			if mid > 0 {
+				hist := s.priceHistory[ob.Symbol]
+				hist = append(hist, mid)
+				if len(hist) > 100 {
+					hist = hist[len(hist)-100:]
+				}
+				s.priceHistory[ob.Symbol] = hist
+			}
+			// Update volume history for PositionManager SMA
+			var bidVol float64
+			for _, lv := range ob.Bids[:min(len(ob.Bids), 10)] {
+				var v float64
+				fmt.Sscanf(lv.Size, "%f", &v)
+				bidVol += v
+			}
+			if bidVol > 0 {
+				vh := s.volumeHistory[ob.Symbol]
+				vh = append(vh, bidVol)
+				if len(vh) > 20 {
+					vh = vh[len(vh)-20:]
+				}
+				s.volumeHistory[ob.Symbol] = vh
 			}
 		}
 		if ctx.Err() != nil {
@@ -814,15 +1273,19 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 
 	s.retryMissingTakeProfits(ctx, pos, ob)
 
-	if elapsedMs(pos.EntryTime) > int64(pos.TimeStopSec)*1000 {
-		s.timeStopLimitExit(ctx, pos, ob)
-	} else {
-		s.maybeExitBreakevenTimed(ctx, pos, ob)
-	}
+	// Old timeStopLimitExit disabled — PositionManager handles Time-Stop via ATR-based triggers
+	// if elapsedMs(pos.EntryTime) > int64(pos.TimeStopSec)*1000 {
+	// 	s.timeStopLimitExit(ctx, pos, ob)
+	// } else {
+	// 	s.maybeExitBreakevenTimed(ctx, pos, ob)
+	// }
 
 	if s.monitorExitOrders(ctx, pos) {
 		return
 	}
+
+	// PositionManager: ATR-based triggers (scale-out, breakeven, chandelier)
+	s.runPositionManager(ctx, pos, ob)
 
 	// ABSOLUTE SAFETY NET: runs AFTER all other logic, guarantees every open position has TPs
 	activeTPs := 0
@@ -927,6 +1390,7 @@ func (s *Service) handleGhostPosition(ctx context.Context, pos *models.ActivePos
 		metrics.ActivePositions.Set(float64(len(s.positions)))
 		metrics.GridActive.WithLabelValues(pos.Symbol).Set(0)
 		s.mu.Unlock()
+		s.removePosition(ctx, pos.Symbol)
 		return
 	}
 
@@ -976,17 +1440,26 @@ func (s *Service) finalizeClose(
 
 	s.mu.Lock()
 	delete(s.positions, pos.Symbol)
+	stats := s.symbolStats[pos.Symbol]
+	if stats == nil {
+		stats = &SymbolStats{}
+		s.symbolStats[pos.Symbol] = stats
+	}
+	stats.Record(pnl)
 	metrics.ActivePositions.Set(float64(len(s.positions)))
 	s.mu.Unlock()
+	s.removePosition(ctx, pos.Symbol)
 
 	s.logger.Info("position closed",
-		"symbol", pos.Symbol,
 		"reason", reason,
 		"pnl", pnl,
 		"exchange_pnl", exchangePnL,
 		"entry", entryPrice,
 		"exit", exitPrice,
 		"hold_ms", hold.Milliseconds(),
+		"symbol_wr", fmt.Sprintf("%.0f%%", stats.WinRate()*100),
+		"consec_losses", stats.ConsecLosses,
+		"penalty", fmt.Sprintf("%.2f", stats.Penalty()),
 	)
 }
 

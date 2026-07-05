@@ -212,6 +212,32 @@ class SymbolBuffer:
             np.tanh(ask_vol / 1e6),
         ], dtype=np.float32)
 
+    def funding_rate_change(self) -> float:
+        ob_points = [p for p in self.points if p.side == "OB"]
+        if len(ob_points) < 10:
+            return 0.0
+        recent = ob_points[-30:]
+        obi_vals = []
+        for p in recent:
+            total = p.bid_vol + p.ask_vol
+            if total > 0:
+                obi_vals.append((p.bid_vol - p.ask_vol) / total)
+        if len(obi_vals) < 2:
+            return 0.0
+        return float(np.clip(obi_vals[-1] - obi_vals[0], -1.0, 1.0))
+
+    def trade_volume_imbalance(self) -> float:
+        trades = [p for p in self.points if p.size > 0 and p.side != "OB"]
+        if not trades:
+            return 0.0
+        recent = trades[-30:]
+        buy_vol = sum(p.size for p in recent if p.side.upper() in ("BUY", "B"))
+        sell_vol = sum(p.size for p in recent if p.side.upper() not in ("BUY", "B"))
+        total = buy_vol + sell_vol
+        if total <= 0:
+            return 0.0
+        return (buy_vol - sell_vol) / total
+
     def feature_vector(self) -> np.ndarray:
         obi = self.order_book_imbalance()
         cvd_norm = np.tanh(self.cvd / 1e6)
@@ -227,11 +253,15 @@ class SymbolBuffer:
         pre_entry_sweep = self._pre_entry_sweep()
         fill_delay_norm = self._fill_delay_norm()
 
+        vol_imbalance = self.trade_volume_imbalance()
+        funding_chg = self.funding_rate_change()
+
         base = np.array([
             obi, cvd_norm, ofs, vwap_dev,
             trend_5m, trend_15m, trend_1h, trend_4h, trend_1d,
             self.funding_rate,
             obi_reversal, pre_entry_sweep, fill_delay_norm,
+            vol_imbalance, funding_chg,
         ], dtype=np.float32)
         return np.concatenate([base, self.liquidity_features()])
 

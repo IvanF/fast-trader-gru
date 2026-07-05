@@ -8,7 +8,7 @@ import torch.nn as nn
 SEQ_LEN = 60
 OB_DIM = 2
 FLOW_DIM = 3
-MACRO_DIM = 20
+MACRO_DIM = 22
 EMBED_DIM = 32
 STATE_DIM = 128
 MEMORY_DIM = 8

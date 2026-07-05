@@ -109,7 +109,7 @@ def stratified_split(dataset: JoinedDataset, val_ratio: float = 0.15, min_val: i
 
 
 class JoinedDataset(Dataset):
-    def __init__(self, data: dict[str, np.ndarray]) -> None:
+    def __init__(self, data: dict[str, np.ndarray], augment: bool = False) -> None:
         self.ob = data["ob_seq"]
         self.flow = data["flow_seq"]
         self.macro = data["macro"]
@@ -118,18 +118,28 @@ class JoinedDataset(Dataset):
         self.confidence = data["confidence"]
         self.pnl = data.get("pnl", np.zeros(len(data["direction"])))
         self.weights = data.get("weights", np.ones(len(data["direction"])))
-        # Trap label: 1.0 if PnL < 0 (losing trade = likely trap), else 0.0
         self.is_trap = (self.pnl < 0).astype(np.float32)
         self.n = len(self.direction)
+        self.augment = augment
 
     def __len__(self) -> int:
         return self.n
 
     def __getitem__(self, idx: int) -> tuple:
+        ob = self.ob[idx].copy()
+        flow = self.flow[idx].copy()
+        macro = self.macro[idx].copy()
+        if self.augment:
+            noise_level = 0.02
+            ob = ob + np.random.normal(0, noise_level, ob.shape).astype(np.float32)
+            macro = macro + np.random.normal(0, noise_level * 2, macro.shape).astype(np.float32)
+            if np.random.random() < 0.3:
+                scale = np.random.uniform(0.9, 1.1)
+                flow[:, 2] = flow[:, 2] * scale
         return (
-            torch.from_numpy(self.ob[idx]),
-            torch.from_numpy(self.flow[idx]),
-            torch.from_numpy(self.macro[idx]),
+            torch.from_numpy(ob),
+            torch.from_numpy(flow),
+            torch.from_numpy(macro),
             torch.from_numpy(self.memory[idx]),
             torch.tensor(self.direction[idx], dtype=torch.long),
             torch.tensor(self.confidence[idx], dtype=torch.float32),
@@ -259,7 +269,7 @@ def main() -> int:
     p.add_argument("--hours", type=int, default=6, help="Influx lookback hours (2-6 recommended)")
     p.add_argument("--days", type=int, default=0, help="Legacy: overrides hours if set")
     p.add_argument("--dataset", default="", help="Pre-exported joined .npz")
-    p.add_argument("--epochs", type=int, default=8)
+    p.add_argument("--epochs", type=int, default=12)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--model-dir", default=os.getenv("MODEL_DIR", "/app/models"))
@@ -347,12 +357,14 @@ def main() -> int:
         print(f"insufficient training samples (need >= {MIN_SAMPLES})", file=sys.stderr)
         return 3
 
-    dataset = JoinedDataset(data)
-    train_ds, val_ds = stratified_split(dataset, val_ratio=0.15, min_val=10)
+    clean_dataset = JoinedDataset(data, augment=False)
+    train_ds, val_ds = stratified_split(clean_dataset, val_ratio=0.15, min_val=10)
+    aug_dataset = JoinedDataset(data, augment=True)
+    train_ds_aug = Subset(aug_dataset, train_ds.indices)
     print(f"split: train={len(train_ds)} val={len(val_ds)}")
     use_cuda = device.type == "cuda"
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
+        train_ds_aug, batch_size=args.batch_size, shuffle=True,
         num_workers=0, pin_memory=use_cuda,
     )
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, num_workers=0, pin_memory=use_cuda)
@@ -432,17 +444,19 @@ def main() -> int:
     print(f"previous model: version={prev_version} val_acc={prev_acc:.3f}")
     print(f"new model: score={best_acc:.3f} trap_acc={best_trap_acc:.3f} loss_delta={loss_delta:.4f}")
 
-    # Promotion logic: model must beat previous OR have reasonable acc
+    # Promotion logic: model must beat previous significantly OR have major loss improvement
+    # Block promotion if val_acc dropped more than 0.5% from previous model
     acc_improved = best_acc > prev_acc + 0.02
-    has_good_acc = best_acc >= 0.25
-    should_promote = acc_improved or loss_improved or has_good_acc
+    acc_not_degraded = best_acc >= prev_acc - 0.005
+    major_loss_improved = loss_delta < -0.05
+    should_promote = (acc_improved or major_loss_improved) and acc_not_degraded
 
     if not should_promote:
         reason = []
-        if not acc_improved:
-            reason.append(f"no improvement (prev={prev_acc:.3f}, new={best_acc:.3f})")
-        if not loss_improved:
-            reason.append(f"loss not improved (delta={loss_delta:.4f})")
+        if not acc_improved and not major_loss_improved:
+            reason.append(f"no significant improvement (prev={prev_acc:.3f}, new={best_acc:.3f}, delta={loss_delta:+.4f})")
+        if not acc_not_degraded:
+            reason.append(f"val_acc degraded too much ({prev_acc:.3f} → {best_acc:.3f})")
         print(f"model NOT promoted: {'; '.join(reason)}", file=sys.stderr)
         report = {
             "exit_code": 5,

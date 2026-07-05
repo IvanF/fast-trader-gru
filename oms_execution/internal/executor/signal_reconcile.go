@@ -50,7 +50,11 @@ func (s *Service) reconcilePendingEntry(ctx context.Context, signal models.Trade
 		s.cancelPendingEntry(ctx, p, "signal_direction_flip")
 		return nil
 	}
-	if signal.Confidence < s.cfg.ConfidenceThreshold {
+	effectiveConf := s.cfg.ConfidenceThreshold
+	if stats, ok := s.symbolStats[signal.Symbol]; ok {
+		effectiveConf = stats.EffectiveConfidence(s.cfg.ConfidenceThreshold)
+	}
+	if signal.Confidence < effectiveConf {
 		s.cancelPendingEntry(ctx, p, "signal_confidence_low")
 		return nil
 	}
@@ -124,6 +128,15 @@ func (s *Service) reconcileActivePosition(ctx context.Context, signal models.Tra
 	}
 
 	if signal.Direction != pos.Direction {
+		// Minimum hold time before adverse signal can close position (3 minutes)
+		// Also respect cooldown after last grid redeploy (1 minute)
+		holdMs := time.Now().UnixMilli() - pos.EntryTime
+		redeployCooldown := time.Now().UnixMilli() - pos.LastGridDeployAt
+		if holdMs < 180_000 || redeployCooldown < 60_000 {
+			s.logger.Info("adverse signal deferred",
+				"symbol", pos.Symbol, "hold_sec", holdMs/1000, "redeploy_sec", redeployCooldown/1000)
+			return nil
+		}
 		return s.handleAdverseSignal(ctx, pos, signal, ob)
 	}
 	if signal.Confidence < s.cfg.ConfidenceThreshold {
@@ -485,7 +498,7 @@ func (s *Service) exitGridNeedsRefresh(pos *models.ActivePosition, plan models.G
 
 func tpStillValid(existing models.ExitOrder, fresh []grid.ExitLevel) bool {
 	for _, f := range fresh {
-		if existing.Kind == f.Kind && priceDriftPct(existing.Price, f.Price) < 0.003 {
+		if existing.Kind == f.Kind && priceDriftPct(existing.Price, f.Price) < 0.02 {
 			return true
 		}
 	}
@@ -497,7 +510,7 @@ func freshTPExists(fresh grid.ExitLevel, existing []models.ExitOrder) bool {
 		if tp.Filled {
 			continue
 		}
-		if tp.Kind == fresh.Kind && priceDriftPct(tp.Price, fresh.Price) < 0.003 {
+		if tp.Kind == fresh.Kind && priceDriftPct(tp.Price, fresh.Price) < 0.02 {
 			return true
 		}
 	}

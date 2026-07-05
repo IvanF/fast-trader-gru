@@ -82,11 +82,14 @@ class MLEngine:
         self._pattern_block_count_this_cycle = 0
         self._tick_cycle_predictions = 0
         self._circuit_breaker_lock = threading.Lock()
+        self._symbol_cooldowns: dict[str, float] = {}  # symbol -> expire timestamp
+        self._symbol_setup_losses: dict[str, list[float]] = {}  # "SYMBOL_DIR_REGIME" -> [pnl1, pnl2, ...]
         self._corr_block_count_this_cycle = 0
         self._last_signal_at = time.time()
         self._signal_drought_warned = False
         self._online_learner = OnlineLearner(cfg.model_dir, cfg.state_dim)
         self._consecutive_losses = 0
+        self._symbol_trades: Dict[str, Dict[str, int]] = {}  # symbol -> {"wins": N, "losses": N}
         self._retrain_worker = RollingRetrainWorker(
             cfg, symbols_provider=lambda: sorted(self.active_symbols),
         )
@@ -167,7 +170,9 @@ class MLEngine:
                     if msg is None:
                         continue
                     if msg["type"] != "message":
+                        logger.debug("%s got non-message type: %s", name, msg["type"])
                         continue
+                    logger.info("%s handler called, channel=%s data_len=%d", name, msg.get("channel", "?"), len(str(msg.get("data", ""))))
                     await handler(msg)
             except asyncio.CancelledError:
                 raise
@@ -215,6 +220,24 @@ class MLEngine:
     async def run(self) -> None:
         await self.connect_redis()
         assert self._redis is not None
+
+        # Restore per-symbol WR from Redis
+        try:
+            keys = []
+            async for key in self._redis.scan_iter("symbol_trades:*"):
+                sym = key.decode().replace("symbol_trades:", "")
+                data = json.loads(await self._redis.get(key))
+                self._symbol_trades[sym] = data
+            if self._symbol_trades:
+                logger.info("restored symbol_trades from redis: %d symbols", len(self._symbol_trades))
+            async for key in self._redis.scan_iter("symbol_setup_losses:*"):
+                skey = key.decode().replace("symbol_setup_losses:", "")
+                data = json.loads(await self._redis.get(key))
+                self._symbol_setup_losses[skey] = data
+            if self._symbol_setup_losses:
+                logger.info("restored symbol_setup_losses from redis: %d setups", len(self._symbol_setup_losses))
+        except Exception:
+            pass
 
         port = int(self.cfg.metrics_addr.split(":")[-1])
         prom.start_metrics_server(port)
@@ -386,8 +409,26 @@ class MLEngine:
                 data = json.loads(raw.decode())
             else:
                 return
+            symbol = data.get("symbol", "")
+            pnl = float(data.get("net_pnl", 0))
+            direction = data.get("direction", "HOLD")
+            logger.info("execution result received: %s %s pnl=%.4f", symbol, direction, pnl)
+
+            # Track per-symbol WR BEFORE early returns
+            if symbol and pnl != 0:
+                self._symbol_trades.setdefault(symbol, {"wins": 0, "losses": 0})
+                if pnl < 0:
+                    self._symbol_trades[symbol]["losses"] += 1
+                else:
+                    self._symbol_trades[symbol]["wins"] += 1
+                try:
+                    result = await self._redis.setex(f"symbol_trades:{symbol}", 86400, json.dumps(self._symbol_trades[symbol]))
+                    logger.info("symbol_trades saved: %s wins=%d losses=%d", symbol, self._symbol_trades[symbol].get("wins",0), self._symbol_trades[symbol].get("losses",0))
+                except Exception as e:
+                    logger.warning("symbol_trades persist failed for %s: %s (redis=%s)", symbol, e, self._redis)
+
             vec = np.array(data.get("state_vector", []), dtype=np.float32)
-            if vec.size == 0:
+            if vec.ndim == 0 or vec.size == 0:
                 return
             if vec.size < self.cfg.state_dim:
                 vec = np.pad(vec, (0, self.cfg.state_dim - vec.size))
@@ -403,7 +444,9 @@ class MLEngine:
 
             # Don't add to FAISS here — wait for MAE/MFE from PriceTracker.
             # Store state_vector in Redis for persistence across restarts.
-            lookup_key = f"{signal_id}:{exchange_pnl}" if signal_id else f"{symbol}:{exchange_pnl}"
+            # Normalize exchange_pnl to lowercase for consistent key matching
+            ep_str = "true" if exchange_pnl else "false"
+            lookup_key = f"{signal_id}:{ep_str}" if signal_id else f"{symbol}:{ep_str}"
             pending_data = {
                 "state_vector": vec[: self.cfg.state_dim].tolist(),
                 "regime": regime,
@@ -418,7 +461,7 @@ class MLEngine:
             try:
                 await self._redis.setex(
                     f"mae_mfe_pending:{lookup_key}",
-                    2100,  # 35 min TTL
+                    2100,
                     json.dumps(pending_data),
                 )
             except Exception:
@@ -438,6 +481,21 @@ class MLEngine:
 
             if pnl < 0:
                 self._consecutive_losses += 1
+                cooldown = 1800 if self._consecutive_losses < 2 else 3600
+                self._symbol_cooldowns[symbol] = time.time() + cooldown
+
+                setup_key = f"{symbol}_{direction}_{regime}"
+                self._symbol_setup_losses.setdefault(setup_key, []).append(pnl)
+                if len(self._symbol_setup_losses[setup_key]) > 50:
+                    self._symbol_setup_losses[setup_key] = self._symbol_setup_losses[setup_key][-50:]
+                try:
+                    await self._redis.setex(
+                        f"symbol_setup_losses:{setup_key}", 86400,
+                        json.dumps(self._symbol_setup_losses[setup_key]),
+                    )
+                except Exception:
+                    pass
+
                 if self._consecutive_losses >= CONSECUTIVE_LOSS_THRESHOLD:
                     logger.warning(
                         "CONSECUTIVE LOSSES: %d in a row — triggering emergency retrain",
@@ -494,18 +552,28 @@ class MLEngine:
                         symbol, direction, trade_id, mae_pct, mfe_pct)
 
             lookup_key = trade_id or symbol
-            pending = self._pending_mae_mfe.pop(lookup_key, None) or \
-                      self._pending_mae_mfe.pop(f"{lookup_key}:True", None) or \
-                      self._pending_mae_mfe.pop(f"{lookup_key}:False", None)
-
-            # Fallback: try Redis if in-memory cache miss (survived restart)
+            
+            # Normalize lookup key — replace True/False with true/false for consistent matching
+            normalized = lookup_key.replace(":True", ":true").replace(":False", ":false")
+            
+            # Try in-memory cache first
+            pending = self._pending_mae_mfe.pop(normalized, None)
             if not pending:
-                for suffix in ["", ":True", ":False"]:
+                pending = self._pending_mae_mfe.pop(lookup_key, None)
+
+            # Fallback: try Redis with multiple key formats
+            if not pending:
+                base = normalized.split(":")[0]  # UUID part
+                for suffix in ["", ":true", ":false", ":True", ":False"]:
                     try:
-                        raw = await self._redis.get(f"mae_mfe_pending:{lookup_key}{suffix}")
+                        raw = await self._redis.get(f"mae_mfe_pending:{base}{suffix}")
                         if raw:
                             pending = json.loads(raw)
-                            await self._redis.delete(f"mae_mfe_pending:{lookup_key}{suffix}")
+                            await self._redis.delete(f"mae_mfe_pending:{base}{suffix}")
+                            # Also delete other format variants
+                            for alt in [":True", ":False", ":true", ":false"]:
+                                if alt != suffix:
+                                    await self._redis.delete(f"mae_mfe_pending:{base}{alt}")
                             break
                     except Exception:
                         pass
@@ -1070,7 +1138,7 @@ class MLEngine:
 
         # Circuit breaker: stop EV gate / pattern blocks if too many symbols already blocked this cycle
         # Prevents death spiral where all signals get filtered
-        PATTERN_BLOCK_LIMIT = int(os.getenv("PATTERN_BLOCK_LIMIT", "10"))
+        PATTERN_BLOCK_LIMIT = int(os.getenv("PATTERN_BLOCK_LIMIT", "50"))
         with self._circuit_breaker_lock:
             cycle_limit_reached = self._pattern_block_count_this_cycle >= PATTERN_BLOCK_LIMIT
 
@@ -1080,15 +1148,24 @@ class MLEngine:
         # Pattern Memory: block trades with similar losing patterns
         if direction != "HOLD" and not cycle_limit_reached:
             should_avoid, avg_loss = self._online_learner.pattern_memory.should_avoid(
-                v_state, regime.value, direction,
+                v_state, regime.value, direction, symbol=symbol,
             )
             if should_avoid:
                 self._stats["pattern_blocks"] += 1
+                self._symbol_cooldowns[symbol] = time.time() + 1800
                 logger.warning(
                     "PATTERN MEMORY BLOCK: %s %s for %s (avg_loss=%.4f)",
                     direction, symbol, regime.value, avg_loss,
                 )
                 return None
+
+        # Symbol-level cooldown: block re-entry for 5 min after SL
+        if symbol in self._symbol_cooldowns:
+            if time.time() < self._symbol_cooldowns[symbol]:
+                self._stats["hold_low_conf"] += 1
+                return None
+            else:
+                del self._symbol_cooldowns[symbol]
 
         prom.confidence_score.labels(symbol=symbol).set(confidence)
         prom.volatility_multiplier.labels(symbol=symbol).set(vol_mult)
@@ -1107,17 +1184,55 @@ class MLEngine:
         trend_5m = buf.macro_trend(300)
         trend_15m = buf.macro_trend(900)
         bullish = trend_5m > self.cfg.bullish_trend_threshold and trend_15m > 0
+        shadow_only = False  # Flag: signal only for shadow training, no real trade
 
-        # Hard trend filter: block SHORT in strong uptrend, LONG in strong downtrend
-        # Counter-trend flip: if SHORT blocked by uptrend, try LONG instead
+        # Dynamic per-symbol confidence: raise threshold for symbols with poor WR
+        base_threshold = self.cfg.confidence_threshold
+        st = self._symbol_trades.get(symbol, {})
+        total = st.get("wins", 0) + st.get("losses", 0)
+        if total >= 3:
+            wr = st.get("wins", 0) / total
+            if wr < 0.40:
+                penalty = max(1.0, 3.0 - 2.5 * (wr / 0.40))
+                base_threshold = min(self.cfg.confidence_threshold * penalty, 0.95)
+                logger.info("Dynamic conf: %s WR=%.0f%% (%d/%d) → threshold=%.3f (base=%.3f)",
+                           symbol, wr * 100, st.get("wins", 0), total, base_threshold, self.cfg.confidence_threshold)
+
+        # Symbol+Setup escalation: 3+ losses in same symbol+regime+direction → threshold 0.80
+        setup_key = f"{symbol}_{direction}_{regime}"
+        setup_losses = self._symbol_setup_losses.get(setup_key, [])
+        if len(setup_losses) >= 3:
+            avg_setup_loss = sum(setup_losses) / len(setup_losses)
+            if avg_setup_loss < -0.10:
+                escalation = 0.80
+                if escalation > base_threshold:
+                    base_threshold = escalation
+                    logger.info("Symbol+Setup escalation: %s %s %s avg_loss=%.4f (%d losses) → threshold=%.3f",
+                               symbol, direction, regime, avg_setup_loss, len(setup_losses), base_threshold)
+
+        # Hard trend filter: block SHORT in uptrend, LONG in downtrend
+        # Counter-trend flip: if trend opposes, flip direction
+        flipped = False
         if direction == "SHORT" and trend_5m > 0.003:
+            # Strong uptrend → flip to LONG for real trade
             logger.info("Trend flip: %s SHORT→LONG (trend_5m=%.4f%% > 0.3%%)",
                        symbol, trend_5m * 100)
             direction = "LONG"
-        if direction == "LONG" and trend_5m < -0.003:
+            flipped = True
+        elif direction == "SHORT" and trend_5m > 0:
+            # Mild uptrend → block SHORT (don't trade against trend)
+            self._stats["hold_direction"] += 1
+            logger.info("Trend filter: %s SHORT blocked (trend_5m=%.4f%% > 0)",
+                       symbol, trend_5m * 100)
+            return None
+        elif direction == "LONG" and trend_5m < -0.003:
+            # Strong downtrend → flip to SHORT for real, but allow shadow LONG
             logger.info("Trend flip: %s LONG→SHORT (trend_5m=%.4f%% < -0.3%%)",
                        symbol, trend_5m * 100)
             direction = "SHORT"
+        elif direction == "LONG" and trend_5m < 0:
+            logger.info("Trend filter: %s LONG in downtrend (trend_5m=%.4f%% < 0, conf=%.3f)",
+                       symbol, trend_5m * 100, confidence)
 
         # Only relax when: bullish trend + model shows positive long EV + confidence >= 0.50
         long_ev = mem_info.get("long_avg_pnl", 0.0)
@@ -1129,13 +1244,28 @@ class MLEngine:
                        symbol, trend_5m, long_ev, confidence, long_conf_threshold)
 
         if direction == "SHORT":
-            threshold = self.cfg.confidence_threshold
+            threshold = base_threshold
+        elif flipped:
+            threshold = base_threshold
         else:
             threshold = long_conf_threshold
 
         if confidence <= threshold:
-            self._stats["hold_low_conf"] += 1
-            return None
+            if shadow_only:
+                logger.info("Shadow-only LONG: %s conf=%.3f below threshold %.3f, keeping for shadow",
+                           symbol, confidence, threshold)
+            else:
+                self._stats["hold_low_conf"] += 1
+                return None
+
+        # LONG trend filter: allow LONG even in downtrend with reduced confidence
+        if direction == "LONG":
+            trend_5m = buf.macro_trend(300)
+            trend_15m = buf.macro_trend(900)
+            if trend_5m < 0 and trend_15m < 0:
+                confidence = min(confidence, 0.30)
+                logger.info("LONG trend filter: %s trend_5m=%.4f trend_15m=%.4f → reduced conf=%.3f",
+                            symbol, trend_5m, trend_15m, confidence)
 
         dynamic_sl = mem_info.get("dynamic_sl_pct", 0.0)
         dynamic_tp = mem_info.get("dynamic_tp_pct", 0.0)
@@ -1227,6 +1357,7 @@ class MLEngine:
         signal["exit_opt_sl_pct"] = exit_sl
         signal["exit_opt_tp_pct"] = exit_tp
         signal["exit_trade_score"] = trade_score
+        signal["shadow_only"] = shadow_only
 
         if trade_score < 0.3:
             self._stats["hold_low_conf"] += 1
