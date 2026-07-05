@@ -28,11 +28,11 @@ ONLINE_LR = float(os.getenv("ONLINE_LR", "5e-6"))
 EWC_LAMBDA = float(os.getenv("EWC_LAMBDA", "1000.0"))
 REPLAY_BUFFER_SIZE = int(os.getenv("REPLAY_BUFFER_SIZE", "200"))
 REPLAY_BATCH = int(os.getenv("REPLAY_BATCH", "16"))
-PATTERN_MEMORY_SIZE = int(os.getenv("PATTERN_MEMORY_SIZE", "500"))
-PATTERN_SIMILARITY_THRESHOLD = float(os.getenv("PATTERN_SIMILARITY_THRESHOLD", "0.90"))
+PATTERN_MEMORY_SIZE = int(os.getenv("PATTERN_MEMORY_SIZE", "5000"))
+PATTERN_SIMILARITY_THRESHOLD = float(os.getenv("PATTERN_SIMILARITY_THRESHOLD", "0.85"))
+PATTERN_TTL_HOURS = float(os.getenv("PATTERN_TTL_HOURS", "0"))
 CONSECUTIVE_LOSS_THRESHOLD = int(os.getenv("CONSECUTIVE_LOSS_THRESHOLD", "10"))
-ONLINE_UPDATE_INTERVAL = int(os.getenv("ONLINE_UPDATE_INTERVAL", "15"))
-PATTERN_TTL_HOURS = float(os.getenv("PATTERN_TTL_HOURS", "12"))
+ONLINE_UPDATE_INTERVAL = int(os.getenv("ONLINE_UPDATE_INTERVAL", "5"))
 
 
 @dataclass
@@ -101,26 +101,40 @@ class PatternMemory:
             scored.sort(key=lambda x: x[0], reverse=True)
             return [p for _, p in scored[:k]]
 
-    def should_avoid(self, v_state: np.ndarray, regime: str, direction: str) -> Tuple[bool, float]:
+    def should_avoid(self, v_state: np.ndarray, regime: str, direction: str, symbol: str = "") -> Tuple[bool, float]:
         """Check if a trade pattern should be avoided based on historical losses.
 
-        If >= 5 similar patterns have avg loss < -$0.10, block the signal.
+        Block if same symbol has 3+ losses, or >= 3 similar state-vector patterns
+        with avg loss < -$0.05, or any single catastrophic loss.
         """
         now = time.time()
-        dir_key = f"{direction}_{regime}"
 
         similar = self.find_similar(v_state, regime, direction)
 
         with self._lock:
-            # Filter out expired patterns (TTL)
             if PATTERN_TTL_HOURS > 0:
                 cutoff = now - PATTERN_TTL_HOURS * 3600
                 similar = [p for p in similar if p.timestamp > cutoff]
-            if len(similar) < 5:
+
+            # Symbol-level: 3+ losses of same symbol → block
+            if symbol:
+                symbol_losses = [p for p in similar if p.symbol == symbol and p.pnl < 0]
+                if len(symbol_losses) >= 3:
+                    return True, np.mean([p.pnl for p in symbol_losses])
+
+            if not similar:
                 return False, 0.0
+
             avg_pnl = np.mean([p.pnl for p in similar])
+
+            # Single catastrophic loss: block immediately
+            for p in similar:
+                if p.pnl < -0.50:
+                    return True, p.pnl
+
+            # 3+ similar losses with avg loss < -$0.05: block
             loss_count = sum(1 for p in similar if p.pnl < 0)
-            if loss_count >= 5 and avg_pnl < -0.10:
+            if loss_count >= 3 and avg_pnl < -0.05:
                 return True, avg_pnl
             return False, avg_pnl
 

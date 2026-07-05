@@ -190,6 +190,18 @@ def _rows_to_sequences(rows: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarr
     if len(prices) >= 20:
         macro[19] = (prices[-1] - prices[0]) / max(prices[0], 1e-8)  # trend_1d
 
+    # Volume imbalance from trades (20)
+    buy_vol = sum(abs(v[0]) for v in flow_vals if v[0] > 0)
+    sell_vol = sum(abs(v[0]) for v in flow_vals if v[0] < 0)
+    trade_total = buy_vol + sell_vol
+    macro[20] = (buy_vol - sell_vol) / trade_total if trade_total > 0 else 0.0
+
+    # Funding rate proxy = OBI change (21)
+    if len(obi_vals) >= 2:
+        obi_first = obi_vals[0][0]
+        obi_last = obi_vals[-1][0]
+        macro[21] = float(np.clip(obi_last - obi_first, -1.0, 1.0))
+
     return ob_seq, flow_seq, macro
 
 

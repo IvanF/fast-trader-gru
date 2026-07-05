@@ -32,6 +32,7 @@ class RollingRetrainWorker:
         self._last_retrain_at = time.time()
         self._consecutive_losses = 0
         self._loss_streak_retrain_cooldown = 0
+        self._winning_trades = 0
 
     @property
     def trades_since_retrain(self) -> int:
@@ -54,8 +55,9 @@ class RollingRetrainWorker:
             self._consecutive_losses += 1
         else:
             self._consecutive_losses = 0
+            self._winning_trades += 1
 
-        CONSECUTIVE_LOSS_TRIGGER = int(os.getenv("CONSECUTIVE_LOSS_THRESHOLD", "3"))
+        CONSECUTIVE_LOSS_TRIGGER = int(os.getenv("CONSECUTIVE_LOSS_THRESHOLD", "10"))
         LOSS_STREAK_COOLDOWN = int(os.getenv("LOSS_STREAK_RETRAIN_COOLDOWN", "300"))
         now = time.time()
         if (self._consecutive_losses >= CONSECUTIVE_LOSS_TRIGGER
@@ -69,13 +71,15 @@ class RollingRetrainWorker:
             await self.trigger("consecutive_losses")
             return
 
-        if self._trades_since_retrain >= self.cfg.retrain_trade_threshold:
+        if self._winning_trades >= self.cfg.retrain_trade_threshold:
             logger.info(
-                "retrain trigger: %d trades reached threshold %d",
-                self._trades_since_retrain,
+                "retrain trigger: %d WINNING trades reached threshold %d",
+                self._winning_trades,
                 self.cfg.retrain_trade_threshold,
             )
             await self.trigger("trade_threshold")
+            self._winning_trades = 0
+            self._trades_since_retrain = 0
 
     async def interval_loop(self) -> None:
         while True:
@@ -117,7 +121,6 @@ class RollingRetrainWorker:
             "--hours", str(self.cfg.retrain_lookback_hours),
             "--epochs", str(self.cfg.retrain_epochs),
             "--trigger", reason,
-            "--incremental",
             "--device", self.cfg.train_device,
         ]
 

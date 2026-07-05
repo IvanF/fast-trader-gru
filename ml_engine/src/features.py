@@ -39,6 +39,13 @@ class TickPoint:
 
 
 @dataclass
+class OrderbookSnapshot:
+    ts: float
+    bids: list  # [(price, size), ...]
+    asks: list  # [(price, size), ...]
+
+
+@dataclass
 class SymbolBuffer:
     symbol: str
     window_sec: int = 300
@@ -48,6 +55,7 @@ class SymbolBuffer:
     price_history: Deque[Tuple[float, float]] = field(default_factory=deque)
     latest_bids: list = field(default_factory=list)
     latest_asks: list = field(default_factory=list)
+    ob_snapshots: Deque[OrderbookSnapshot] = field(default_factory=deque)
 
     def add_trade(self, ts_ms: int, price: float, size: float, side: str,
                   bid_vol: float = 0.0, ask_vol: float = 0.0) -> None:
@@ -70,6 +78,12 @@ class SymbolBuffer:
         if mid > 0:
             self.price_history.append((ts, mid))
         self.points.append(TickPoint(ts, mid, 0.0, "OB", bid_vol, ask_vol))
+        # Store raw orderbook snapshot for 2D tensor
+        raw_bids = [(_level_price(b), _level_size(b)) for b in bids[:20]]
+        raw_asks = [(_level_price(a), _level_size(a)) for a in asks[:20]]
+        self.ob_snapshots.append(OrderbookSnapshot(ts, raw_bids, raw_asks))
+        while len(self.ob_snapshots) > 60:
+            self.ob_snapshots.popleft()
         self._trim(ts)
 
     def last_mid(self) -> float:
@@ -212,6 +226,32 @@ class SymbolBuffer:
             np.tanh(ask_vol / 1e6),
         ], dtype=np.float32)
 
+    def funding_rate_change(self) -> float:
+        ob_points = [p for p in self.points if p.side == "OB"]
+        if len(ob_points) < 10:
+            return 0.0
+        recent = ob_points[-30:]
+        obi_vals = []
+        for p in recent:
+            total = p.bid_vol + p.ask_vol
+            if total > 0:
+                obi_vals.append((p.bid_vol - p.ask_vol) / total)
+        if len(obi_vals) < 2:
+            return 0.0
+        return float(np.clip(obi_vals[-1] - obi_vals[0], -1.0, 1.0))
+
+    def trade_volume_imbalance(self) -> float:
+        trades = [p for p in self.points if p.size > 0 and p.side != "OB"]
+        if not trades:
+            return 0.0
+        recent = trades[-30:]
+        buy_vol = sum(p.size for p in recent if p.side.upper() in ("BUY", "B"))
+        sell_vol = sum(p.size for p in recent if p.side.upper() not in ("BUY", "B"))
+        total = buy_vol + sell_vol
+        if total <= 0:
+            return 0.0
+        return (buy_vol - sell_vol) / total
+
     def feature_vector(self) -> np.ndarray:
         obi = self.order_book_imbalance()
         cvd_norm = np.tanh(self.cvd / 1e6)
@@ -227,11 +267,15 @@ class SymbolBuffer:
         pre_entry_sweep = self._pre_entry_sweep()
         fill_delay_norm = self._fill_delay_norm()
 
+        vol_imbalance = self.trade_volume_imbalance()
+        funding_chg = self.funding_rate_change()
+
         base = np.array([
             obi, cvd_norm, ofs, vwap_dev,
             trend_5m, trend_15m, trend_1h, trend_4h, trend_1d,
             self.funding_rate,
             obi_reversal, pre_entry_sweep, fill_delay_norm,
+            vol_imbalance, funding_chg,
         ], dtype=np.float32)
         return np.concatenate([base, self.liquidity_features()])
 
@@ -243,10 +287,50 @@ class SymbolBuffer:
         for p in obs[-length:]:
             total = p.bid_vol + p.ask_vol
             obi = (p.bid_vol - p.ask_vol) / total if total > 0 else 0.0
-            seq.append([obi, p.bid_vol - p.ask_vol])
+            norm_diff = np.tanh((p.bid_vol - p.ask_vol) / max(total, 1e-8))
+            seq.append([obi, norm_diff])
         while len(seq) < length:
             seq.insert(0, [0.0, 0.0])
         return np.array(seq[-length:], dtype=np.float32)
+
+    def orderbook_tensor_2d(self, depth: int = 20, length: int = 60) -> np.ndarray:
+        """Build 2D orderbook tensor (length, depth, 2) for Conv2d CNN.
+
+        Each timestep: depth levels × 2 features (relative_price, z_normalized_volume).
+        Z-score normalization: size / mean_size_in_snapshot.
+        """
+        tensor = np.zeros((length, depth, 2), dtype=np.float32)
+        snapshots = list(self.ob_snapshots)[-length:]
+        if not snapshots:
+            return tensor
+
+        for t, snap in enumerate(snapshots):
+            all_sizes = [s for _, s in snap.bids[:depth]] + [s for _, s in snap.asks[:depth]]
+            mean_size = np.mean(all_sizes) if all_sizes else 1.0
+            mean_size = max(mean_size, 1e-8)
+
+            ref_bid = snap.bids[0][0] if snap.bids else 0.0
+            ref_ask = snap.asks[0][0] if snap.asks else 0.0
+            if ref_bid <= 0 or ref_ask <= 0:
+                continue
+            mid = (ref_bid + ref_ask) / 2.0
+
+            for i in range(depth):
+                if i < len(snap.bids):
+                    price, size = snap.bids[i]
+                    tensor[t, i, 0] = (price - mid) / mid if mid > 0 else 0.0
+                    tensor[t, i, 1] = size / mean_size
+                else:
+                    tensor[t, i, 0] = 0.0
+                    tensor[t, i, 1] = 0.0
+
+            for i in range(depth):
+                if i < len(snap.asks):
+                    price, size = snap.asks[i]
+                    tensor[t, i, 0] = (price - mid) / mid if mid > 0 else 0.0
+                    tensor[t, i, 1] = -size / mean_size
+
+        return tensor
 
     def flow_sequence(self, length: int = 60) -> np.ndarray:
         trades = [p for p in self.points if p.size > 0]
