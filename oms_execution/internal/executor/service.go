@@ -1287,9 +1287,9 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 				"qty", exSize,
 			)
 			s.cancelExitOrders(ctx, pos)
-			side := "Sell"
+			side := "Buy"
 			if pos.Direction == "LONG" {
-				side = "Buy"
+				side = "Sell"
 			}
 			_, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, exSize, pos.QtyStep)
 			if err != nil {
