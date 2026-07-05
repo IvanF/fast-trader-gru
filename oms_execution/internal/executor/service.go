@@ -1274,17 +1274,34 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 
 	s.retryMissingTakeProfits(ctx, pos, ob)
 
-	// HARD TIME-STOP: force close after 300 seconds regardless of R-level
+	// HARD TIME-STOP: force market close after 300 seconds
 	const HardTimeStopSec = 300
 	holdSec := (time.Now().UnixMilli() - pos.EntryTime) / 1000
-	if holdSec > HardTimeStopSec && !pos.TimeStopPlaced {
-		s.logger.Warn("HARD TIME-STOP triggered",
-			"symbol", pos.Symbol,
-			"hold_sec", holdSec,
-			"limit_sec", HardTimeStopSec,
-		)
-		s.timeStopLimitExit(ctx, pos, ob)
-		return
+	if holdSec > HardTimeStopSec {
+		// Always check exchange position — don't trust TimeStopPlaced flag
+		exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
+		if hasPos && exSize > 0 {
+			s.logger.Warn("HARD TIME-STOP — market close",
+				"symbol", pos.Symbol,
+				"hold_sec", holdSec,
+				"qty", exSize,
+			)
+			s.cancelExitOrders(ctx, pos)
+			side := "Sell"
+			if pos.Direction == "LONG" {
+				side = "Buy"
+			}
+			_, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, exSize, pos.QtyStep)
+			if err != nil {
+				s.logger.Error("hard time-stop market close failed", "symbol", pos.Symbol, "error", err)
+			}
+			pos.TimeStopPlaced = true
+			return
+		}
+		if !hasPos {
+			s.tryFinalizePosition(ctx, pos, "time_stop", 0)
+			return
+		}
 	}
 
 	if s.monitorExitOrders(ctx, pos) {
