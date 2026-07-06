@@ -8,7 +8,7 @@ import (
 const (
 	KellyFraction     = 0.5   // Half-Kelly for safety
 	MaxRiskPerTrade   = 0.02  // Hard limit: 2% of deposit per trade
-	MaxSLPct          = 0.005 // Hard SL cap: 0.5%
+	MaxSLPct          = 0.008 // Hard SL cap: 0.8% (matches BuildExitGrid maxSLPct)
 	WickBufferMult    = 1.5   // Wick buffer multiplier
 	ATRMult           = 2.0   // ATR multiplier for base SL
 	MaxTickSizePct    = 0.001 // Max tick size as % of price: 0.1%
