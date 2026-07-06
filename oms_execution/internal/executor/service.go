@@ -1474,6 +1474,12 @@ func (s *Service) handleGhostPosition(ctx context.Context, pos *models.ActivePos
 		}
 
 		closeReason := "exchange_closed"
+
+		// Hard time-stop: if position was closed by our time-stop logic, use that reason
+		if pos.TimeStopPlaced {
+			closeReason = "time_stop"
+		}
+
 		for _, tp := range pos.TakeProfitOrders {
 			if tp.Price > 0 {
 				tpDist := math.Abs(closed.AvgExitPrice-tp.Price) / tp.Price
