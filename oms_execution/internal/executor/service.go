@@ -1311,15 +1311,15 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 
 	s.retryMissingTakeProfits(ctx, pos, ob)
 
-	// HARD TIME-STOP: passive Maker close after 120 seconds, market fallback
-	const HardTimeStopSec = 120
-	const MakerFillTimeoutSec = 8
+	// HARD TIME-STOP: 2-stage FSM — PostOnly → Kill-Switch after 5s
+	const HardTimeStopSec = 180
+	const MakerFillTimeoutSec = 5
 	holdSec := (time.Now().UnixMilli() - pos.EntryTime) / 1000
 	if holdSec > HardTimeStopSec {
 		exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
 		if hasPos && exSize > 0 {
 			if !pos.TimeStopPlaced {
-				s.logger.Warn("HARD TIME-STOP — passive Maker close",
+				s.logger.Warn("HARD TIME-STOP — initiating 2-stage exit",
 					"symbol", pos.Symbol,
 					"hold_sec", holdSec,
 					"qty", exSize,
@@ -1337,31 +1337,47 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 					orderID, orderErr := s.bybit.PlaceReducePostOnlyLimit(ctx, pos.Symbol, side, normQty, pos.QtyStep, bybit.FormatPrice(exitPrice))
 					if orderErr == nil {
 						pos.TimeStopPlaced = true
-						s.logger.Info("HARD TIME-STOP — PostOnly Maker order placed",
+						s.logger.Info("HARD TIME-STOP stage 1 — PostOnly Maker order placed",
 							"symbol", pos.Symbol, "price", exitPrice, "qty", normQty, "order_id", orderID)
 
 						s.goWithTimeout(ctx, MakerFillTimeoutSec, func() {
+						s.mu.Lock()
+						currentPos, exists := s.positions[pos.Symbol]
+						if !exists || currentPos == nil || !currentPos.TimeStopPlaced {
+							s.mu.Unlock()
+							return
+						}
+						s.mu.Unlock()
+
 							oi, oiErr := s.bybit.GetOrderRealtime(ctx, pos.Symbol, orderID)
 							if oiErr == nil && oi.OrderStatus == "New" {
-								s.logger.Warn("HARD TIME-STOP — Maker not filled, market fallback",
-									"symbol", pos.Symbol)
+								s.logger.Warn("HARD TIME-STOP stage 2 — Market Kill-Switch!",
+									"symbol", pos.Symbol,
+									"order_id", orderID)
 								_ = s.bybit.CancelOrder(ctx, pos.Symbol, orderID)
+
 								_, merr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
 								if merr != nil {
-									s.logger.Error("hard time-stop fallback market close failed",
+									s.logger.Error("Market Kill-Switch failed",
 										"symbol", pos.Symbol, "error", merr)
+								} else {
+									s.logger.Info("Market Kill-Switch executed",
+										"symbol", pos.Symbol)
 								}
 							}
 						})
 						return
 					}
-					s.logger.Warn("HARD TIME-STOP — PostOnly failed, market fallback",
+					s.logger.Warn("HARD TIME-STOP — PostOnly failed, immediate market Kill-Switch",
 						"symbol", pos.Symbol, "error", orderErr)
 				}
 
+				s.logger.Warn("HARD TIME-STOP — immediate market Kill-Switch",
+					"symbol", pos.Symbol, "qty", normQty)
 				_, mktErr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
 				if mktErr != nil {
-					s.logger.Error("hard time-stop market close failed", "symbol", pos.Symbol, "error", mktErr)
+					s.logger.Error("Market Kill-Switch failed",
+						"symbol", pos.Symbol, "error", mktErr)
 				}
 				pos.TimeStopPlaced = true
 				return
@@ -1377,8 +1393,8 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 		return
 	}
 
-	// 180s BREAKEVEN: move SL to breakeven after 3 minutes if not yet done
-	if holdSec > 180 && !pos.BreakevenSet {
+	// BREAKEVEN: move SL to breakeven after 90 seconds if not yet done
+	if holdSec > 90 && !pos.BreakevenSet {
 		mid := grid.MidPrice(ob)
 		if mid > 0 {
 			commissionBuffer := pos.FillPrice * 0.0013 // 0.13% covers both sides
@@ -1398,11 +1414,11 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 					slQty := s.slCoverQty(pos, exSize)
 					if slQty > 0 {
 						if err := s.atomicReplaceStopLoss(ctx, pos, breakevenPrice, slQty, "breakeven"); err != nil {
-							s.logger.Warn("180s breakeven SL replace failed",
-								"symbol", pos.Symbol, "error", err)
+				s.logger.Warn("90s breakeven SL replace failed",
+					"symbol", pos.Symbol, "error", err)
 						} else {
 							pos.BreakevenSet = true
-							s.logger.Info("180s breakeven SL set",
+							s.logger.Info("90s breakeven SL set",
 								"symbol", pos.Symbol,
 								"breakeven", breakevenPrice,
 								"fill", pos.FillPrice,
