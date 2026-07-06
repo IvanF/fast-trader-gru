@@ -71,59 +71,144 @@ class FlowGRUAttention(nn.Module):
         return self.fc(pooled)
 
 
-class FusionModel(nn.Module):
-    """Late-fusion backbone producing the master state vector.
+class DeltaBarEncoder(nn.Module):
+    """Encode 50ms delta bars into token embeddings.
 
-    ob_seq: (batch, 1, depth=20, seq_len=60) — 2D orderbook tensor for Conv2d.
-    flow_seq: (batch, seq_len=60, flow_dim=3) — trade flow for GRU.
-    macro: (batch, macro_dim=22) — macro features.
+    Input: (batch, seq_len, 6) — 6 features per delta bar
+    Output: (batch, seq_len, d_model) — token embeddings
     """
 
-    def __init__(self, state_dim: int = STATE_DIM) -> None:
+    def __init__(self, in_features: int = 6, d_model: int = 64) -> None:
         super().__init__()
-        self.cnn = OrderbookCNN()
-        self.gru = FlowGRUAttention()
-        self.macro_proj = nn.Linear(MACRO_DIM, state_dim - 2 * EMBED_DIM)
+        self.proj = nn.Sequential(
+            nn.Linear(in_features, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
+class MultimodalCrossAttention(nn.Module):
+    """Cross-Attention: TradeFlow (Q) scans Orderbook (K,V) with macro bias.
+
+    TradeFlow tokens query spatial orderbook levels to find
+    where aggressive flow meets passive liquidity.
+    """
+
+    def __init__(self, d_model: int = 64) -> None:
+        super().__init__()
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.macro_gate = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.scale = d_model ** 0.5
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor,
+                value: torch.Tensor, macro_bias: torch.Tensor) -> torch.Tensor:
+        """
+        query: (batch, q_len, d_model) — trade flow / delta bars
+        key:   (batch, k_len, d_model) — orderbook tokens
+        value: (batch, k_len, d_model) — orderbook tokens
+        macro_bias: (batch, d_model) — macro context vector
+        """
+        Q = self.q_proj(query)
+        K = self.k_proj(key)
+        V = self.v_proj(value)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+
+        # Add macro context as bias to attention scores
+        gate = torch.tanh(self.macro_gate(macro_bias))
+        scores = scores + gate.unsqueeze(1)
+
+        weights = torch.softmax(scores, dim=-1)
+        context = torch.matmul(weights, V)
+        return self.out_proj(context)
+
+
+class FusionModel(nn.Module):
+    """Backbone producing the master state vector.
+
+    Legacy mode: CNN + GRU + macro_proj → concat → 128-dim
+    Cross-Attention mode: CrossAttention(Flow→OB) + DeltaBarEncoder + macro → 128-dim
+    """
+
+    def __init__(self, state_dim: int = STATE_DIM, use_cross_attention: bool = False) -> None:
+        super().__init__()
+        self.use_cross_attention = use_cross_attention
         self.state_dim = state_dim
 
+        if use_cross_attention:
+            self.ob_encoder = nn.Linear(2, 64)  # ob_seq → tokens
+            self.delta_encoder = DeltaBarEncoder(in_features=6, d_model=64)
+            self.cross_attn = MultimodalCrossAttention(d_model=64)
+            self.pool = nn.AdaptiveAvgPool1d(1)
+            self.out_proj = nn.Linear(64, state_dim)
+        else:
+            self.cnn = OrderbookCNN()
+            self.gru = FlowGRUAttention()
+            self.macro_proj = nn.Linear(MACRO_DIM, state_dim - 2 * EMBED_DIM)
+
     def forward(
-        self, ob_seq: torch.Tensor, flow_seq: torch.Tensor, macro: torch.Tensor
+        self, ob_seq: torch.Tensor, flow_seq: torch.Tensor, macro: torch.Tensor,
+        delta_bars: torch.Tensor = None,
     ) -> torch.Tensor:
-        cnn_out = self.cnn(ob_seq)
-        gru_out = self.gru(flow_seq)
-        macro_out = self.macro_proj(macro)
-        fused = torch.cat([cnn_out, gru_out, macro_out], dim=-1)
-        if fused.shape[-1] < self.state_dim:
-            pad = torch.zeros(fused.shape[0], self.state_dim - fused.shape[-1], device=fused.device)
-            fused = torch.cat([fused, pad], dim=-1)
-        return fused[:, : self.state_dim]
+        if self.use_cross_attention and delta_bars is not None:
+            # ob_seq: (batch, seq_len, 2) → encode to tokens
+            ob_tokens = self.ob_encoder(ob_seq)  # (batch, seq, 64)
+            # delta_bars: (batch, bar_len, 6) → encode to tokens
+            flow_tokens = self.delta_encoder(delta_bars)  # (batch, bar_len, 64)
+            # macro → context vector
+            macro_out = self.macro_proj(macro)  # (batch, 64)
+            # Cross-Attention: flow queries, ob keys/values, macro bias
+            context = self.cross_attn(flow_tokens, ob_tokens, ob_tokens, macro_out)
+            pooled = context.mean(dim=1)  # (batch, 64)
+            return self.out_proj(pooled)[:, :self.state_dim]
+        else:
+            cnn_out = self.cnn(ob_seq)
+            gru_out = self.gru(flow_seq)
+            macro_out = self.macro_proj(macro)
+            fused = torch.cat([cnn_out, gru_out, macro_out], dim=-1)
+            if fused.shape[-1] < self.state_dim:
+                pad = torch.zeros(fused.shape[0], self.state_dim - fused.shape[-1], device=fused.device)
+                fused = torch.cat([fused, pad], dim=-1)
+            return fused[:, : self.state_dim]
 
 
 class DecisionMLP(nn.Module):
-    """Direction + confidence + vol + trap heads."""
+    """Direction + confidence + vol + trap + toxic heads.
+
+    Legacy mode (out_dim=6): direction[0:3] + confidence[3] + vol_mult[4] + trap[5]
+    PnL mode (out_dim=3): pred_pnl[0] + trap_logit[1] + toxic_logit[2]
+    """
 
     def __init__(self, in_dim: int = MLP_IN_DIM, out_dim: int = 6, dropout: float = 0.45) -> None:
         super().__init__()
-        self.net = nn.Sequential(
+        self.out_dim = out_dim
+        self.shared = nn.Sequential(
             nn.Linear(in_dim, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(64, 32),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(32, out_dim),
         )
+        self.head = nn.Linear(32, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        h = self.shared(x)
+        return self.head(h)
 
 
 class TradingModel(nn.Module):
     """End-to-end model for joint training."""
 
-    def __init__(self) -> None:
+    def __init__(self, use_cross_attention: bool = False) -> None:
         super().__init__()
-        self.fusion = FusionModel()
+        self.fusion = FusionModel(use_cross_attention=use_cross_attention)
         self.decision = DecisionMLP()
 
     def forward(
@@ -132,8 +217,9 @@ class TradingModel(nn.Module):
         flow_seq: torch.Tensor,
         macro: torch.Tensor,
         v_memory: torch.Tensor,
+        delta_bars: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        state = self.fusion(ob_seq, flow_seq, macro)
+        state = self.fusion(ob_seq, flow_seq, macro, delta_bars=delta_bars)
         logits = self.decision(torch.cat([state, v_memory], dim=-1))
         return state, logits
 

@@ -45,6 +45,31 @@ class OrderbookSnapshot:
     asks: list  # [(price, size), ...]
 
 
+DELTA_BAR_MS = 50  # 50ms time-bins
+
+
+@dataclass
+class DeltaBar:
+    """50ms delta bar: changes over one time quantum."""
+    ts: float
+    delta_bid_vol: float = 0.0
+    delta_ask_vol: float = 0.0
+    market_buy_vol: float = 0.0
+    market_sell_vol: float = 0.0
+    trade_count: int = 0
+    price_velocity: float = 0.0  # dprice / 50ms
+
+    def to_array(self) -> np.ndarray:
+        return np.array([
+            self.delta_bid_vol,
+            self.delta_ask_vol,
+            self.market_buy_vol,
+            self.market_sell_vol,
+            float(self.trade_count),
+            self.price_velocity,
+        ], dtype=np.float32)
+
+
 @dataclass
 class SymbolBuffer:
     symbol: str
@@ -56,6 +81,14 @@ class SymbolBuffer:
     latest_bids: list = field(default_factory=list)
     latest_asks: list = field(default_factory=list)
     ob_snapshots: Deque[OrderbookSnapshot] = field(default_factory=deque)
+    delta_bars: Deque[DeltaBar] = field(default_factory=deque)
+    _bar_start_ts: float = 0.0
+    _bar_bid_vol: float = 0.0
+    _bar_ask_vol: float = 0.0
+    _bar_buy_vol: float = 0.0
+    _bar_sell_vol: float = 0.0
+    _bar_trade_count: int = 0
+    _bar_price_start: float = 0.0
 
     def add_trade(self, ts_ms: int, price: float, size: float, side: str,
                   bid_vol: float = 0.0, ask_vol: float = 0.0) -> None:
@@ -65,6 +98,8 @@ class SymbolBuffer:
         self.cvd += signed
         self.price_history.append((ts, price))
         self._trim(ts)
+        # Accumulate into current 50ms delta bar
+        self._accumulate_trade(ts, price, size, side)
 
     def add_orderbook(self, ts_ms: int, bids: list, asks: list) -> None:
         ts = ts_ms / 1000.0
@@ -78,13 +113,84 @@ class SymbolBuffer:
         if mid > 0:
             self.price_history.append((ts, mid))
         self.points.append(TickPoint(ts, mid, 0.0, "OB", bid_vol, ask_vol))
-        # Store raw orderbook snapshot for 2D tensor
         raw_bids = [(_level_price(b), _level_size(b)) for b in bids[:20]]
         raw_asks = [(_level_price(a), _level_size(a)) for a in asks[:20]]
         self.ob_snapshots.append(OrderbookSnapshot(ts, raw_bids, raw_asks))
         while len(self.ob_snapshots) > 60:
             self.ob_snapshots.popleft()
         self._trim(ts)
+        # Accumulate into current 50ms delta bar
+        self._accumulate_ob(ts, bid_vol, ask_vol, mid)
+
+    def _accumulate_trade(self, ts: float, price: float, size: float, side: str) -> None:
+        if self._bar_start_ts <= 0:
+            self._bar_start_ts = ts
+            self._bar_price_start = price
+        if ts - self._bar_start_ts >= DELTA_BAR_MS / 1000.0:
+            self._flush_delta_bar()
+            self._bar_start_ts = ts
+            self._bar_price_start = price
+        if side.upper() in ("BUY", "B"):
+            self._bar_buy_vol += size
+        else:
+            self._bar_sell_vol += size
+        self._bar_trade_count += 1
+
+    def _accumulate_ob(self, ts: float, bid_vol: float, ask_vol: float, mid: float) -> None:
+        if self._bar_start_ts <= 0:
+            self._bar_start_ts = ts
+            self._bar_price_start = mid
+        self._bar_bid_vol = bid_vol
+        self._bar_ask_vol = ask_vol
+        if mid > 0:
+            if self._bar_price_start <= 0:
+                self._bar_price_start = mid
+            price_vel = (mid - self._bar_price_start) / max(ts - self._bar_start_ts, 1e-6)
+            if ts - self._bar_start_ts >= DELTA_BAR_MS / 1000.0:
+                bar = DeltaBar(
+                    ts=self._bar_start_ts,
+                    delta_bid_vol=self._bar_bid_vol,
+                    delta_ask_vol=self._bar_ask_vol,
+                    market_buy_vol=self._bar_buy_vol,
+                    market_sell_vol=self._bar_sell_vol,
+                    trade_count=self._bar_trade_count,
+                    price_velocity=price_vel,
+                )
+                self.delta_bars.append(bar)
+                while len(self.delta_bars) > 100:
+                    self.delta_bars.popleft()
+                self._bar_start_ts = ts
+                self._bar_price_start = mid
+                self._bar_bid_vol = 0.0
+                self._bar_ask_vol = 0.0
+                self._bar_buy_vol = 0.0
+                self._bar_sell_vol = 0.0
+                self._bar_trade_count = 0
+
+    def _flush_delta_bar(self) -> None:
+        if self._bar_start_ts > 0 and self._bar_trade_count > 0:
+            bar = DeltaBar(
+                ts=self._bar_start_ts,
+                delta_bid_vol=self._bar_bid_vol,
+                delta_ask_vol=self._bar_ask_vol,
+                market_buy_vol=self._bar_buy_vol,
+                market_sell_vol=self._bar_sell_vol,
+                trade_count=self._bar_trade_count,
+                price_velocity=0.0,
+            )
+            self.delta_bars.append(bar)
+            while len(self.delta_bars) > 100:
+                self.delta_bars.popleft()
+
+    def delta_bar_sequence(self, length: int = 100) -> np.ndarray:
+        """Return (length, 6) tensor of 50ms delta bars."""
+        if not self.delta_bars:
+            return np.zeros((length, 6), dtype=np.float32)
+        bars = list(self.delta_bars)[-length:]
+        result = np.zeros((length, 6), dtype=np.float32)
+        for i, bar in enumerate(bars):
+            result[i] = bar.to_array()
+        return result
 
     def last_mid(self) -> float:
         if self.price_history:

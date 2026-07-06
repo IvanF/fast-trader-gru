@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"time"
 
@@ -48,9 +49,10 @@ func (s *Service) tryAdoptOrphan(ctx context.Context, exPos bybit.PositionInfo) 
 	s.mu.Lock()
 	_, tracked := s.positions[exPos.Symbol]
 	_, pending := s.pending[exPos.Symbol]
+	_, promoting := s._promoting[exPos.Symbol]
 	until, inCooldown := s.ghostCooldown[exPos.Symbol]
 	s.mu.Unlock()
-	if tracked || pending {
+	if tracked || pending || promoting {
 		return
 	}
 	if inCooldown && time.Now().UnixMilli() < until {
@@ -208,8 +210,37 @@ func (s *Service) adoptExchangePosition(ctx context.Context, exPos bybit.Positio
 		}
 	}
 
+	// Enforce MaxSLPct after ML override
+	maxSLPct := s.cfg.GetMaxSLPct(exPos.Symbol)
+	if maxSLPct > 0 {
+		slDistPct := math.Abs(fillPrice-plan.StopLoss) / fillPrice
+		if slDistPct > maxSLPct {
+			if direction == "LONG" {
+				plan.StopLoss = grid.RoundToTick(fillPrice*(1.0-maxSLPct), inst.TickSize)
+			} else {
+				plan.StopLoss = grid.RoundToTick(fillPrice*(1.0+maxSLPct), inst.TickSize)
+			}
+			s.logger.Info("orphan SL clamped to MaxSLPct",
+				"symbol", exPos.Symbol, "max_sl", maxSLPct, "sl", plan.StopLoss)
+		}
+	}
+
 	notional := qty * fillPrice
 	marginUSD := notional / float64(max(leverage, 1))
+
+	originalRisk := math.Abs(fillPrice - plan.StopLoss)
+	if originalRisk <= 0 {
+		originalRisk = fillPrice * minSLPct
+	}
+
+	entryTime := time.Now().UnixMilli()
+	candleIdx := int(entryTime / 60000)
+
+	var priceSnap []float64
+	if hist := s.priceHistory[exPos.Symbol]; len(hist) > 0 {
+		priceSnap = make([]float64, len(hist))
+		copy(priceSnap, hist)
+	}
 
 	pos := &models.ActivePosition{
 		Symbol:       exPos.Symbol,
@@ -221,7 +252,7 @@ func (s *Service) adoptExchangePosition(ctx context.Context, exPos bybit.Positio
 		TargetQty:    qty,
 		RemainingQty: qty,
 		StopLoss:     plan.StopLoss,
-		EntryTime:    time.Now().UnixMilli(),
+		EntryTime:    entryTime,
 		TimeStopSec:  timeStop,
 		QtyStep:      inst.Lot.QtyStep,
 		MinOrderQty:  inst.Lot.MinOrderQty,
@@ -230,7 +261,10 @@ func (s *Service) adoptExchangePosition(ctx context.Context, exPos bybit.Positio
 		NotionalUSD:  notional,
 		Leverage:     leverage,
 		Signal:       signal,
-		FilledAt:     time.Now().UnixMilli(),
+		FilledAt:     entryTime,
+		OriginalRisk: originalRisk,
+		PriceHistory: priceSnap,
+		EntryCandleIdx: candleIdx,
 	}
 
 	s.mu.Lock()
@@ -242,6 +276,8 @@ func (s *Service) adoptExchangePosition(ctx context.Context, exPos bybit.Positio
 	metrics.ActivePositions.Set(float64(len(s.positions)))
 	metrics.GridActive.WithLabelValues(exPos.Symbol).Set(1)
 	s.mu.Unlock()
+
+	s.persistPosition(ctx, pos)
 
 	s.logger.Warn("adopted orphan exchange position",
 		"symbol", exPos.Symbol,

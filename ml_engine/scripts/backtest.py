@@ -112,7 +112,7 @@ def run_backtest(
         v_state = state_vecs[i]
         v_memory = memory_vecs[i]
 
-        direction, confidence, vol_mult = inference.decide(v_state, v_memory)
+        direction, confidence, vol_mult, trap_prob = inference.decide(v_state, v_memory)
 
         if direction == "HOLD":
             no_signal_count += 1

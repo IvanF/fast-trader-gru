@@ -82,6 +82,32 @@ class DecoupledTrapLoss(nn.Module):
         return dir_loss + 0.5 * conf_loss + 1.5 * trap_loss
 
 
+TAKER_FEE = 0.00075
+MAKER_FEE = 0.00055
+
+
+class AsymmetricPnLLoss(nn.Module):
+    """Asymmetric MSE loss for Expected PnL regression.
+    
+    Overestimation of profit is penalized 2.5x more than underestimation.
+    True PnL is adjusted for full-round-trip fees (taker entry + maker exit).
+    """
+
+    def __init__(self, over_penalty: float = 2.5) -> None:
+        super().__init__()
+        self.over_penalty = over_penalty
+
+    def forward(
+        self,
+        pred_pnl: torch.Tensor,
+        true_pnl: torch.Tensor,
+    ) -> torch.Tensor:
+        effective_true = true_pnl - (TAKER_FEE + MAKER_FEE)
+        error = pred_pnl - effective_true
+        weights = torch.where(error > 0, self.over_penalty, 1.0)
+        return torch.mean(weights * error * error)
+
+
 def stratified_split(dataset: JoinedDataset, val_ratio: float = 0.15, min_val: int = 10) -> tuple:
     """Stratified train/val split preserving direction distribution."""
     n = len(dataset)
