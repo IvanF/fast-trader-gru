@@ -829,7 +829,7 @@ func (s *Service) timeStopLimitExit(ctx context.Context, pos *models.ActivePosit
 				"order_id", orderID,
 			)
 
-			s.goWithTimeout(ctx, 5, func() {
+			s.goWithTimeout(ctx, 30, func() {
 				s.mu.Lock()
 				currentPos, exists := s.positions[pos.Symbol]
 				if !exists || currentPos == nil || !currentPos.TimeStopPlaced {

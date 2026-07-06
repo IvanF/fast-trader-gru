@@ -451,12 +451,12 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 			}
 			if bidV+askV > 0 {
 				obi := (bidV - askV) / (bidV + askV)
-				if signal.Direction == "SHORT" && obi < -0.2 {
-					s.logger.Info("signal rejected — momentum against SHORT",
-						"symbol", signal.Symbol, "obi", fmt.Sprintf("%.3f", obi))
+			if signal.Direction == "SHORT" && obi < -0.4 {
+						s.logger.Info("signal rejected — momentum against SHORT",
+							"symbol", signal.Symbol, "obi", fmt.Sprintf("%.3f", obi))
 					return nil
 				}
-				if signal.Direction == "LONG" && obi > 0.2 {
+				if signal.Direction == "LONG" && obi > 0.4 {
 					s.logger.Info("signal rejected — momentum against LONG",
 						"symbol", signal.Symbol, "obi", fmt.Sprintf("%.3f", obi))
 					return nil
@@ -484,7 +484,7 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 				}
 			}
 
-			// Volume spike filter: reject if volume < 2× SMA (no conviction in quiet market)
+			// Volume filter: reject if volume < 0.5× SMA (dead market)
 			if vh := s.volumeHistory[signal.Symbol]; len(vh) >= 5 {
 				sum := 0.0
 				for _, v := range vh {
@@ -497,7 +497,7 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 					fmt.Sscanf(lv.Size, "%f", &v)
 					currentVol += v
 				}
-				if smaVol > 0 && currentVol < smaVol*2.0 {
+				if smaVol > 0 && currentVol < smaVol*0.5 {
 					s.logger.Info("signal rejected — volume too low",
 						"symbol", signal.Symbol,
 						"current_vol", fmt.Sprintf("%.1f", currentVol),
@@ -1311,9 +1311,10 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 
 	s.retryMissingTakeProfits(ctx, pos, ob)
 
-	// HARD TIME-STOP: 2-stage FSM — PostOnly → Kill-Switch after 5s
+	// HARD TIME-STOP: 2-stage FSM — PostOnly → Kill-Switch after 30s
 	const HardTimeStopSec = 180
-	const MakerFillTimeoutSec = 5
+	const MakerFillTimeoutSec = 30
+	const ZombieRetrySec = 120
 	holdSec := (time.Now().UnixMilli() - pos.EntryTime) / 1000
 	if holdSec > HardTimeStopSec {
 		exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
@@ -1380,6 +1381,25 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 						"symbol", pos.Symbol, "error", mktErr)
 				}
 				pos.TimeStopPlaced = true
+				return
+			}
+			// ZOMBIE RETRY: if TimeStopPlaced but still open after ZombieRetrySec, force market
+			if pos.TimeStopPlaced && holdSec > HardTimeStopSec+ZombieRetrySec {
+				s.logger.Error("ZOMBIE DETECTED — force market close",
+					"symbol", pos.Symbol, "hold_sec", holdSec, "qty", exSize)
+				pos.TimeStopPlaced = false
+				side := "Buy"
+				if pos.Direction == "LONG" {
+					side = "Sell"
+				}
+				normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
+				_, mktErr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
+				if mktErr != nil {
+					s.logger.Error("ZOMBIE force close failed", "symbol", pos.Symbol, "error", mktErr)
+				} else {
+					s.logger.Info("ZOMBIE force close executed", "symbol", pos.Symbol)
+					pos.TimeStopPlaced = true
+				}
 				return
 			}
 		}
