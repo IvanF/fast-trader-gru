@@ -811,6 +811,53 @@ func (s *Service) timeStopLimitExit(ctx context.Context, pos *models.ActivePosit
 		return
 	}
 
+	// Try passive PostOnly Maker close first
+	side := "Buy"
+	if pos.Direction == "LONG" {
+		side = "Sell"
+	}
+	normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
+	exitPrice := grid.PassiveMakerExitPrice(pos.Direction, ob, pos.TickSize, 1)
+	if exitPrice > 0 {
+		orderID, err := s.bybit.PlaceReducePostOnlyLimit(ctx, pos.Symbol, side, normQty, pos.QtyStep, bybit.FormatPrice(exitPrice))
+		if err == nil {
+			pos.TimeStopPlaced = true
+			s.logger.Info("time stop — PostOnly Maker order placed",
+				"symbol", pos.Symbol,
+				"price", exitPrice,
+				"qty", normQty,
+				"order_id", orderID,
+			)
+
+			s.goWithTimeout(ctx, 5, func() {
+				s.mu.Lock()
+				currentPos, exists := s.positions[pos.Symbol]
+				if !exists || currentPos == nil || !currentPos.TimeStopPlaced {
+					s.mu.Unlock()
+					return
+				}
+				s.mu.Unlock()
+
+				oi, oiErr := s.bybit.GetOrderRealtime(ctx, pos.Symbol, orderID)
+				if oiErr == nil && oi.OrderStatus == "New" {
+					s.logger.Warn("time stop Kill-Switch — PostOnly unfilled, market close",
+						"symbol", pos.Symbol, "order_id", orderID)
+					_ = s.bybit.CancelOrder(ctx, pos.Symbol, orderID)
+					_, merr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
+					if merr != nil {
+						s.logger.Error("time stop Kill-Switch failed", "symbol", pos.Symbol, "error", merr)
+					} else {
+						s.logger.Info("time stop Kill-Switch executed", "symbol", pos.Symbol)
+					}
+				}
+			})
+			return
+		}
+		s.logger.Warn("time stop PostOnly failed, falling back to SL-based exit",
+			"symbol", pos.Symbol, "error", err)
+	}
+
+	// Fallback: replace SL with best bid/ask price for immediate fill
 	var price float64
 	if pos.Direction == "LONG" {
 		price = liquidity.BestBid(ob)
@@ -825,16 +872,14 @@ func (s *Service) timeStopLimitExit(ctx context.Context, pos *models.ActivePosit
 		return
 	}
 
-	// Cancel TPs FIRST, then place SL for full remainder — avoids over-allocation
 	s.cancelTPOrdersOnly(ctx, pos)
 	if err := s.atomicReplaceStopLoss(ctx, pos, price, exSize, "time_stop"); err != nil {
 		s.logger.Error("time stop sl replace failed", "symbol", pos.Symbol, "error", err)
 		return
 	}
 	pos.TimeStopPlaced = true
-	s.logger.Info("time stop sl placed", "symbol", pos.Symbol, "price", price, "qty", exSize)
+	s.logger.Info("time stop sl placed (market fallback)", "symbol", pos.Symbol, "price", price, "qty", exSize)
 
-	// Deploy new TP grid after time_stop — position still has qty, needs exit plan
 	if len(pos.TakeProfitOrders) == 0 && exSize > pos.MinOrderQty {
 		pos.ExitGridReady = false
 	}

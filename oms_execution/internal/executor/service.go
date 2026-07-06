@@ -1341,13 +1341,13 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 							"symbol", pos.Symbol, "price", exitPrice, "qty", normQty, "order_id", orderID)
 
 						s.goWithTimeout(ctx, MakerFillTimeoutSec, func() {
-						s.mu.Lock()
-						currentPos, exists := s.positions[pos.Symbol]
-						if !exists || currentPos == nil || !currentPos.TimeStopPlaced {
+							s.mu.Lock()
+							currentPos, exists := s.positions[pos.Symbol]
+							if !exists || currentPos == nil || !currentPos.TimeStopPlaced {
+								s.mu.Unlock()
+								return
+							}
 							s.mu.Unlock()
-							return
-						}
-						s.mu.Unlock()
 
 							oi, oiErr := s.bybit.GetOrderRealtime(ctx, pos.Symbol, orderID)
 							if oiErr == nil && oi.OrderStatus == "New" {
