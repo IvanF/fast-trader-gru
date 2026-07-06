@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.influx_join import build_joined_dataset
 from src.influx_store import InfluxStore
-from src.models.nn_models import TradingModel
+from src.models.nn_models import TradingModel, DecisionMLP, MLP_IN_DIM
 from src.onnx_deploy import export_onnx_models, promote_models, publish_reload, validate_onnx
 from src.train_device import resolve_train_device
 
@@ -214,8 +214,9 @@ def train_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    trap_loss: DecoupledTrapLoss,
+    loss_fn,
     max_grad_norm: float,
+    predict_pnl: bool = False,
 ) -> float:
     model.train()
     total = 0.0
@@ -232,12 +233,15 @@ def train_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         _, logits = model(ob, flow, macro, memory)
-        targets = {
-            "direction": direction,
-            "confidence": confidence,
-            "is_trap_label": is_trap,
-        }
-        loss = trap_loss(logits, targets)
+        if predict_pnl:
+            loss = loss_fn(logits[:, 0], pnl)
+        else:
+            targets = {
+                "direction": direction,
+                "confidence": confidence,
+                "is_trap_label": is_trap,
+            }
+            loss = loss_fn(logits, targets)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
@@ -251,10 +255,13 @@ def eval_epoch(
     model: TradingModel,
     loader: DataLoader,
     device: torch.device,
-    trap_loss: DecoupledTrapLoss,
+    loss_fn,
+    predict_pnl: bool = False,
 ) -> tuple[float, float, float]:
     model.eval()
-    total, correct, n = 0.0, 0, 0
+    total = 0.0
+    correct = 0
+    n = 0
     trap_correct = 0
     trap_total = 0
     for ob, flow, macro, memory, direction, confidence, pnl, is_trap, sample_weight in loader:
@@ -267,15 +274,27 @@ def eval_epoch(
         is_trap = is_trap.to(device, non_blocking=True)
         confidence = confidence.to(device, non_blocking=True)
         _, logits = model(ob, flow, macro, memory)
-        targets = {
-            "direction": direction,
-            "confidence": confidence,
-            "is_trap_label": is_trap,
-        }
-        total += float(trap_loss(logits, targets).item()) * len(direction)
-        correct += int((logits[:, :3].argmax(dim=1) == direction).sum().item())
-        trap_pred = (torch.sigmoid(logits[:, 5]) > 0.5).float()
-        trap_correct += int((trap_pred == is_trap).sum().item())
+
+        if predict_pnl:
+            pred_pnl = logits[:, 0]
+            loss = loss_fn(pred_pnl, pnl)
+            total += float(loss.item()) * len(direction)
+            # Direction accuracy from sign of pred_pnl
+            pred_dir = torch.where(pred_pnl > 0, torch.tensor(0, device=device), torch.tensor(1, device=device))
+            correct += int((pred_dir == direction).sum().item())
+            # Trap accuracy from toxic head (logits[:, 2])
+            trap_pred = (torch.sigmoid(logits[:, 2]) > 0.5).float()
+            trap_correct += int((trap_pred == is_trap).sum().item())
+        else:
+            targets = {
+                "direction": direction,
+                "confidence": confidence,
+                "is_trap_label": is_trap,
+            }
+            total += float(loss_fn(logits, targets).item()) * len(direction)
+            correct += int((logits[:, :3].argmax(dim=1) == direction).sum().item())
+            trap_pred = (torch.sigmoid(logits[:, 5]) > 0.5).float()
+            trap_correct += int((trap_pred == is_trap).sum().item())
         trap_total += len(direction)
         n += len(direction)
     return total / max(n, 1), correct / max(n, 1), trap_correct / max(trap_total, 1)
@@ -400,11 +419,19 @@ def main() -> int:
         load_checkpoint(model, args.model_dir, device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    trap_loss_fn = DecoupledTrapLoss()
-    print(
-        f"loss=DecoupledTrapLoss weight_decay={args.weight_decay:g} "
-        f"max_grad_norm={args.max_grad_norm:g}"
-    )
+
+    predict_pnl = os.getenv("PREDICT_PNL", "false").lower() == "true"
+    if predict_pnl:
+        model.decision = DecisionMLP(in_dim=MLP_IN_DIM, out_dim=3).to(device)
+        if args.incremental:
+            load_checkpoint(model, args.model_dir, device)
+        loss_fn = AsymmetricPnLLoss()
+        print(f"loss=AsymmetricPnLLoss predict_pnl=True weight_decay={args.weight_decay:g} "
+              f"max_grad_norm={args.max_grad_norm:g}")
+    else:
+        loss_fn = DecoupledTrapLoss()
+        print(f"loss=DecoupledTrapLoss weight_decay={args.weight_decay:g} "
+              f"max_grad_norm={args.max_grad_norm:g}")
 
     initial_loss = 0.0
     final_loss = 0.0
@@ -414,10 +441,10 @@ def main() -> int:
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(
-            model, train_loader, optimizer, device, trap_loss_fn,
-            args.max_grad_norm,
+            model, train_loader, optimizer, device, loss_fn,
+            args.max_grad_norm, predict_pnl,
         )
-        val_loss, val_acc, val_trap_acc = eval_epoch(model, val_loader, device, trap_loss_fn)
+        val_loss, val_acc, val_trap_acc = eval_epoch(model, val_loader, device, loss_fn, predict_pnl)
         if epoch == 1:
             initial_loss = val_loss
         final_loss = val_loss
@@ -442,12 +469,19 @@ def main() -> int:
             macro = macro.to(device, non_blocking=True)
             memory = memory.to(device, non_blocking=True)
             _, logits = mdl(ob, flow, macro, memory)
-            pred = logits[:, :3].argmax(dim=1)
-            conf = torch.sigmoid(logits[:, 3])
-            for p, c in zip(pred.tolist(), conf.tolist()):
-                total += 1
-                if p != 2 and c >= 0.30:
-                    acted += 1
+            if predict_pnl:
+                pred_pnl = logits[:, 0]
+                for p in pred_pnl.tolist():
+                    total += 1
+                    if abs(p) >= 0.0015:
+                        acted += 1
+            else:
+                pred = logits[:, :3].argmax(dim=1)
+                conf = torch.sigmoid(logits[:, 3])
+                for p, c in zip(pred.tolist(), conf.tolist()):
+                    total += 1
+                    if p != 2 and c >= 0.30:
+                        acted += 1
         return acted / max(total, 1)
 
     signal_rate = _check_signal_rate(model, val_loader, device)

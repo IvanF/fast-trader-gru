@@ -102,7 +102,7 @@ class MultimodalCrossAttention(nn.Module):
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
-        self.macro_gate = nn.Linear(d_model, d_model)
+        self.macro_gate = nn.Linear(d_model, 1)
         self.out_proj = nn.Linear(d_model, d_model)
         self.scale = d_model ** 0.5
 
@@ -120,9 +120,9 @@ class MultimodalCrossAttention(nn.Module):
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
 
-        # Add macro context as bias to attention scores
-        gate = torch.tanh(self.macro_gate(macro_bias))
-        scores = scores + gate.unsqueeze(1)
+        # macro_gate: (batch, d_model) → (batch, 1) → broadcast to (batch, q_len, k_len)
+        gate = torch.tanh(self.macro_gate(macro_bias))  # (batch, 1)
+        scores = scores + gate.unsqueeze(-1)
 
         weights = torch.softmax(scores, dim=-1)
         context = torch.matmul(weights, V)
@@ -145,7 +145,7 @@ class FusionModel(nn.Module):
             self.ob_encoder = nn.Linear(2, 64)  # ob_seq → tokens
             self.delta_encoder = DeltaBarEncoder(in_features=6, d_model=64)
             self.cross_attn = MultimodalCrossAttention(d_model=64)
-            self.pool = nn.AdaptiveAvgPool1d(1)
+            self.macro_proj = nn.Linear(MACRO_DIM, 64)
             self.out_proj = nn.Linear(64, state_dim)
         else:
             self.cnn = OrderbookCNN()
