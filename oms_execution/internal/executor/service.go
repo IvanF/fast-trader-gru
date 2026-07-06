@@ -22,6 +22,8 @@ import (
 	"github.com/fast-trader-gru/oms_execution/internal/risk"
 )
 
+const DynamicConfCap = 0.45
+
 type Service struct {
 	cfg       config.Config
 	bybit     *bybit.Client
@@ -90,8 +92,8 @@ func (ss *SymbolStats) Penalty() float64 {
 
 func (ss *SymbolStats) EffectiveConfidence(baseConf float64) float64 {
 	effective := baseConf * ss.Penalty()
-	if effective > 0.60 {
-		effective = 0.60
+	if effective > DynamicConfCap {
+		effective = DynamicConfCap
 	}
 	return effective
 }
