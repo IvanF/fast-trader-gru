@@ -1308,6 +1308,46 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 		return
 	}
 
+	// 180s BREAKEVEN: move SL to breakeven after 3 minutes if not yet done
+	if holdSec > 180 && !pos.BreakevenSet {
+		mid := grid.MidPrice(ob)
+		if mid > 0 {
+			commissionBuffer := pos.FillPrice * 0.0013 // 0.13% covers both sides
+			var breakevenPrice float64
+			if pos.Direction == "LONG" {
+				breakevenPrice = pos.FillPrice + commissionBuffer
+			} else {
+				breakevenPrice = pos.FillPrice - commissionBuffer
+			}
+			breakevenPrice = math.Round(breakevenPrice/pos.TickSize) * pos.TickSize
+
+			// Only tighten (never widen)
+			if pos.Direction == "LONG" && breakevenPrice > pos.StopLoss ||
+				pos.Direction == "SHORT" && breakevenPrice < pos.StopLoss {
+				exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
+				if hasPos && exSize > 0 {
+					slQty := s.slCoverQty(pos, exSize)
+					if slQty > 0 {
+						if err := s.atomicReplaceStopLoss(ctx, pos, breakevenPrice, slQty, "breakeven"); err != nil {
+							s.logger.Warn("180s breakeven SL replace failed",
+								"symbol", pos.Symbol, "error", err)
+						} else {
+							pos.BreakevenSet = true
+							s.logger.Info("180s breakeven SL set",
+								"symbol", pos.Symbol,
+								"breakeven", breakevenPrice,
+								"fill", pos.FillPrice,
+								"hold_sec", holdSec,
+							)
+						}
+					}
+				}
+			} else {
+				pos.BreakevenSet = true // Already at or past breakeven
+			}
+		}
+	}
+
 	// PositionManager: ATR-based triggers (scale-out, breakeven, chandelier)
 	s.runPositionManager(ctx, pos, ob)
 
@@ -1475,6 +1515,8 @@ func (s *Service) finalizeClose(
 	s.removePosition(ctx, pos.Symbol)
 
 	s.logger.Info("position closed",
+		"symbol", pos.Symbol,
+		"direction", pos.Direction,
 		"reason", reason,
 		"pnl", pnl,
 		"exchange_pnl", exchangePnL,

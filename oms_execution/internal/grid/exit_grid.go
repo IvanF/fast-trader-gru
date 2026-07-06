@@ -109,8 +109,11 @@ func BuildExitGrid(
 		vm = 1.0
 	}
 
-	minSLPct := opts.MinSLPct
-	maxSLPct := opts.MaxSLPct
+	// SL bounds adapted for crypto volatility.
+	// minSLPct=0.3% prevents noise-triggered SL while allowing tight risk.
+	// maxSLPct=0.8% hard-caps SL to prevent oversized risk per trade.
+	minSLPct := 0.003 // 0.3% minimum SL distance
+	maxSLPct := 0.008 // 0.8% maximum SL distance (hard cap)
 
 	if vm > 0 && vm != 1.0 {
 		slVolMult := math.Sqrt(vm)
@@ -278,24 +281,24 @@ func BuildExitGrid(
 		}
 	}
 
-	// === R:R enforcement: TP must be >= 0.7x SL distance ===
+	// === R:R enforcement: TP must be >= 1.2x SL distance ===
 	slDist := math.Abs(fillPrice - slPrice)
 	tpDistCheck := math.Abs(tpPrice - fillPrice)
-	if slDist > 0 && tpDistCheck < slDist*0.7 {
+	if slDist > 0 && tpDistCheck < slDist*1.2 {
 		if direction == "LONG" {
-			tpPrice = roundToTick(fillPrice+slDist*0.7+tickSize, tickSize)
+			tpPrice = roundToTick(fillPrice+slDist*1.2+tickSize, tickSize)
 		} else {
-			tpPrice = roundToTick(fillPrice-slDist*0.7-tickSize, tickSize)
+			tpPrice = roundToTick(fillPrice-slDist*1.2-tickSize, tickSize)
 		}
 	}
 
 	// Re-verify after rounding
 	tpDistFinal := math.Abs(tpPrice - fillPrice)
-	if slDist > 0 && tpDistFinal < slDist*0.6 {
+	if slDist > 0 && tpDistFinal < slDist*1.0 {
 		if direction == "LONG" {
-			tpPrice = roundToTick(fillPrice+slDist*0.8, tickSize)
+			tpPrice = roundToTick(fillPrice+slDist*1.2, tickSize)
 		} else {
-			tpPrice = roundToTick(fillPrice-slDist*0.8, tickSize)
+			tpPrice = roundToTick(fillPrice-slDist*1.2, tickSize)
 		}
 	}
 

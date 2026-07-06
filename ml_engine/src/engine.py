@@ -84,6 +84,7 @@ class MLEngine:
         self._circuit_breaker_lock = threading.Lock()
         self._symbol_cooldowns: dict[str, float] = {}  # symbol -> expire timestamp
         self._toxic_prob_cache: float = 0.0  # toxic flow prob from last inference
+        self._pred_pnl_cache: float = 0.0  # raw pred_pnl from last inference
         self._symbol_setup_losses: dict[str, list[float]] = {}  # "SYMBOL_DIR_REGIME" -> [pnl1, pnl2, ...]
         self._corr_block_count_this_cycle = 0
         self._last_signal_at = time.time()
@@ -946,8 +947,9 @@ class MLEngine:
             direction = "LONG" if pred_pnl > 0 else "SHORT" if pred_pnl < 0 else "HOLD"
             confidence = min(abs(pred_pnl) / 0.01, 1.0) if abs(pred_pnl) >= 0.0015 else 0.0
             vol_mult = 1.0
-            # Store toxic_prob for later use
+            # Store toxic_prob and pred_pnl for later use
             self._toxic_prob_cache = toxic_prob
+            self._pred_pnl_cache = pred_pnl
             logger.info("PnL prediction: %s pred_pnl=%.4f dir=%s conf=%.3f toxic=%.3f trap=%.3f",
                         symbol, pred_pnl, direction, confidence, toxic_prob, trap_prob)
         else:
@@ -1140,17 +1142,18 @@ class MLEngine:
                 logger.info("Trap Head LOG: %s trap=%.3f dir=%s conf=%.3f (not blocking)",
                             symbol, trap_prob, direction, confidence)
 
-        predict_pnl = os.getenv("PREDICT_PNL", "false").lower() == "true"
+        predict_pnl = True  # Forced: model is trained on PnL regression
         if predict_pnl:
             toxic_prob = self._toxic_prob_cache
-            TOXIC_THRESHOLD = float(os.getenv("TOXIC_THRESHOLD", "0.35"))
+            TOXIC_THRESHOLD = 0.40
             if toxic_prob > TOXIC_THRESHOLD:
                 self._stats["toxic_blocked"] = self._stats.get("toxic_blocked", 0) + 1
                 logger.info("TOXIC FLOW BLOCK: %s toxic=%.3f > %.3f → HOLD",
                             symbol, toxic_prob, TOXIC_THRESHOLD)
                 return None
-            min_pnl = float(os.getenv("MIN_PNL_THRESHOLD", "0.0015"))
-            if confidence < min_pnl / 0.01:
+
+            MIN_EDGE = 0.0025  # 0.25% minimum expected PnL
+            if abs(self._pred_pnl_cache) < MIN_EDGE:
                 self._stats["hold_low_conf"] += 1
                 return None
 
