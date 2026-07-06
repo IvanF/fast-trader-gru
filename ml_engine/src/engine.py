@@ -83,6 +83,7 @@ class MLEngine:
         self._tick_cycle_predictions = 0
         self._circuit_breaker_lock = threading.Lock()
         self._symbol_cooldowns: dict[str, float] = {}  # symbol -> expire timestamp
+        self._toxic_prob_cache: float = 0.0  # toxic flow prob from last inference
         self._symbol_setup_losses: dict[str, list[float]] = {}  # "SYMBOL_DIR_REGIME" -> [pnl1, pnl2, ...]
         self._corr_block_count_this_cycle = 0
         self._last_signal_at = time.time()
@@ -926,18 +927,33 @@ class MLEngine:
         )
 
     def _score_symbol(self, symbol: str, buf):
-        """Run ONNX inference and return (direction, confidence, vol_mult, trap_prob, state_vec, regime, memory_info, v_memory)."""
+        """Run ONNX inference and return (direction, confidence, vol_mult, trap_prob, state_vec, regime, memory_info, v_memory).
+
+        In PREDICT_PNL mode, confidence = normalized |pred_pnl|, trap_prob and toxic_prob are available.
+        """
         flow_seq = buf.flow_sequence()
         macro = buf.feature_vector()
 
-        # Use 2D Conv2d tensor when new ONNX model is available,
-        # otherwise use 1D Conv1d sequence (legacy models)
-        ob_seq = buf.orderbook_sequence()  # (seq_len=60, 2) Conv1d input
+        ob_seq = buf.orderbook_sequence()
         v_state = self.inference.infer_state_vector(ob_seq, flow_seq, macro)
         regime = self.regime.get(symbol)
         v_memory, memory_info = self.memory.query_with_metadata(v_state, regime.value, symbol=symbol)
 
-        direction, confidence, vol_mult, trap_prob = self.inference.decide(v_state, v_memory)
+        predict_pnl = os.getenv("PREDICT_PNL", "false").lower() == "true"
+
+        if predict_pnl:
+            pred_pnl, trap_prob, toxic_prob = self.inference.decide_pnl(v_state, v_memory)
+            direction = "LONG" if pred_pnl > 0 else "SHORT" if pred_pnl < 0 else "HOLD"
+            confidence = min(abs(pred_pnl) / 0.01, 1.0) if abs(pred_pnl) >= 0.0015 else 0.0
+            vol_mult = 1.0
+            # Store toxic_prob for later use
+            self._toxic_prob_cache = toxic_prob
+            logger.info("PnL prediction: %s pred_pnl=%.4f dir=%s conf=%.3f toxic=%.3f trap=%.3f",
+                        symbol, pred_pnl, direction, confidence, toxic_prob, trap_prob)
+        else:
+            direction, confidence, vol_mult, trap_prob = self.inference.decide(v_state, v_memory)
+            self._toxic_prob_cache = 0.0
+
         vol_mult = min(max(vol_mult, 0.5), self.cfg.vol_multiplier_cap)
         return direction, confidence, vol_mult, trap_prob, v_state, regime, memory_info, v_memory
 
@@ -1123,6 +1139,20 @@ class MLEngine:
             else:
                 logger.info("Trap Head LOG: %s trap=%.3f dir=%s conf=%.3f (not blocking)",
                             symbol, trap_prob, direction, confidence)
+
+        predict_pnl = os.getenv("PREDICT_PNL", "false").lower() == "true"
+        if predict_pnl:
+            toxic_prob = self._toxic_prob_cache
+            TOXIC_THRESHOLD = float(os.getenv("TOXIC_THRESHOLD", "0.35"))
+            if toxic_prob > TOXIC_THRESHOLD:
+                self._stats["toxic_blocked"] = self._stats.get("toxic_blocked", 0) + 1
+                logger.info("TOXIC FLOW BLOCK: %s toxic=%.3f > %.3f → HOLD",
+                            symbol, toxic_prob, TOXIC_THRESHOLD)
+                return None
+            min_pnl = float(os.getenv("MIN_PNL_THRESHOLD", "0.0015"))
+            if confidence < min_pnl / 0.01:
+                self._stats["hold_low_conf"] += 1
+                return None
 
         position_scale = 1.0
         CORRELATION_BLOCK_LIMIT = int(os.getenv("CORRELATION_BLOCK_LIMIT", "8"))

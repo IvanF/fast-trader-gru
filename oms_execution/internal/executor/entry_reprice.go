@@ -99,12 +99,17 @@ func (s *Service) exchangeHasEntryFill(ctx context.Context, p *models.PendingEnt
 }
 
 // promotePendingFromExchange accepts an exchange fill and deploys the exit grid.
+// It atomically claims the pending entry to prevent orphan scan from double-adopting.
 func (s *Service) promotePendingFromExchange(ctx context.Context, p *models.PendingEntry, reason string) bool {
 	s.mu.Lock()
 	if cur, ok := s.pending[p.Symbol]; !ok || cur != p {
 		s.mu.Unlock()
 		return false
 	}
+	// Atomically remove pending entry under the same lock to prevent orphan scan race.
+	// Mark as "promoting" so orphan scan skips this symbol during the async gap.
+	delete(s.pending, p.Symbol)
+	s._promoting[p.Symbol] = true
 	s.mu.Unlock()
 
 	exPos, err := s.bybit.GetPosition(ctx, p.Symbol)

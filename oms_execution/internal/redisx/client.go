@@ -91,3 +91,53 @@ func (c *Client) GetActiveSymbols(ctx context.Context) ([]string, error) {
 	}
 	return payload.Symbols, nil
 }
+
+// --- Position persistence ---
+
+func posKey(symbol string) string {
+	return "oms:position:" + symbol
+}
+
+func (c *Client) SavePosition(ctx context.Context, pos *models.ActivePosition) error {
+	data, err := json.Marshal(pos)
+	if err != nil {
+		return err
+	}
+	pipe := c.rdb.Pipeline()
+	pipe.Set(ctx, posKey(pos.Symbol), data, 0)
+	pipe.SAdd(ctx, "oms:positions", pos.Symbol)
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+func (c *Client) DeletePosition(ctx context.Context, symbol string) error {
+	pipe := c.rdb.Pipeline()
+	pipe.Del(ctx, posKey(symbol))
+	pipe.SRem(ctx, "oms:positions", symbol)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+func (c *Client) LoadPositions(ctx context.Context) ([]*models.ActivePosition, error) {
+	symbols, err := c.rdb.SMembers(ctx, "oms:positions").Result()
+	if err != nil {
+		return nil, err
+	}
+	var positions []*models.ActivePosition
+	for _, sym := range symbols {
+		val, err := c.rdb.Get(ctx, posKey(sym)).Result()
+		if err == redis.Nil {
+			c.rdb.SRem(context.Background(), "oms:positions", sym)
+			continue
+		}
+		if err != nil {
+			continue
+		}
+		var pos models.ActivePosition
+		if err := json.Unmarshal([]byte(val), &pos); err != nil {
+			continue
+		}
+		positions = append(positions, &pos)
+	}
+	return positions, nil
+}

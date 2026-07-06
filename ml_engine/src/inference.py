@@ -249,6 +249,45 @@ class HotSwapONNXInference:
 
         return self._heuristic_decision(v_state, v_memory)
 
+    def decide_pnl(self, v_state: np.ndarray, v_memory: np.ndarray) -> Tuple[float, float, float]:
+        """PnL regression mode: returns (pred_pnl, trap_prob, toxic_prob).
+
+        Model outputs 3 logits: [pnl, trap_logit, toxic_logit].
+        pred_pnl is raw regression output (positive = LONG, negative = SHORT).
+        """
+        with self._lock:
+            mlp_sess = self._bundle.mlp
+
+        if mlp_sess is not None:
+            expected = mlp_sess.get_inputs()[0].shape[1]
+            inp = np.concatenate([v_state, v_memory]).astype(np.float32).reshape(1, -1)
+            actual = inp.shape[1]
+            if actual != expected:
+                if actual > expected:
+                    inp = inp[:, :expected]
+                else:
+                    pad = np.zeros((1, expected - actual), dtype=np.float32)
+                    inp = np.concatenate([inp, pad], axis=1)
+            outputs = mlp_sess.run(None, {mlp_sess.get_inputs()[0].name: inp})
+            logits = outputs[0][0]
+
+            if len(logits) == 3:
+                pred_pnl = float(logits[0])
+                trap_prob = float(self._sigmoid(logits[1]))
+                toxic_prob = float(self._sigmoid(logits[2]))
+            elif len(logits) >= 6:
+                pred_pnl = float(logits[0])
+                trap_prob = float(self._sigmoid(logits[5]))
+                toxic_prob = float(self._sigmoid(logits[3])) if len(logits) > 6 else 0.0
+            else:
+                pred_pnl = 0.0
+                trap_prob = 0.0
+                toxic_prob = 0.0
+
+            return pred_pnl, trap_prob, toxic_prob
+
+        return 0.0, 0.0, 0.0
+
     @staticmethod
     def _run_cnn(sess: Optional[ort.InferenceSession], ob_seq: np.ndarray) -> np.ndarray:
         if sess is None:

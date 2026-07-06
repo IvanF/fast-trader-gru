@@ -25,6 +25,7 @@ type TradeSignal struct {
 	MacroTrend15m        float64   `json:"macro_trend_15m,omitempty"`
 	DynamicSLPct         float64   `json:"dynamic_sl_pct,omitempty"`
 	DynamicTPPct         float64   `json:"dynamic_tp_pct,omitempty"`
+	ShadowOnly           bool      `json:"shadow_only,omitempty"`
 }
 
 // PendingOrderEvent notifies ML of pending entry lifecycle for alpha-decay abort.
@@ -135,6 +136,14 @@ type ActivePosition struct {
 	EmergencySizeHandled  bool
 	GridDeployFailures    int
 	LastGridDeployFailure int64
+	// PositionManager fields
+	ScaledOut       bool      // Scale-out at 1R executed?
+	BreakevenPMSet  bool      // Breakeven at 1.5R executed?
+	OriginalRisk    float64   // Original SL distance from entry
+	PriceHistory    []float64 // Rolling mid prices for ATR
+	EntryCandleIdx  int       // Candle index at entry time
+	CandleHigh      float64   // Current candle high
+	CandleLow       float64   // Current candle low
 }
 
 type PendingEntryState string
