@@ -90,8 +90,8 @@ func (ss *SymbolStats) Penalty() float64 {
 
 func (ss *SymbolStats) EffectiveConfidence(baseConf float64) float64 {
 	effective := baseConf * ss.Penalty()
-	if effective > 0.95 {
-		effective = 0.95
+	if effective > 0.60 {
+		effective = 0.60
 	}
 	return effective
 }
@@ -483,6 +483,28 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 					}
 				}
 			}
+
+			// Volume spike filter: reject if volume < 2× SMA (no conviction in quiet market)
+			if vh := s.volumeHistory[signal.Symbol]; len(vh) >= 5 {
+				sum := 0.0
+				for _, v := range vh {
+					sum += v
+				}
+				smaVol := sum / float64(len(vh))
+				currentVol := 0.0
+				for _, lv := range ob.Bids[:min(len(ob.Bids), 10)] {
+					var v float64
+					fmt.Sscanf(lv.Size, "%f", &v)
+					currentVol += v
+				}
+				if smaVol > 0 && currentVol < smaVol*2.0 {
+					s.logger.Info("signal rejected — volume too low",
+						"symbol", signal.Symbol,
+						"current_vol", fmt.Sprintf("%.1f", currentVol),
+						"sma_vol", fmt.Sprintf("%.1f", smaVol))
+					return nil
+				}
+			}
 		}
 	}
 
@@ -510,6 +532,21 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 	}
 
 	return s.placeNewEntry(ctx, signal, recvAt)
+}
+
+// goWithTimeout runs fn in a goroutine that is cancelled after timeoutSec
+// seconds or when ctx is done. Prevents goroutine leaks.
+func (s *Service) goWithTimeout(ctx context.Context, timeoutSec int, fn func()) {
+	go func() {
+		timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			fn()
+		}
+	}()
 }
 
 func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, recvAt time.Time) error {
@@ -1274,29 +1311,61 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 
 	s.retryMissingTakeProfits(ctx, pos, ob)
 
-	// HARD TIME-STOP: force market close after 300 seconds
-	const HardTimeStopSec = 300
+	// HARD TIME-STOP: passive Maker close after 120 seconds, market fallback
+	const HardTimeStopSec = 120
+	const MakerFillTimeoutSec = 8
 	holdSec := (time.Now().UnixMilli() - pos.EntryTime) / 1000
 	if holdSec > HardTimeStopSec {
-		// Always check exchange position — don't trust TimeStopPlaced flag
 		exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
 		if hasPos && exSize > 0 {
-			s.logger.Warn("HARD TIME-STOP — market close",
-				"symbol", pos.Symbol,
-				"hold_sec", holdSec,
-				"qty", exSize,
-			)
-			s.cancelExitOrders(ctx, pos)
-			side := "Buy"
-			if pos.Direction == "LONG" {
-				side = "Sell"
+			if !pos.TimeStopPlaced {
+				s.logger.Warn("HARD TIME-STOP — passive Maker close",
+					"symbol", pos.Symbol,
+					"hold_sec", holdSec,
+					"qty", exSize,
+				)
+				s.cancelExitOrders(ctx, pos)
+
+				side := "Buy"
+				if pos.Direction == "LONG" {
+					side = "Sell"
+				}
+				normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
+
+				exitPrice := grid.PassiveMakerExitPrice(pos.Direction, ob, pos.TickSize, s.cfg.EntryMakerTicks)
+				if exitPrice > 0 {
+					orderID, orderErr := s.bybit.PlaceReducePostOnlyLimit(ctx, pos.Symbol, side, normQty, pos.QtyStep, bybit.FormatPrice(exitPrice))
+					if orderErr == nil {
+						pos.TimeStopPlaced = true
+						s.logger.Info("HARD TIME-STOP — PostOnly Maker order placed",
+							"symbol", pos.Symbol, "price", exitPrice, "qty", normQty, "order_id", orderID)
+
+						s.goWithTimeout(ctx, MakerFillTimeoutSec, func() {
+							oi, oiErr := s.bybit.GetOrderRealtime(ctx, pos.Symbol, orderID)
+							if oiErr == nil && oi.OrderStatus == "New" {
+								s.logger.Warn("HARD TIME-STOP — Maker not filled, market fallback",
+									"symbol", pos.Symbol)
+								_ = s.bybit.CancelOrder(ctx, pos.Symbol, orderID)
+								_, merr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
+								if merr != nil {
+									s.logger.Error("hard time-stop fallback market close failed",
+										"symbol", pos.Symbol, "error", merr)
+								}
+							}
+						})
+						return
+					}
+					s.logger.Warn("HARD TIME-STOP — PostOnly failed, market fallback",
+						"symbol", pos.Symbol, "error", orderErr)
+				}
+
+				_, mktErr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
+				if mktErr != nil {
+					s.logger.Error("hard time-stop market close failed", "symbol", pos.Symbol, "error", mktErr)
+				}
+				pos.TimeStopPlaced = true
+				return
 			}
-			_, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, exSize, pos.QtyStep)
-			if err != nil {
-				s.logger.Error("hard time-stop market close failed", "symbol", pos.Symbol, "error", err)
-			}
-			pos.TimeStopPlaced = true
-			return
 		}
 		if !hasPos {
 			s.tryFinalizePosition(ctx, pos, "time_stop", 0)
