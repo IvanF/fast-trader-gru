@@ -1656,7 +1656,7 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	hftTimeStop := s.cfg.HFTTimeStopSec
 	// Dynamic: high-confidence signals get 600s, low-confidence get 180s
 	if pos.Signal.Confidence >= 0.90 {
-		normalTimeStop = 600
+		normalTimeStop = 300
 	} else {
 		normalTimeStop = 180
 	}
@@ -1668,6 +1668,68 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	if holdSec > int64(hardTimeStopSec) {
 		exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
 		if hasPos && exSize > 0 {
+			// ════════════════════════════════════════════════════════════════
+			// FIX 3: BREAKEVEN EXIT — if in profit at time-stop, close at breakeven
+			// instead of taking market loss. Protects profitable trades from
+			// being killed by time-stop.
+			// ════════════════════════════════════════════════════════════════
+			mid := grid.MidPrice(ob)
+			if mid > 0 {
+				commissionBuffer := pos.FillPrice * 0.0013
+				var isProfitable bool
+				if pos.Direction == "LONG" {
+					isProfitable = mid > pos.FillPrice+commissionBuffer
+				} else {
+					isProfitable = mid < pos.FillPrice-commissionBuffer
+				}
+				if isProfitable && !pos.TimeStopPlaced {
+					s.logger.Info("[TIME-STOP FIX] Breakeven exit — position in profit",
+						"symbol", pos.Symbol,
+						"direction", pos.Direction,
+						"entry", pos.FillPrice,
+						"current", mid,
+						"hold_sec", holdSec)
+					s.cancelExitOrders(ctx, pos)
+					side := "Buy"
+					if pos.Direction == "LONG" {
+						side = "Sell"
+					}
+					normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
+					_, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
+					if err != nil {
+						s.logger.Error("breakeven exit failed", "symbol", pos.Symbol, "error", err)
+					}
+					pos.TimeStopPlaced = true
+					s.tryFinalizePosition(ctx, pos, "time_stop", mid)
+					return
+				}
+			}
+
+			// ════════════════════════════════════════════════════════════════
+			// FIX 5: LONG PENALTY — for LONG positions with big loss at time-stop,
+			// force immediate market close to limit damage.
+			// ════════════════════════════════════════════════════════════════
+			if pos.Direction == "LONG" && !pos.TimeStopPlaced {
+				if mid > 0 {
+					longLoss := (pos.FillPrice - mid) / pos.FillPrice
+					if longLoss > 0.003 { // > 0.3% loss
+						s.logger.Warn("[TIME-STOP FIX] LONG penalty — force immediate close",
+							"symbol", pos.Symbol,
+							"loss_pct", fmt.Sprintf("%.2f%%", longLoss*100),
+							"hold_sec", holdSec)
+						s.cancelExitOrders(ctx, pos)
+						normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
+						_, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, "Sell", normQty, pos.QtyStep)
+						if err != nil {
+							s.logger.Error("LONG penalty close failed", "symbol", pos.Symbol, "error", err)
+						}
+						pos.TimeStopPlaced = true
+						s.tryFinalizePosition(ctx, pos, "time_stop", mid)
+						return
+					}
+				}
+			}
+
 			if !pos.TimeStopPlaced {
 				s.logger.Warn("HARD TIME-STOP — initiating 2-stage exit",
 					"symbol", pos.Symbol,
@@ -1713,8 +1775,62 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 								} else {
 									s.logger.Info("Market Kill-Switch executed",
 										"symbol", pos.Symbol)
+		}
+	}
+
+	// ════════════════════════════════════════════════════════════════
+	// FIX 4: TRAILING TIME-STOP — if position reached 50% of TP
+	// distance, move SL to breakeven immediately (don't wait for
+	// breakevenSec timer). Protects profits from time-stop reversal.
+	// ════════════════════════════════════════════════════════════════
+	if !pos.BreakevenSet && holdSec > 60 {
+		mid := grid.MidPrice(ob)
+		if mid > 0 && len(pos.TakeProfitOrders) > 0 {
+			tpPrice := pos.TakeProfitOrders[0].Price
+			if tpPrice > 0 {
+				riskDist := math.Abs(pos.FillPrice - pos.StopLoss)
+				if riskDist > 0 {
+					profitPct := math.Abs(mid - pos.FillPrice)
+					halfTP := math.Abs(tpPrice-pos.FillPrice) * 0.5
+					if profitPct >= halfTP {
+						commissionBuffer := pos.FillPrice * 0.0013
+						var trailingBE float64
+						if pos.Direction == "LONG" {
+							trailingBE = pos.FillPrice + commissionBuffer
+						} else {
+							trailingBE = pos.FillPrice - commissionBuffer
+						}
+						trailingBE = math.Round(trailingBE/pos.TickSize) * pos.TickSize
+
+						if pos.Direction == "LONG" && trailingBE > pos.StopLoss ||
+							pos.Direction == "SHORT" && trailingBE < pos.StopLoss {
+							exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
+							if hasPos && exSize > 0 {
+								slQty := s.slCoverQty(pos, exSize)
+								if slQty > 0 {
+									if err := s.atomicReplaceStopLoss(ctx, pos, trailingBE, slQty, "trailing_breakeven"); err != nil {
+										s.logger.Warn("trailing breakeven failed",
+											"symbol", pos.Symbol, "error", err)
+									} else {
+										pos.BreakevenSet = true
+										s.logger.Info("[TIME-STOP FIX] Trailing breakeven — 50% TP reached",
+											"symbol", pos.Symbol,
+											"direction", pos.Direction,
+											"entry", pos.FillPrice,
+											"current", mid,
+											"tp", tpPrice,
+											"trailing_be", trailingBE,
+											"hold_sec", holdSec,
+										)
+									}
 								}
 							}
+						}
+					}
+				}
+			}
+		}
+	}
 						})
 						return
 					}

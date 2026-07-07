@@ -1152,7 +1152,7 @@ class MLEngine:
                             symbol, toxic_prob, TOXIC_THRESHOLD)
                 return None
 
-            MIN_EDGE = 0.0005  # 0.05% minimum expected PnL (relaxed for more signals)
+            MIN_EDGE = 0.001  # 0.1% minimum expected PnL (filters noise)
             if abs(self._pred_pnl_cache) < MIN_EDGE:
                 self._stats["hold_low_conf"] += 1
                 return None
