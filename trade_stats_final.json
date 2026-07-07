@@ -1,0 +1,619 @@
+{
+  "summary": {
+    "total_trades": 50,
+    "wins": 13,
+    "losses": 37,
+    "win_rate": 26.0,
+    "balance": 1997.2,
+    "total_pnl": -2.8,
+    "avg_win": 0.1332,
+    "avg_loss": -0.1223,
+    "win_loss_ratio": 1.09,
+    "ev_per_trade": -0.0559,
+    "need_wr_for_breakeven": 47.9,
+    "by_reason": {
+      "fee_loss": {
+        "count": 1,
+        "wins": 0,
+        "pnl": -0.0868
+      },
+      "time_stop": {
+        "count": 33,
+        "wins": 8,
+        "pnl": -2.0167
+      },
+      "stale_tracker_removed": {
+        "count": 7,
+        "wins": 0,
+        "pnl": 0.0
+      },
+      "take_profit": {
+        "count": 5,
+        "wins": 5,
+        "pnl": 0.9528
+      },
+      "exchange_closed": {
+        "count": 1,
+        "wins": 0,
+        "pnl": -0.4443
+      },
+      "stop_loss": {
+        "count": 3,
+        "wins": 0,
+        "pnl": -1.1997
+      }
+    },
+    "by_hold_bucket": {
+      "under_2min": {
+        "count": 6,
+        "wins": 2,
+        "wr": 33.3,
+        "pnl": -0.8015
+      },
+      "2_10min": {
+        "count": 40,
+        "wins": 8,
+        "wr": 20.0,
+        "pnl": -2.2892
+      },
+      "over_10min": {
+        "count": 4,
+        "wins": 3,
+        "wr": 75.0,
+        "pnl": 0.2956
+      }
+    }
+  },
+  "trades": [
+    {
+      "time": "2026-07-06T19:57:53.055926994Z",
+      "symbol": "BEATUSDT",
+      "direction": "LONG",
+      "pnl": -0.08677795,
+      "entry": 2.5137,
+      "exit": 2.5001,
+      "hold_ms": 2439239,
+      "hold_sec": 2439,
+      "reason": "fee_loss"
+    },
+    {
+      "time": "2026-07-06T19:58:14.863469121Z",
+      "symbol": "CRVUSDT",
+      "direction": "SHORT",
+      "pnl": 0.05559086,
+      "entry": 0.2151,
+      "exit": 0.2147,
+      "hold_ms": 373429,
+      "hold_sec": 373,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T19:58:21.313177928Z",
+      "symbol": "BNBUSDT",
+      "direction": "LONG",
+      "pnl": 0.058652,
+      "entry": 583.4,
+      "exit": 585.1,
+      "hold_ms": 7729964,
+      "hold_sec": 7729,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:01:25.56953101Z",
+      "symbol": "LTCUSDT",
+      "direction": "LONG",
+      "pnl": 0.0,
+      "entry": 45.2,
+      "exit": 45.2,
+      "hold_ms": 220220,
+      "hold_sec": 220,
+      "reason": "stale_tracker_removed"
+    },
+    {
+      "time": "2026-07-06T20:01:27.078343158Z",
+      "symbol": "MUSDT",
+      "direction": "LONG",
+      "pnl": 0.0,
+      "entry": 1.1635,
+      "exit": 1.1635,
+      "hold_ms": 173571,
+      "hold_sec": 173,
+      "reason": "stale_tracker_removed"
+    },
+    {
+      "time": "2026-07-06T20:04:59.334630427Z",
+      "symbol": "MONUSDT",
+      "direction": "LONG",
+      "pnl": 0.0,
+      "entry": 0.024093,
+      "exit": 0.024093,
+      "hold_ms": 179137,
+      "hold_sec": 179,
+      "reason": "stale_tracker_removed"
+    },
+    {
+      "time": "2026-07-06T20:08:14.16594367Z",
+      "symbol": "LITUSDT",
+      "direction": "SHORT",
+      "pnl": 0.0,
+      "entry": 2.5939,
+      "exit": 2.5939,
+      "hold_ms": 158258,
+      "hold_sec": 158,
+      "reason": "stale_tracker_removed"
+    },
+    {
+      "time": "2026-07-06T20:08:18.152409602Z",
+      "symbol": "DEXEUSDT",
+      "direction": "LONG",
+      "pnl": -0.24148322,
+      "entry": 28.154,
+      "exit": 28.033,
+      "hold_ms": 200600,
+      "hold_sec": 200,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:10:23.338925672Z",
+      "symbol": "HYPEUSDT",
+      "direction": "LONG",
+      "pnl": -0.07581893,
+      "entry": 71.124,
+      "exit": 71.069,
+      "hold_ms": 151078,
+      "hold_sec": 151,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:12:07.359653734Z",
+      "symbol": "TAOUSDT",
+      "direction": "LONG",
+      "pnl": -0.10928871,
+      "entry": 214.99,
+      "exit": 214.68,
+      "hold_ms": 199590,
+      "hold_sec": 199,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:13:19.4425435Z",
+      "symbol": "MUSDT",
+      "direction": "LONG",
+      "pnl": 0.2008616,
+      "entry": 1.1582,
+      "exit": 1.1638,
+      "hold_ms": 108796,
+      "hold_sec": 108,
+      "reason": "take_profit"
+    },
+    {
+      "time": "2026-07-06T20:13:49.101743669Z",
+      "symbol": "NEARUSDT",
+      "direction": "LONG",
+      "pnl": -0.05440682,
+      "entry": 2.0648,
+      "exit": 2.0641,
+      "hold_ms": 173770,
+      "hold_sec": 173,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:13:53.078496937Z",
+      "symbol": "TRIAUSDT",
+      "direction": "LONG",
+      "pnl": 0.2077937,
+      "entry": 0.030573,
+      "exit": 0.030725,
+      "hold_ms": 96582,
+      "hold_sec": 96,
+      "reason": "take_profit"
+    },
+    {
+      "time": "2026-07-06T20:13:57.042614888Z",
+      "symbol": "HYPEUSDT",
+      "direction": "LONG",
+      "pnl": -0.05899089,
+      "entry": 71.053,
+      "exit": 71.022,
+      "hold_ms": 185197,
+      "hold_sec": 185,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:18:46.031860464Z",
+      "symbol": "LITUSDT",
+      "direction": "LONG",
+      "pnl": 0.0,
+      "entry": 2.5652,
+      "exit": 2.5652,
+      "hold_ms": 57362,
+      "hold_sec": 57,
+      "reason": "stale_tracker_removed"
+    },
+    {
+      "time": "2026-07-06T20:20:04.011119927Z",
+      "symbol": "BEATUSDT",
+      "direction": "LONG",
+      "pnl": 0.29560504,
+      "entry": 2.5435,
+      "exit": 2.5611,
+      "hold_ms": 174329,
+      "hold_sec": 174,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:20:15.06817298Z",
+      "symbol": "ZECUSDT",
+      "direction": "LONG",
+      "pnl": -0.08000718,
+      "entry": 450.07,
+      "exit": 449.68,
+      "hold_ms": 203612,
+      "hold_sec": 203,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:20:27.332011416Z",
+      "symbol": "GRASSUSDT",
+      "direction": "LONG",
+      "pnl": -0.15889306,
+      "entry": 0.52435,
+      "exit": 0.52307,
+      "hold_ms": 169106,
+      "hold_sec": 169,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:20:55.223496907Z",
+      "symbol": "JTOUSDT",
+      "direction": "LONG",
+      "pnl": -0.44428069,
+      "entry": 0.7745,
+      "exit": 0.7682,
+      "hold_ms": 49879,
+      "hold_sec": 49,
+      "reason": "exchange_closed"
+    },
+    {
+      "time": "2026-07-06T20:22:23.307756558Z",
+      "symbol": "MUSDT",
+      "direction": "LONG",
+      "pnl": -0.38845856,
+      "entry": 1.1613,
+      "exit": 1.154,
+      "hold_ms": 117758,
+      "hold_sec": 117,
+      "reason": "stop_loss"
+    },
+    {
+      "time": "2026-07-06T20:22:46.633950777Z",
+      "symbol": "LITUSDT",
+      "direction": "LONG",
+      "pnl": -0.25430219,
+      "entry": 2.5278,
+      "exit": 2.5159,
+      "hold_ms": 165794,
+      "hold_sec": 165,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:24:52.006579999Z",
+      "symbol": "GRASSUSDT",
+      "direction": "LONG",
+      "pnl": 0.22036675,
+      "entry": 0.52461,
+      "exit": 0.52714,
+      "hold_ms": 197107,
+      "hold_sec": 197,
+      "reason": "take_profit"
+    },
+    {
+      "time": "2026-07-06T20:26:14.821077929Z",
+      "symbol": "TAOUSDT",
+      "direction": "LONG",
+      "pnl": -0.10699087,
+      "entry": 215.11,
+      "exit": 214.81,
+      "hold_ms": 228224,
+      "hold_sec": 228,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:26:16.571087856Z",
+      "symbol": "YFIUSDT",
+      "direction": "LONG",
+      "pnl": 0.08787909,
+      "entry": 2579.0,
+      "exit": 2590.0,
+      "hold_ms": 244159,
+      "hold_sec": 244,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:26:29.552654743Z",
+      "symbol": "HBARUSDT",
+      "direction": "LONG",
+      "pnl": -0.0578447,
+      "entry": 0.07361,
+      "exit": 0.07358,
+      "hold_ms": 233505,
+      "hold_sec": 233,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:26:31.318888602Z",
+      "symbol": "INJUSDT",
+      "direction": "LONG",
+      "pnl": -0.03720195,
+      "entry": 4.863,
+      "exit": 4.863,
+      "hold_ms": 231295,
+      "hold_sec": 231,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:28:56.247002368Z",
+      "symbol": "BEATUSDT",
+      "direction": "LONG",
+      "pnl": 0.10358572,
+      "entry": 2.5564,
+      "exit": 2.5639,
+      "hold_ms": 207615,
+      "hold_sec": 207,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:32:06.836678632Z",
+      "symbol": "DEXEUSDT",
+      "direction": "LONG",
+      "pnl": -0.02263448,
+      "entry": 28.287,
+      "exit": 28.285,
+      "hold_ms": 194792,
+      "hold_sec": 194,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:32:57.205443554Z",
+      "symbol": "GRASSUSDT",
+      "direction": "LONG",
+      "pnl": 0.03709878,
+      "entry": 0.52653,
+      "exit": 0.52732,
+      "hold_ms": 198063,
+      "hold_sec": 198,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:34:24.226278454Z",
+      "symbol": "MUSDT",
+      "direction": "LONG",
+      "pnl": -0.18656152,
+      "entry": 1.161,
+      "exit": 1.1584,
+      "hold_ms": 223390,
+      "hold_sec": 223,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:34:25.970180672Z",
+      "symbol": "BEATUSDT",
+      "direction": "LONG",
+      "pnl": -0.4338023,
+      "entry": 2.5684,
+      "exit": 2.5494,
+      "hold_ms": 140017,
+      "hold_sec": 140,
+      "reason": "stop_loss"
+    },
+    {
+      "time": "2026-07-06T20:36:44.159377426Z",
+      "symbol": "PUMPFUNUSDT",
+      "direction": "SHORT",
+      "pnl": -0.25571034,
+      "entry": 0.0016471,
+      "exit": 0.0016543,
+      "hold_ms": 342469,
+      "hold_sec": 342,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:37:05.158129188Z",
+      "symbol": "ZECUSDT",
+      "direction": "LONG",
+      "pnl": -0.00552057,
+      "entry": 453.37,
+      "exit": 453.66,
+      "hold_ms": 166069,
+      "hold_sec": 166,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:37:13.459124568Z",
+      "symbol": "DEXEUSDT",
+      "direction": "LONG",
+      "pnl": -0.16177379,
+      "entry": 28.269,
+      "exit": 28.195,
+      "hold_ms": 263049,
+      "hold_sec": 263,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:37:17.470701087Z",
+      "symbol": "LITUSDT",
+      "direction": "LONG",
+      "pnl": -0.11793792,
+      "entry": 2.5456,
+      "exit": 2.5406,
+      "hold_ms": 152593,
+      "hold_sec": 152,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:37:43.195119441Z",
+      "symbol": "TAOUSDT",
+      "direction": "LONG",
+      "pnl": -0.02594863,
+      "entry": 215.76,
+      "exit": 215.81,
+      "hold_ms": 167901,
+      "hold_sec": 167,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:40:07.971428025Z",
+      "symbol": "BEATUSDT",
+      "direction": "LONG",
+      "pnl": -0.03843852,
+      "entry": 2.5474,
+      "exit": 2.5492,
+      "hold_ms": 221315,
+      "hold_sec": 221,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:43:18.763680764Z",
+      "symbol": "MONUSDT",
+      "direction": "LONG",
+      "pnl": -0.06372692,
+      "entry": 0.024761,
+      "exit": 0.024748,
+      "hold_ms": 172404,
+      "hold_sec": 172,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:44:02.603012834Z",
+      "symbol": "ZECUSDT",
+      "direction": "LONG",
+      "pnl": 0.0,
+      "entry": 453.76,
+      "exit": 453.76,
+      "hold_ms": 149175,
+      "hold_sec": 149,
+      "reason": "stale_tracker_removed"
+    },
+    {
+      "time": "2026-07-06T20:46:25.04394313Z",
+      "symbol": "ENAUSDT",
+      "direction": "SHORT",
+      "pnl": 0.1263185,
+      "entry": 0.07858,
+      "exit": 0.07835,
+      "hold_ms": 1831769,
+      "hold_sec": 1831,
+      "reason": "take_profit"
+    },
+    {
+      "time": "2026-07-06T20:49:36.610836847Z",
+      "symbol": "1000BONKUSDT",
+      "direction": "SHORT",
+      "pnl": -0.10934051,
+      "entry": 0.004374,
+      "exit": 0.004383,
+      "hold_ms": 162544,
+      "hold_sec": 162,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:49:42.350971596Z",
+      "symbol": "EPICUSDT",
+      "direction": "SHORT",
+      "pnl": -0.37744434,
+      "entry": 0.3953,
+      "exit": 0.3977,
+      "hold_ms": 119683,
+      "hold_sec": 119,
+      "reason": "stop_loss"
+    },
+    {
+      "time": "2026-07-06T20:53:15.142847654Z",
+      "symbol": "GRASSUSDT",
+      "direction": "LONG",
+      "pnl": 0.10011989,
+      "entry": 0.53296,
+      "exit": 0.53425,
+      "hold_ms": 172488,
+      "hold_sec": 172,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:53:35.049339635Z",
+      "symbol": "JTOUSDT",
+      "direction": "SHORT",
+      "pnl": -0.15111898,
+      "entry": 0.7669,
+      "exit": 0.7689,
+      "hold_ms": 142476,
+      "hold_sec": 142,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:57:47.321551209Z",
+      "symbol": "GRAMUSDT",
+      "direction": "LONG",
+      "pnl": -0.05933035,
+      "entry": 1.7792,
+      "exit": 1.7778,
+      "hold_ms": 150094,
+      "hold_sec": 150,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T20:58:14.547632938Z",
+      "symbol": "ALLOUSDT",
+      "direction": "LONG",
+      "pnl": 0.19738509,
+      "entry": 0.40556,
+      "exit": 0.40751,
+      "hold_ms": 5191189,
+      "hold_sec": 5191,
+      "reason": "take_profit"
+    },
+    {
+      "time": "2026-07-06T21:00:11.915527185Z",
+      "symbol": "SLXUSDT",
+      "direction": "SHORT",
+      "pnl": 0.0,
+      "entry": 0.1975,
+      "exit": 0.1975,
+      "hold_ms": 351162,
+      "hold_sec": 351,
+      "reason": "stale_tracker_removed"
+    },
+    {
+      "time": "2026-07-06T21:01:48.97341922Z",
+      "symbol": "MONUSDT",
+      "direction": "LONG",
+      "pnl": -0.24526826,
+      "entry": 0.02461,
+      "exit": 0.024499,
+      "hold_ms": 144555,
+      "hold_sec": 144,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T21:04:04.491367961Z",
+      "symbol": "JTOUSDT",
+      "direction": "LONG",
+      "pnl": 0.0402612,
+      "entry": 0.7707,
+      "exit": 0.7719,
+      "hold_ms": 192298,
+      "hold_sec": 192,
+      "reason": "time_stop"
+    },
+    {
+      "time": "2026-07-06T21:04:35.336065743Z",
+      "symbol": "NEARUSDT",
+      "direction": "SHORT",
+      "pnl": -0.11731653,
+      "entry": 2.0613,
+      "exit": 2.0646,
+      "hold_ms": 154474,
+      "hold_sec": 154,
+      "reason": "time_stop"
+    }
+  ]
+}
