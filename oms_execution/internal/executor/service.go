@@ -43,6 +43,7 @@ type Service struct {
 	priceHistory  map[string][]float64 // symbol -> rolling mid prices for ATR
 	volumeHistory map[string][]float64 // symbol -> rolling bid volume for SMA
 	symbolStats   map[string]*SymbolStats
+	obMomentum    *liquidity.OrderbookMomentum // orderbook pressure velocity tracker
 }
 
 type SymbolStats struct {
@@ -137,6 +138,7 @@ func New(cfg config.Config, bc *bybit.Client, rc *redisx.Client, iw *influx.Writ
 		priceHistory:  make(map[string][]float64),
 		volumeHistory: make(map[string][]float64),
 		symbolStats:   make(map[string]*SymbolStats),
+		obMomentum:    liquidity.NewOrderbookMomentum(20),
 	}
 	if cfg.ShadowMode {
 		s.shadow = NewShadowEngine(logger, cfg.ResultsChannel)
@@ -487,15 +489,54 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 			}
 			if bidV+askV > 0 {
 				obi := (bidV - askV) / (bidV + askV)
-			if signal.Direction == "SHORT" && obi < -0.4 {
-						s.logger.Info("signal rejected — momentum against SHORT",
-							"symbol", signal.Symbol, "obi", fmt.Sprintf("%.3f", obi))
+
+				// Record OBI for momentum tracking
+				s.obMomentum.Update(signal.Symbol, ob)
+				momentum := s.obMomentum.Momentum(signal.Symbol)
+				shift := s.obMomentum.PressureShift(signal.Symbol, 0.3)
+
+				// Static OBI filter: reject if opposite pressure too strong
+				if signal.Direction == "SHORT" && obi < -0.4 {
+					s.logger.Info("signal rejected — momentum against SHORT",
+						"symbol", signal.Symbol,
+						"obi", fmt.Sprintf("%.3f", obi),
+						"momentum", fmt.Sprintf("%.4f", momentum))
 					return nil
 				}
 				if signal.Direction == "LONG" && obi > 0.4 {
 					s.logger.Info("signal rejected — momentum against LONG",
-						"symbol", signal.Symbol, "obi", fmt.Sprintf("%.3f", obi))
+						"symbol", signal.Symbol,
+						"obi", fmt.Sprintf("%.3f", obi),
+						"momentum", fmt.Sprintf("%.4f", momentum))
 					return nil
+				}
+
+				// Orderbook momentum filter: reject if pressure is building AGAINST us
+				// shift=+1: buying pressure increasing, shift=-1: selling pressure increasing
+				if signal.Direction == "LONG" && shift == -1 {
+					s.logger.Info("signal rejected — selling pressure building",
+						"symbol", signal.Symbol,
+						"obi", fmt.Sprintf("%.3f", obi),
+						"momentum", fmt.Sprintf("%.4f", momentum))
+					return nil
+				}
+				if signal.Direction == "SHORT" && shift == +1 {
+					s.logger.Info("signal rejected — buying pressure building",
+						"symbol", signal.Symbol,
+						"obi", fmt.Sprintf("%.3f", obi),
+						"momentum", fmt.Sprintf("%.4f", momentum))
+					return nil
+				}
+
+				// Log momentum for analytics (always, not just on rejection)
+				if math.Abs(momentum) > 0.1 {
+					s.logger.Info("orderbook momentum",
+						"symbol", signal.Symbol,
+						"obi", fmt.Sprintf("%.3f", obi),
+						"momentum", fmt.Sprintf("%.4f", momentum),
+						"shift", shift,
+						"dir", signal.Direction,
+					)
 				}
 			}
 			// Price trend filter: reject if mid moved >0.5% against signal in last 30s
@@ -1074,7 +1115,7 @@ func (s *Service) promotePending(ctx context.Context, p *models.PendingEntry, av
 					}
 				}
 			}
-			tradingMode = risk.DetectTradingMode(atrPct, spreadPct, s.cfg.VolatilityThresholdATR, s.cfg.SpreadThresholdPct)
+			tradingMode = risk.DetectTradingMode(atrPct, spreadPct, s.obMomentum.Momentum(p.Symbol), s.cfg.VolatilityThresholdATR, s.cfg.SpreadThresholdPct)
 			if tradingMode == risk.HFTScalpingMode {
 				s.logger.Warn("[DYNAMIC HFT] volatile instrument detected — HFT Scalping Mode activated",
 					"symbol", p.Symbol,
