@@ -1325,6 +1325,25 @@ func (s *Service) promotePending(ctx context.Context, p *models.PendingEntry, av
 		TradingMode:  int(tradingMode),
 	}
 
+	// ════════════════════════════════════════════════════════════════
+	// STALE TRACKER FIX: Verify exchange position before creating
+	// ActivePosition. If exchange doesn't have the position, the
+	// chase logic reported a false fill — don't create tracker.
+	// ════════════════════════════════════════════════════════════════
+	exPos, exErr := s.bybit.GetPosition(ctx, p.Symbol)
+	if exErr != nil {
+		s.logger.Warn("exchange position check failed, proceeding with caution",
+			"symbol", p.Symbol, "error", exErr)
+	} else if exPos.Size <= 0 {
+		s.logger.Warn("[STALE TRACKER FIX] Exchange has no position — false fill detected",
+			"symbol", p.Symbol,
+			"exchange_size", exPos.Size,
+			"chase_reported_fill", true,
+			"action", "canceling entry, no tracker created")
+		s.cancelPendingEntry(ctx, p, "exchange_confirmation_failed")
+		return
+	}
+
 	// Register in map before any slow I/O so concurrent signals cannot open a duplicate entry.
 	s.mu.Lock()
 	if _, exists := s.positions[p.Symbol]; exists {
@@ -2031,6 +2050,28 @@ func (s *Service) handleGhostPosition(ctx context.Context, pos *models.ActivePos
 		s.mu.Unlock()
 		s.removePosition(ctx, pos.Symbol)
 		return
+	}
+
+	// ════════════════════════════════════════════════════════════════
+	// STALE TRACKER: Position exists in OMS but exchange is flat.
+	// Before removing, attempt one final market close to be safe.
+	// ════════════════════════════════════════════════════════════════
+	// Try to flatten on exchange as safety net (in case exchange has tiny remainder)
+	exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
+	if hasPos && exSize > 0 {
+		s.logger.Warn("stale tracker: exchange still has position, forcing market close",
+			"symbol", pos.Symbol, "ex_size", exSize)
+		side := "Buy"
+		if pos.Direction == "LONG" {
+			side = "Sell"
+		}
+		normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
+		_, mktErr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
+		if mktErr != nil {
+			s.logger.Error("stale tracker market close failed", "symbol", pos.Symbol, "error", mktErr)
+		} else {
+			s.logger.Info("stale tracker market close executed", "symbol", pos.Symbol)
+		}
 	}
 
 	s.finalizeClose(ctx, pos, 0, pos.FillPrice, pos.FillPrice, "stale_tracker_removed", false)
