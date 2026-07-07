@@ -1,6 +1,12 @@
 services:
   redis:
     image: redis:7.4-alpine
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     container_name: ftg-redis
     command: redis-server /usr/local/etc/redis/redis.conf
     volumes:
@@ -19,6 +25,12 @@ services:
 
   screener:
     build: ./screener
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     container_name: ftg-screener
     environment:
       REDIS_ADDR: redis:6379
@@ -38,6 +50,12 @@ services:
 
   data_ingestion:
     build: ./data_ingestion
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     container_name: ftg-ingestion
     environment:
       REDIS_ADDR: redis:6379
@@ -56,6 +74,12 @@ services:
 
   influxdb:
     image: influxdb:2.7
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     container_name: ftg-influxdb
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
@@ -99,6 +123,12 @@ services:
 
   history_logger:
     build: ./history_logger
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     container_name: ftg-history-logger
     environment:
       REDIS_ADDR: redis:6379
@@ -126,6 +156,12 @@ services:
 
   ml_engine:
     build: ./ml_engine
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     container_name: ftg-ml-engine
     gpus: all
     environment:
@@ -212,6 +248,12 @@ services:
 
   oms_execution:
     build: ./oms_execution
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     container_name: ftg-oms
     environment:
       REDIS_ADDR: redis:6379
@@ -268,6 +310,12 @@ services:
 
   prometheus:
     image: prom/prometheus:v2.54.0
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     container_name: ftg-prometheus
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -279,6 +327,12 @@ services:
 
   grafana:
     image: grafana/grafana:11.2.0
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     container_name: ftg-grafana
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
