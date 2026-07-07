@@ -119,9 +119,10 @@ class PatternMemory:
             if not similar:
                 return False, 0.0
 
-            # Symbol-level: 3+ losses of same symbol → block
+            # Symbol-level: 3+ consecutive losses of same symbol in last 60 minutes → block
             if symbol:
-                symbol_losses = [p for p in similar if p.symbol == symbol and p.pnl < 0]
+                recent_cutoff = now - 3600  # 60 minutes
+                symbol_losses = [p for p in similar if p.symbol == symbol and p.pnl < 0 and p.timestamp > recent_cutoff]
                 if len(symbol_losses) >= 3:
                     return True, np.mean([p.pnl for p in symbol_losses])
 
