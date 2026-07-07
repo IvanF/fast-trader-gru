@@ -1057,6 +1057,39 @@ func (s *Service) promotePending(ctx context.Context, p *models.PendingEntry, av
 		copy(priceSnap, hist)
 	}
 
+	// Detect trading mode dynamically — no hardcoded tickers
+	tradingMode := risk.NormalMode
+	if len(priceSnap) >= 14 {
+		atr := risk.CalculateATR(priceSnap, 14)
+		if avgPrice > 0 {
+			atrPct := atr / avgPrice
+			// Get current spread from orderbook
+			var spreadPct float64
+			if ob, obErr := s.redis.GetOrderbook(ctx, p.Symbol); obErr == nil {
+				if len(ob.Bids) > 0 && len(ob.Asks) > 0 {
+					bestBid, _ := strconv.ParseFloat(ob.Bids[0].Price, 64)
+					bestAsk, _ := strconv.ParseFloat(ob.Asks[0].Price, 64)
+					if bestBid > 0 {
+						spreadPct = (bestAsk - bestBid) / bestBid
+					}
+				}
+			}
+			tradingMode = risk.DetectTradingMode(atrPct, spreadPct, s.cfg.VolatilityThresholdATR, s.cfg.SpreadThresholdPct)
+			if tradingMode == risk.HFTScalpingMode {
+				s.logger.Warn("[DYNAMIC HFT] volatile instrument detected — HFT Scalping Mode activated",
+					"symbol", p.Symbol,
+					"atr_pct", fmt.Sprintf("%.4f", atrPct),
+					"spread_pct", fmt.Sprintf("%.4f", spreadPct),
+					"atr_threshold", fmt.Sprintf("%.4f", s.cfg.VolatilityThresholdATR),
+					"spread_threshold", fmt.Sprintf("%.4f", s.cfg.SpreadThresholdPct),
+				)
+			}
+		}
+	}
+
+	// Override TimeStop based on trading mode
+	timeStopSec := risk.ModeTimeStopSec(tradingMode, s.cfg.TimeStopSeconds, s.cfg.HFTTimeStopSec)
+
 	pos := &models.ActivePosition{
 		Symbol:       p.Symbol,
 		Direction:    p.Direction,
@@ -1068,7 +1101,7 @@ func (s *Service) promotePending(ctx context.Context, p *models.PendingEntry, av
 		RemainingQty: qty,
 		StopLoss:     plannedSL,
 		EntryTime:    entryTime,
-		TimeStopSec:  p.TimeStopSec,
+		TimeStopSec:  timeStopSec,
 		QtyStep:      p.QtyStep,
 		MinOrderQty:  p.MinOrderQty,
 		TickSize:     p.TickSize,
@@ -1081,6 +1114,7 @@ func (s *Service) promotePending(ctx context.Context, p *models.PendingEntry, av
 		OriginalRisk: originalRisk,
 		PriceHistory: priceSnap,
 		EntryCandleIdx: candleIdx,
+		TradingMode:  int(tradingMode),
 	}
 
 	// Register in map before any slow I/O so concurrent signals cannot open a duplicate entry.
@@ -1407,11 +1441,14 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	s.retryMissingTakeProfits(ctx, pos, ob)
 
 	// HARD TIME-STOP: 2-stage FSM — PostOnly → Kill-Switch after 30s
-	const HardTimeStopSec = 420
+	// Timing adapts to trading mode: HFT gets shorter windows
+	mode := risk.TradingMode(pos.TradingMode)
+	hardTimeStopSec := risk.ModeTimeStopSec(mode, s.cfg.TimeStopSeconds, s.cfg.HFTTimeStopSec)
+	breakevenSec := risk.ModeBreakevenSec(mode, 180, s.cfg.HFTBreakevenSec)
 	const MakerFillTimeoutSec = 30
 	const ZombieRetrySec = 120
 	holdSec := (time.Now().UnixMilli() - pos.EntryTime) / 1000
-	if holdSec > HardTimeStopSec {
+	if holdSec > int64(hardTimeStopSec) {
 		exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
 		if hasPos && exSize > 0 {
 			if !pos.TimeStopPlaced {
@@ -1479,7 +1516,7 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 				return
 			}
 			// ZOMBIE RETRY: if TimeStopPlaced but still open after ZombieRetrySec, force market
-			if pos.TimeStopPlaced && holdSec > HardTimeStopSec+ZombieRetrySec {
+			if pos.TimeStopPlaced && holdSec > int64(hardTimeStopSec)+ZombieRetrySec {
 				s.logger.Error("ZOMBIE DETECTED — force market close",
 					"symbol", pos.Symbol, "hold_sec", holdSec, "qty", exSize)
 				pos.TimeStopPlaced = false
@@ -1508,8 +1545,8 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 		return
 	}
 
-	// BREAKEVEN: move SL to breakeven after 180 seconds if not yet done
-	if holdSec > 180 && !pos.BreakevenSet {
+	// BREAKEVEN: move SL to breakeven — timing adapts to trading mode
+	if holdSec > int64(breakevenSec) && !pos.BreakevenSet {
 		mid := grid.MidPrice(ob)
 		if mid > 0 {
 			commissionBuffer := pos.FillPrice * 0.0013 // 0.13% covers both sides

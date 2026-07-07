@@ -36,6 +36,10 @@ type Config struct {
 	StaleEntryMoveAwayPct      float64
 	StaleEntryMinAgeSec        int
 	EntryMakerTicks            int
+	VolatilityThresholdATR     float64 // ATR% above which HFT Scalping Mode activates
+	SpreadThresholdPct         float64 // Spread% above which HFT Scalping Mode activates
+	HFTTimeStopSec             int     // Time-stop for HFT mode
+	HFTBreakevenSec            int     // Breakeven for HFT mode
 	VolMultiplierCap           float64
 	PendingVolRepriceDelta     float64
 	MinSLPct                   float64
@@ -135,6 +139,10 @@ func Load() Config {
 		StaleEntryMoveAwayPct:      floatEnv("STALE_ENTRY_MOVE_AWAY_PCT", 0.008),
 		StaleEntryMinAgeSec:        intEnv("STALE_ENTRY_MIN_AGE_SEC", 3),
 		EntryMakerTicks:            intEnv("ENTRY_MAKER_TICKS", 2),
+		VolatilityThresholdATR:     floatEnv("VOLATILITY_THRESHOLD_ATR", 0.015),
+		SpreadThresholdPct:         floatEnv("SPREAD_THRESHOLD_PCT", 0.003),
+		HFTTimeStopSec:             intEnv("HFT_TIME_STOP_SEC", 60),
+		HFTBreakevenSec:            intEnv("HFT_BREAKEVEN_SEC", 30),
 		VolMultiplierCap:           floatEnv("VOL_MULTIPLIER_CAP", 2.0),
 		PendingVolRepriceDelta:     floatEnv("PENDING_VOL_REPRICE_DELTA", 0.5),
 		MinSLPct:                   floatEnv("MIN_SL_PCT", 0.004),

@@ -1357,6 +1357,7 @@ class MLEngine:
             "macro_trend_15m": buf.macro_trend(900),
             "timestamp": int(time.time() * 1000),
             "signal_id": str(uuid.uuid4()),
+            "atr_14_pct": buf.atr_pct() if hasattr(buf, 'atr_pct') else 0.0,
         }
 
         dynamic_sl = mem_info.get("dynamic_sl_pct", 0.0)
