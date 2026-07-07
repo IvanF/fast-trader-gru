@@ -12,13 +12,14 @@ const (
 
 // DetectTradingMode evaluates current market microstructure and returns the optimal
 // execution strategy for the given instrument. No hardcoded ticker names.
-// It uses two factors:
+// It uses three factors:
 //   - Normalized ATR: if the instrument moves >threshold% per candle
 //   - Orderbook spread: if spread >threshold%, market is too thin for normal execution
+//   - Orderbook momentum: if |momentum| > 0.3, pressure is shifting fast (HFT territory)
 //
 // Zero-allocation design: only reads existing fields, no heap allocations.
-func DetectTradingMode(atrPct float64, spreadPct float64, volThreshold float64, spreadThreshold float64) TradingMode {
-	if atrPct > volThreshold || spreadPct > spreadThreshold {
+func DetectTradingMode(atrPct float64, spreadPct float64, momentum float64, volThreshold float64, spreadThreshold float64) TradingMode {
+	if atrPct > volThreshold || spreadPct > spreadThreshold || momentum > 0.3 || momentum < -0.3 {
 		return HFTScalpingMode
 	}
 	return NormalMode
