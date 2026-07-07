@@ -108,9 +108,9 @@ func (ss *SymbolStats) EffectiveConfidence(baseConf float64) float64 {
 }
 
 const (
-	CircuitBreakerMinTrades = 10
-	CircuitBreakerMaxWR     = 0.25
-	CircuitBreakerBanHours  = 12
+	CircuitBreakerMinTrades = 20
+	CircuitBreakerMaxWR     = 0.20
+	CircuitBreakerBanHours  = 2
 )
 
 func (ss *SymbolStats) IsAutoBanned() bool {
@@ -646,20 +646,26 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 	}
 
 	// ════════════════════════════════════════════════════════════════
-	// CORRELATION FILTER — prevent correlated exposure
-	// If we have open positions and the new signal has high BTC correlation
-	// (> 0.7), skip — too much macro risk in a single direction.
+	// CORRELATION FILTER — prevent cluster exposure
+	// If we already have 3+ open positions with high BTC correlation,
+	// block new entries to prevent correlated macro risk.
 	// ════════════════════════════════════════════════════════════════
 	const MaxCorrelationThreshold = 0.7
 	if signal.BTCorrelation > MaxCorrelationThreshold {
 		s.mu.Lock()
-		openCount := len(s.positions)
+		corrPositions := 0
+		for _, pos := range s.positions {
+			if pos.Signal.BTCorrelation > MaxCorrelationThreshold {
+				corrPositions++
+			}
+		}
 		s.mu.Unlock()
-		if openCount > 0 {
-			s.logger.Info("signal rejected — high correlation with existing exposure",
+		if corrPositions >= 3 {
+			s.logger.Warn("signal rejected — cluster correlation risk",
 				"symbol", signal.Symbol,
 				"btc_correlation", fmt.Sprintf("%.3f", signal.BTCorrelation),
-				"open_positions", openCount)
+				"corr_positions", corrPositions,
+				"limit", 3)
 			return nil
 		}
 	}
@@ -872,6 +878,54 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 		side = "Sell"
 	}
 
+	// ════════════════════════════════════════════════════════════════
+	// PASSIVE-AGGRESSIVE ENTRY
+	// High-confidence signals (>0.95) → immediate Market-Take
+	// Normal signals → Limit Chasing (Maker advantage)
+	// ════════════════════════════════════════════════════════════════
+	const MarketTakeThreshold = 0.95
+	if signal.Confidence >= MarketTakeThreshold {
+		placeStart := time.Now()
+		orderID, err := s.bybit.PlaceMarketOrder(ctx, plan.Symbol, side, plan.Qty, inst.Lot.QtyStep, false)
+		placeDelay := time.Since(placeStart)
+		s.logger.Info("Market-Take entry (high confidence)",
+			"symbol", signal.Symbol,
+			"confidence", fmt.Sprintf("%.3f", signal.Confidence),
+			"side", side,
+			"qty", plan.Qty,
+			"order_id", orderID,
+			"place_delay", placeDelay.Round(time.Millisecond),
+		)
+		if err != nil {
+			s.logger.Error("Market-Take failed, falling back to Limit Chasing",
+				"symbol", signal.Symbol, "error", err)
+		} else {
+			pending := &models.PendingEntry{
+				Symbol:      plan.Symbol,
+				OrderID:     orderID,
+				State:       models.PendingEntryStateActive,
+				Direction:   plan.Direction,
+				Qty:         plan.Qty,
+				EntryPrice:  plan.EntryPrice,
+				StopLoss:    plan.StopLoss,
+				TakeProfits: plan.TakeProfits,
+				TimeStopSec: plan.TimeStopSec,
+				MarginUSD:   marginUSD,
+				NotionalUSD: notionalUSD,
+				Leverage:    leverage,
+				Signal:      signal,
+				QtyStep:     inst.Lot.QtyStep,
+				MinOrderQty: inst.Lot.MinOrderQty,
+				TickSize:    inst.TickSize,
+				PlacedAt:    time.Now().UnixMilli(),
+			}
+			s.mu.Lock()
+			s.pending[plan.Symbol] = pending
+			s.mu.Unlock()
+			return nil
+		}
+	}
+
 	const MaxChaseAttempts = 3
 	const ChaseTimeoutSec = 3
 
@@ -945,10 +999,12 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 
 		oi, oiErr := s.bybit.GetOrderRealtime(ctx, signal.Symbol, orderID)
 		if oiErr == nil && oi.OrderStatus == "Filled" {
+			placeDelay := time.Duration(ChaseTimeoutSec) * time.Second
 			s.logger.Info("Limit Chasing filled",
 				"symbol", signal.Symbol,
 				"attempt", attempt,
 				"price", chasePrice,
+				"place_delay", placeDelay.Round(time.Millisecond),
 			)
 			break
 		}
@@ -1594,8 +1650,17 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 
 	// HARD TIME-STOP: 2-stage FSM — PostOnly → Kill-Switch after 30s
 	// Timing adapts to trading mode: HFT gets shorter windows
+	// Also adapts to signal confidence: high-conf gets longer runway
 	mode := risk.TradingMode(pos.TradingMode)
-	hardTimeStopSec := risk.ModeTimeStopSec(mode, s.cfg.TimeStopSeconds, s.cfg.HFTTimeStopSec)
+	normalTimeStop := s.cfg.TimeStopSeconds
+	hftTimeStop := s.cfg.HFTTimeStopSec
+	// Dynamic: high-confidence signals get 600s, low-confidence get 180s
+	if pos.Signal.Confidence >= 0.90 {
+		normalTimeStop = 600
+	} else {
+		normalTimeStop = 180
+	}
+	hardTimeStopSec := risk.ModeTimeStopSec(mode, normalTimeStop, hftTimeStop)
 	breakevenSec := risk.ModeBreakevenSec(mode, 180, s.cfg.HFTBreakevenSec)
 	const MakerFillTimeoutSec = 30
 	const ZombieRetrySec = 120
@@ -1858,7 +1923,18 @@ func (s *Service) handleGhostPosition(ctx context.Context, pos *models.ActivePos
 	s.mu.Lock()
 	s.ghostCooldown[pos.Symbol] = time.Now().UnixMilli()+120_000
 	s.mu.Unlock()
-	s.logger.Info("removed stale position tracker", "symbol", pos.Symbol)
+
+	holdSec := (time.Now().UnixMilli() - pos.EntryTime) / 1000
+	orderDelay := 0.0
+	if pos.FilledAt > 0 {
+		orderDelay = float64(time.Now().UnixMilli()-pos.FilledAt) / 1000.0
+	}
+	s.logger.Warn("stale position tracker removed",
+		"symbol", pos.Symbol,
+		"hold_sec", holdSec,
+		"order_placement_delay", fmt.Sprintf("%.1fs", orderDelay),
+		"has_exit_orders", len(pos.TakeProfitOrders) > 0 || pos.StopLossOrder != nil,
+		"reason", "no fill on exit orders — position was stuck")
 }
 
 func (s *Service) finalizeClose(
