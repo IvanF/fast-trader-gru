@@ -23,7 +23,7 @@ import (
 	"github.com/fast-trader-gru/oms_execution/internal/risk"
 )
 
-const DynamicConfCap = 0.85
+const DynamicConfCap = 0.90
 
 // Funding Rate extremes for bias filter and squeeze detection
 const (
@@ -927,7 +927,7 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 	}
 
 	const MaxChaseAttempts = 3
-	const ChaseTimeoutSec = 3
+	const ChaseTimeoutSec = 5
 
 	// ════════════════════════════════════════════════════════════════
 	// VOLATILITY-BASED ENTRY DELAY
@@ -943,7 +943,7 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 			if pBefore > 0 {
 				velocity := math.Abs(pNow-pBefore) / pBefore
 				if velocity > 0.003 {
-					delaySec := 3
+					delaySec := 5
 					s.logger.Info("volatility entry delay — price moving fast",
 						"symbol", signal.Symbol,
 						"velocity_5s", fmt.Sprintf("%.4f%%", velocity*100),
@@ -1656,12 +1656,11 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	hftTimeStop := s.cfg.HFTTimeStopSec
 	// Dynamic: high-confidence signals get 600s, low-confidence get 180s
 	if pos.Signal.Confidence >= 0.90 {
-		normalTimeStop = 300
+		normalTimeStop = 240
 	} else {
-		normalTimeStop = 180
+		normalTimeStop = 120
 	}
 	hardTimeStopSec := risk.ModeTimeStopSec(mode, normalTimeStop, hftTimeStop)
-	breakevenSec := risk.ModeBreakevenSec(mode, 180, s.cfg.HFTBreakevenSec)
 	const MakerFillTimeoutSec = 30
 	const ZombieRetrySec = 120
 	holdSec := (time.Now().UnixMilli() - pos.EntryTime) / 1000
@@ -1878,8 +1877,8 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 		return
 	}
 
-	// BREAKEVEN: move SL to breakeven — timing adapts to trading mode
-	if holdSec > int64(breakevenSec) && !pos.BreakevenSet {
+	// BREAKEVEN: move SL to breakeven after 60 seconds
+	if holdSec > 60 && !pos.BreakevenSet {
 		mid := grid.MidPrice(ob)
 		if mid > 0 {
 			commissionBuffer := pos.FillPrice * 0.0013 // 0.13% covers both sides
