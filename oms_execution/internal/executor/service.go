@@ -1675,9 +1675,9 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	hftTimeStop := s.cfg.HFTTimeStopSec
 	// Dynamic: high-confidence signals get 600s, low-confidence get 180s
 	if pos.Signal.Confidence >= 0.90 {
-		normalTimeStop = 240
+		normalTimeStop = 480
 	} else {
-		normalTimeStop = 120
+		normalTimeStop = 240
 	}
 	hardTimeStopSec := risk.ModeTimeStopSec(mode, normalTimeStop, hftTimeStop)
 	const MakerFillTimeoutSec = 30
