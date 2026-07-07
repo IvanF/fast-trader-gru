@@ -170,20 +170,27 @@ func (s *Service) tightenExitOnWeakSignal(ctx context.Context, pos *models.Activ
 		return nil
 	}
 
+	// Don't tighten if already at breakeven or partial taken
+	if pos.PartialTaken || pos.BreakevenSet {
+		return nil
+	}
+
+	// Min distance from entry: don't tighten SL closer than 0.5% from entry
+	// This prevents premature SL triggers from noise
+	minDistPct := 0.005
+
 	var tighter float64
 	if pos.Direction == "LONG" {
 		tighter = mid * (1 - 0.001)
-		if pos.PartialTaken {
-			tighter = math.Max(tighter, pos.FillPrice)
-		}
+		minSL := pos.FillPrice * (1 - minDistPct)
+		tighter = math.Max(tighter, minSL)
 		if tighter <= pos.StopLoss {
 			return nil
 		}
 	} else {
 		tighter = mid * (1 + 0.001)
-		if pos.PartialTaken {
-			tighter = math.Min(tighter, pos.FillPrice)
-		}
+		minSL := pos.FillPrice * (1 + minDistPct)
+		tighter = math.Min(tighter, minSL)
 		if tighter >= pos.StopLoss {
 			return nil
 		}
