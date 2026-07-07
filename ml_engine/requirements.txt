@@ -14,3 +14,6 @@ psutil>=5.9.0
 nvidia-ml-py>=12.535.0
 influxdb-client>=1.44.0
 pandas>=2.1.0
+
+# Gatekeeper
+catboost>=1.2.0

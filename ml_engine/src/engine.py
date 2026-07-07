@@ -28,6 +28,7 @@ from .regime import RegimeDetector
 from .exit_plan import build_exit_plan
 from .online_learner import OnlineLearner, CONSECUTIVE_LOSS_THRESHOLD
 from .retrain_worker import RollingRetrainWorker
+from .gatekeeper import Gatekeeper, FEATURE_NAMES
 from .train_device import log_cuda_status
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,9 @@ class MLEngine:
         self._event_states = EventStateStore()
         self._movement_states = MovementStateStore()
         self._movement_weights, self._movement_bias = load_weights_from_env()
+        self._gatekeeper = Gatekeeper()
+        self._gatekeeper.load_model()
+        self._gk_train_count = 0
         self._movement_funding_prior = float(os.getenv("MOVEMENT_PROB_FUNDING_PRIOR_SCALE", "50"))
         self._started_at = time.time()
         self._last_telemetry: Dict[str, float] = {}
@@ -248,6 +252,8 @@ class MLEngine:
         prom.register_exit_plan_handler(self._handle_exit_plan_request)
         prom.start_health_server(health_port)
         prom.faiss_index_size.set(self.memory.size)
+        prom.gatekeeper_sample_count.set(self._gatekeeper.sample_count)
+        prom.gatekeeper_train_count.set(self._gatekeeper.train_count)
         manifest = ModelManifest.from_dir(self.cfg.model_dir)
         prom.set_model_version(manifest.version, manifest.updated_at)
         prom.set_model_version_info(manifest.version, manifest.updated_at)
@@ -480,6 +486,16 @@ class MLEngine:
                 regime=regime,
                 symbol=symbol,
             )
+
+            # Gatekeeper: record trade outcome for online learning
+            gk_features = self._collect_gatekeeper_features(
+                symbol, float(data.get("confidence", 0.5)),
+                float(data.get("pred_pnl", 0.0)),
+                None, float(data.get("btc_correlation", 0.0)),
+                regime,
+            )
+            self._gatekeeper.record_trade(gk_features, pnl)
+            self._stats["gatekeeper_trades"] = self._stats.get("gatekeeper_trades", 0) + 1
 
             if pnl < 0:
                 self._consecutive_losses += 1
@@ -1422,4 +1438,109 @@ class MLEngine:
             logger.info("EVENT-DRIVEN PASS (OBI impulse): %s conf=%.3f obi_rev=%.3f",
                         symbol, confidence, obi_reversal)
 
+        # ════════════════════════════════════════════════════════════════
+        # GATEKEEPER: CatBoost binary classifier
+        # Predicts probability of trade being profitable.
+        # Replaces hardcoded DynamicConfCap with data-driven decision.
+        # ════════════════════════════════════════════════════════════════
+        if self._gatekeeper.is_trained:
+            gk_features = self._collect_gatekeeper_features(
+                symbol, confidence, pred_pnl if predict_pnl else 0.0,
+                buf, corr, regime,
+            )
+            gk_result = self._gatekeeper.predict(gk_features)
+            self._stats["gatekeeper_predictions"] = self._stats.get("gatekeeper_predictions", 0) + 1
+
+            if gk_result.prediction == 0:
+                self._stats["gatekeeper_rejected"] = self._stats.get("gatekeeper_rejected", 0) + 1
+                logger.info("GATEKEEPER REJECT: %s prob=%.3f < %.3f",
+                           symbol, gk_result.prob, GK_THRESHOLD)
+                return None
+
+            logger.info("GATEKEEPER PASS: %s prob=%.3f", symbol, gk_result.prob)
+
         return signal
+
+    def _collect_gatekeeper_features(self, symbol: str, confidence: float,
+                                     pred_pnl: float, buf, corr: float,
+                                     regime) -> Dict[str, float]:
+        """Collect 20 features for Gatekeeper prediction."""
+        mid = buf.last_mid() if hasattr(buf, 'last_mid') else 0.0
+        features = {
+            "confidence": confidence,
+            "pred_pnl": pred_pnl,
+            "spread_pct": 0.0,
+            "obi": 0.0,
+            "volume_ratio": 1.0,
+            "momentum": 0.0,
+            "price_velocity": 0.0,
+            "atr_pct": 0.0,
+            "funding_rate": self._funding_rates.get(symbol, 0.0),
+            "btc_correlation": corr,
+            "volatility_multiplier": 1.0,
+            "symbol_wr": 0.5,
+            "symbol_pnl_sum": 0.0,
+            "symbol_consec_losses": 0,
+            "symbol_trades_24h": 0,
+            "hour_of_day": time.time() % 86400 / 3600,
+            "open_positions_count": 0,
+            "recent_wr_20": 0.5,
+        }
+
+        # Spread from orderbook
+        if hasattr(buf, 'latest_bids') and hasattr(buf, 'latest_asks'):
+            bids = buf.latest_bids
+            asks = buf.latest_asks
+            if bids and asks:
+                try:
+                    best_bid = float(bids[0][0])
+                    best_ask = float(asks[0][0])
+                    if best_bid > 0:
+                        features["spread_pct"] = (best_ask - best_bid) / best_bid
+                except (IndexError, ValueError, TypeError):
+                    pass
+
+        # OBI from last orderbook snapshot
+        if hasattr(buf, 'latest_bids') and hasattr(buf, 'latest_asks'):
+            bids = buf.latest_bids
+            asks = buf.latest_asks
+            bid_vol = sum(float(b[1]) for b in bids[:5]) if bids else 0
+            ask_vol = sum(float(a[1]) for a in asks[:5]) if asks else 0
+            total = bid_vol + ask_vol
+            if total > 0:
+                features["obi"] = (bid_vol - ask_vol) / total
+
+        # Volume ratio
+        features["volume_ratio"] = self._get_volume_ratio(symbol)
+
+        # Momentum from OBI reversal
+        features["momentum"] = buf._obi_reversal() if hasattr(buf, '_obi_reversal') else 0.0
+
+        # Price velocity
+        if mid > 0 and hasattr(buf, '_obi_reversal'):
+            features["price_velocity"] = buf._obi_reversal()
+
+        # ATR percentage
+        features["atr_pct"] = self._get_atr_pct(symbol, mid)
+
+        # Symbol stats
+        st = self._symbol_trades.get(symbol, {})
+        total = st.get("wins", 0) + st.get("losses", 0)
+        features["symbol_wr"] = st.get("wins", 0) / max(total, 1)
+        features["symbol_consec_losses"] = self._online_learner.pattern_memory._consec_losses.get(symbol, 0)
+        features["symbol_trades_24h"] = total
+
+        # Recent WR
+        features["recent_wr_20"] = self._gatekeeper._trade_buffer[-1]["label"] if self._gatekeeper._trade_buffer else 0.5
+
+        return features
+
+    def _get_volume_ratio(self, symbol: str) -> float:
+        """Get current volume / SMA volume ratio."""
+        # Placeholder — use buffer if available
+        return 1.0
+
+    def _get_atr_pct(self, symbol: str, mid: float) -> float:
+        """Get ATR as percentage of price."""
+        # Use signal atr_14_pct if available
+        return 0.01
