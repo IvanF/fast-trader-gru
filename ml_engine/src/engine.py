@@ -1401,4 +1401,25 @@ class MLEngine:
                         symbol, trade_score, exit_sl * 100, exit_tp * 100)
             return None
 
+        # ════════════════════════════════════════════════════════════════
+        # EVENT-DRIVEN GATE — only send high-quality signals to OMS
+        # Pass if: confidence > 0.85 OR OBI impulse (ob_reversal > 0.4)
+        # This reduces noise from 94K to ~5-8K signals/min.
+        # ════════════════════════════════════════════════════════════════
+        EVENT_DRIVEN_CONF = 0.85
+        OBI_IMPULSE_THRESHOLD = 0.4
+        obi_reversal = buf._obi_reversal() if hasattr(buf, '_obi_reversal') else 0.0
+        has_obi_impulse = obi_reversal > OBI_IMPULSE_THRESHOLD
+        has_high_conf = confidence >= EVENT_DRIVEN_CONF
+
+        if not has_high_conf and not has_obi_impulse:
+            self._stats["hold_low_conf"] += 1
+            logger.debug("EVENT-DRIVEN BLOCK: %s conf=%.3f obi_rev=%.3f (below gate)",
+                         symbol, confidence, obi_reversal)
+            return None
+
+        if has_obi_impulse and not has_high_conf:
+            logger.info("EVENT-DRIVEN PASS (OBI impulse): %s conf=%.3f obi_rev=%.3f",
+                        symbol, confidence, obi_reversal)
+
         return signal

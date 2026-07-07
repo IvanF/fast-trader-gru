@@ -23,7 +23,7 @@ import (
 	"github.com/fast-trader-gru/oms_execution/internal/risk"
 )
 
-const DynamicConfCap = 0.45
+const DynamicConfCap = 0.85
 
 // Funding Rate extremes for bias filter and squeeze detection
 const (
@@ -645,6 +645,25 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 		return nil
 	}
 
+	// ════════════════════════════════════════════════════════════════
+	// CORRELATION FILTER — prevent correlated exposure
+	// If we have open positions and the new signal has high BTC correlation
+	// (> 0.7), skip — too much macro risk in a single direction.
+	// ════════════════════════════════════════════════════════════════
+	const MaxCorrelationThreshold = 0.7
+	if signal.BTCorrelation > MaxCorrelationThreshold {
+		s.mu.Lock()
+		openCount := len(s.positions)
+		s.mu.Unlock()
+		if openCount > 0 {
+			s.logger.Info("signal rejected — high correlation with existing exposure",
+				"symbol", signal.Symbol,
+				"btc_correlation", fmt.Sprintf("%.3f", signal.BTCorrelation),
+				"open_positions", openCount)
+			return nil
+		}
+	}
+
 	return s.placeNewEntry(ctx, signal, recvAt)
 }
 
@@ -855,6 +874,32 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 
 	const MaxChaseAttempts = 3
 	const ChaseTimeoutSec = 3
+
+	// ════════════════════════════════════════════════════════════════
+	// VOLATILITY-BASED ENTRY DELAY
+	// If price is moving fast (>0.3%/5s), wait for impulse to settle
+	// before chasing. Prevents entering at the peak of a spike.
+	// ════════════════════════════════════════════════════════════════
+	if hist := s.priceHistory[signal.Symbol]; len(hist) >= 10 {
+		recent5s := hist[len(hist)-5:]
+	older5s := hist[len(hist)-10 : len(hist)-5]
+		if len(recent5s) >= 2 && len(older5s) >= 2 {
+			pNow := recent5s[len(recent5s)-1]
+			pBefore := older5s[0]
+			if pBefore > 0 {
+				velocity := math.Abs(pNow-pBefore) / pBefore
+				if velocity > 0.003 {
+					delaySec := 3
+					s.logger.Info("volatility entry delay — price moving fast",
+						"symbol", signal.Symbol,
+						"velocity_5s", fmt.Sprintf("%.4f%%", velocity*100),
+						"delay", delaySec)
+					time.Sleep(time.Duration(delaySec) * time.Second)
+				}
+			}
+		}
+	}
+
 	var orderID string
 	for attempt := 1; attempt <= MaxChaseAttempts; attempt++ {
 		chaseOb, chaseErr := s.redis.GetOrderbook(ctx, signal.Symbol)
