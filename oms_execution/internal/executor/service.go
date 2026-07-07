@@ -16,6 +16,7 @@ import (
 	"github.com/fast-trader-gru/oms_execution/internal/config"
 	"github.com/fast-trader-gru/oms_execution/internal/grid"
 	"github.com/fast-trader-gru/oms_execution/internal/influx"
+	"github.com/fast-trader-gru/oms_execution/internal/liquidity"
 	"github.com/fast-trader-gru/oms_execution/internal/metrics"
 	"github.com/fast-trader-gru/oms_execution/internal/models"
 	"github.com/fast-trader-gru/oms_execution/internal/redisx"
@@ -50,6 +51,7 @@ type SymbolStats struct {
 	Losses       int
 	ConsecLosses int
 	LastPnL      float64
+	BannedUntil  time.Time
 }
 
 func (ss *SymbolStats) Record(pnl float64) {
@@ -96,6 +98,28 @@ func (ss *SymbolStats) EffectiveConfidence(baseConf float64) float64 {
 		effective = DynamicConfCap
 	}
 	return effective
+}
+
+const (
+	CircuitBreakerMinTrades = 10
+	CircuitBreakerMaxWR     = 0.25
+	CircuitBreakerBanHours  = 12
+)
+
+func (ss *SymbolStats) IsAutoBanned() bool {
+	if !ss.BannedUntil.IsZero() && time.Now().Before(ss.BannedUntil) {
+		return true
+	}
+	if ss.TotalTrades >= CircuitBreakerMinTrades {
+		wr := float64(ss.Wins) / float64(ss.TotalTrades)
+		if wr < CircuitBreakerMaxWR {
+			if ss.BannedUntil.IsZero() || time.Now().After(ss.BannedUntil) {
+				ss.BannedUntil = time.Now().Add(time.Duration(CircuitBreakerBanHours) * time.Hour)
+			}
+			return true
+		}
+	}
+	return false
 }
 
 func New(cfg config.Config, bc *bybit.Client, rc *redisx.Client, iw *influx.Writer, logger *slog.Logger) *Service {
@@ -393,6 +417,16 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 	stats := s.symbolStats[signal.Symbol]
 	s.mu.Unlock()
 	if stats != nil {
+		if stats.IsAutoBanned() {
+			remaining := time.Until(stats.BannedUntil).Round(time.Minute)
+			s.logger.Warn("[CIRCUIT BREAKER] Symbol auto-banned",
+				"symbol", signal.Symbol,
+				"wr", fmt.Sprintf("%.0f%%", stats.WinRate()*100),
+				"total_trades", stats.TotalTrades,
+				"remaining", remaining,
+			)
+			return nil
+		}
 		effectiveConf := stats.EffectiveConfidence(s.cfg.ConfidenceThreshold)
 		if signal.Confidence < effectiveConf {
 			s.logger.Info("signal rejected — dynamic confidence",
@@ -712,15 +746,74 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 		side = "Sell"
 	}
 
-	orderID, err := s.bybit.PlaceLimitOrder(ctx, bybit.PlaceOrderRequest{
-		Symbol:      plan.Symbol,
-		Side:        side,
-		Qty:         bybit.FormatQty(plan.Qty, inst.Lot.QtyStep),
-		Price:       bybit.FormatPrice(plan.EntryPrice),
-		PositionIdx: 0,
-	})
-	if err != nil {
-		return err
+	const MaxChaseAttempts = 3
+	const ChaseTimeoutSec = 3
+	var orderID string
+	for attempt := 1; attempt <= MaxChaseAttempts; attempt++ {
+		chaseOb, chaseErr := s.redis.GetOrderbook(ctx, signal.Symbol)
+		if chaseErr != nil {
+			return fmt.Errorf("chase orderbook: %w", chaseErr)
+		}
+
+		var chasePrice float64
+		if plan.Direction == "LONG" {
+			chasePrice = liquidity.BestBid(chaseOb)
+		} else {
+			chasePrice = liquidity.BestAsk(chaseOb)
+		}
+		if chasePrice <= 0 {
+			chasePrice = grid.MidPrice(chaseOb)
+		}
+		if chasePrice <= 0 {
+			return fmt.Errorf("chase: no book price for %s", signal.Symbol)
+		}
+		chasePrice = grid.RoundToTick(chasePrice, inst.TickSize)
+
+		orderID, err = s.bybit.PlaceLimitOrder(ctx, bybit.PlaceOrderRequest{
+			Symbol:      plan.Symbol,
+			Side:        side,
+			Qty:         bybit.FormatQty(plan.Qty, inst.Lot.QtyStep),
+			Price:       bybit.FormatPrice(chasePrice),
+			PositionIdx: 0,
+		})
+		if err != nil {
+			return fmt.Errorf("chase attempt %d: %w", attempt, err)
+		}
+
+		s.logger.Info("Limit Chasing entry",
+			"symbol", signal.Symbol,
+			"attempt", attempt,
+			"price", chasePrice,
+			"side", side,
+			"qty", plan.Qty,
+			"order_id", orderID,
+		)
+
+		time.Sleep(time.Duration(ChaseTimeoutSec) * time.Second)
+
+		oi, oiErr := s.bybit.GetOrderRealtime(ctx, signal.Symbol, orderID)
+		if oiErr == nil && oi.OrderStatus == "Filled" {
+			s.logger.Info("Limit Chasing filled",
+				"symbol", signal.Symbol,
+				"attempt", attempt,
+				"price", chasePrice,
+			)
+			break
+		}
+
+		if attempt < MaxChaseAttempts {
+			s.logger.Info("Limit Chasing — cancelling unfilled, re-chasing",
+				"symbol", signal.Symbol,
+				"attempt", attempt,
+				"order_status", oi.OrderStatus,
+			)
+			_ = s.bybit.CancelOrder(ctx, signal.Symbol, orderID)
+			orderID = ""
+		}
+	}
+
+	if orderID == "" {
+		return fmt.Errorf("chase failed: %s not filled after %d attempts", signal.Symbol, MaxChaseAttempts)
 	}
 
 	metrics.SignalToOrderLatency.Observe(time.Since(recvAt).Seconds())
@@ -1314,7 +1407,7 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	s.retryMissingTakeProfits(ctx, pos, ob)
 
 	// HARD TIME-STOP: 2-stage FSM — PostOnly → Kill-Switch after 30s
-	const HardTimeStopSec = 180
+	const HardTimeStopSec = 420
 	const MakerFillTimeoutSec = 30
 	const ZombieRetrySec = 120
 	holdSec := (time.Now().UnixMilli() - pos.EntryTime) / 1000
@@ -1415,8 +1508,8 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 		return
 	}
 
-	// BREAKEVEN: move SL to breakeven after 90 seconds if not yet done
-	if holdSec > 90 && !pos.BreakevenSet {
+	// BREAKEVEN: move SL to breakeven after 180 seconds if not yet done
+	if holdSec > 180 && !pos.BreakevenSet {
 		mid := grid.MidPrice(ob)
 		if mid > 0 {
 			commissionBuffer := pos.FillPrice * 0.0013 // 0.13% covers both sides
@@ -1436,11 +1529,11 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 					slQty := s.slCoverQty(pos, exSize)
 					if slQty > 0 {
 						if err := s.atomicReplaceStopLoss(ctx, pos, breakevenPrice, slQty, "breakeven"); err != nil {
-				s.logger.Warn("90s breakeven SL replace failed",
+				s.logger.Warn("180s breakeven SL replace failed",
 					"symbol", pos.Symbol, "error", err)
 						} else {
 							pos.BreakevenSet = true
-							s.logger.Info("90s breakeven SL set",
+							s.logger.Info("180s breakeven SL set",
 								"symbol", pos.Symbol,
 								"breakeven", breakevenPrice,
 								"fill", pos.FillPrice,
