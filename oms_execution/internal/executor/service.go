@@ -1793,7 +1793,8 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 								} else {
 									s.logger.Info("Market Kill-Switch executed",
 										"symbol", pos.Symbol)
-		}
+									s.tryFinalizePosition(ctx, pos, "time_stop", 0)
+								}
 	}
 
 	// ════════════════════════════════════════════════════════════════
@@ -1862,6 +1863,8 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 				if mktErr != nil {
 					s.logger.Error("Market Kill-Switch failed",
 						"symbol", pos.Symbol, "error", mktErr)
+				} else {
+					s.tryFinalizePosition(ctx, pos, "time_stop", 0)
 				}
 				pos.TimeStopPlaced = true
 				return
