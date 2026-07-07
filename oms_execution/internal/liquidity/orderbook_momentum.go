@@ -138,40 +138,50 @@ func (om *OrderbookMomentum) CurrentOBI(symbol string) float64 {
 // ParseSize safely converts a string size to float64.
 // Returns 0 on error — avoids allocation on hot path.
 func ParseSize(s string) float64 {
-	var v float64
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c == '.' {
-			// simple float parse
-			var result float64
-			frac := 0.1
-			for j := i + 1; j < len(s); j++ {
-				d := s[j]
-				if d < '0' || d > '9' {
-					break
-				}
-				result += float64(d-'0') * frac
-				frac *= 0.1
-			}
-			// parse integer part
-			for j := 0; j < i; j++ {
-				d := s[j]
-				if d < '0' || d > '9' {
-					return 0
-				}
-				result = result*10 + float64(d-'0')
-			}
-			return result
-		}
+	if len(s) == 0 {
+		return 0
 	}
-	// No decimal point — integer
-	for i := 0; i < len(s); i++ {
-		d := s[i]
-		if d < '0' || d > '9' {
-			return v
-		}
-		v = v*10 + float64(d-'0')
+
+	neg := false
+	start := 0
+	if s[0] == '-' {
+		neg = true
+		start = 1
 	}
-	_ = v
-	return 0
+
+	var intPart float64
+	dotIdx := -1
+	for i := start; i < len(s); i++ {
+		if s[i] == '.' {
+			dotIdx = i
+			break
+		}
+		if s[i] < '0' || s[i] > '9' {
+			return 0
+		}
+		intPart = intPart*10 + float64(s[i]-'0')
+	}
+
+	if dotIdx < 0 {
+		if neg {
+			return -intPart
+		}
+		return intPart
+	}
+
+	var frac float64
+	mult := 0.1
+	for i := dotIdx + 1; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			break
+		}
+		frac += float64(s[i]-'0') * mult
+		mult *= 0.1
+	}
+
+	result := intPart + frac
+	if neg {
+		return -result
+	}
+	return result
 }
