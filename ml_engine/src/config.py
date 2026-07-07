@@ -107,7 +107,7 @@ class Config:
             long_confidence_threshold=float(os.getenv("LONG_CONFIDENCE_THRESHOLD", "0.65")),
             predict_pnl=os.getenv("PREDICT_PNL", "true").lower() == "true",
             toxic_threshold=float(os.getenv("TOXIC_THRESHOLD", "0.40")),
-            min_pnl_threshold=float(os.getenv("MIN_PNL_THRESHOLD", "0.0005")),
+            min_pnl_threshold=float(os.getenv("MIN_PNL_THRESHOLD", "0.001")),
             memory_decay_days=int(os.getenv("MEMORY_DECAY_DAYS", "14")),
             faiss_persist_interval_sec=int(os.getenv("FAISS_PERSIST_INTERVAL_SEC", "300")),
             state_dim=int(os.getenv("STATE_DIM", "128")),
