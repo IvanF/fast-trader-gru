@@ -26,6 +26,7 @@ type TradeSignal struct {
 	DynamicSLPct         float64   `json:"dynamic_sl_pct,omitempty"`
 	DynamicTPPct         float64   `json:"dynamic_tp_pct,omitempty"`
 	ShadowOnly           bool      `json:"shadow_only,omitempty"`
+	ATRPct               float64   `json:"atr_14_pct,omitempty"` // Normalized ATR for dynamic mode detection
 }
 
 // PendingOrderEvent notifies ML of pending entry lifecycle for alpha-decay abort.
@@ -144,6 +145,8 @@ type ActivePosition struct {
 	EntryCandleIdx  int       // Candle index at entry time
 	CandleHigh      float64   // Current candle high
 	CandleLow       float64   // Current candle low
+	// Dynamic Trading Mode (0=Normal, 1=HFT Scalping)
+	TradingMode     int       // 0=Normal, 1=HFTScalping — set by DetectTradingMode at entry
 }
 
 type PendingEntryState string
