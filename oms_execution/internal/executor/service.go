@@ -25,6 +25,12 @@ import (
 
 const DynamicConfCap = 0.45
 
+// Funding Rate extremes for bias filter and squeeze detection
+const (
+	ExtremePositiveFunding = 0.0005  // +0.05% per 8h — longs overleveraged
+	ExtremeNegativeFunding = -0.0005 // -0.05% per 8h — shorts overleveraged
+)
+
 type Service struct {
 	cfg       config.Config
 	bybit     *bybit.Client
@@ -583,6 +589,37 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 				}
 			}
 		}
+
+		// ════════════════════════════════════════════════════════════════
+		// FUNDING RATE BIAS FILTER — asymmetric direction filter
+		// Extreme positive funding: longs overleveraged → block LONG, favor SHORT
+		// Extreme negative funding: shorts overleveraged → block SHORT, favor LONG
+		// ════════════════════════════════════════════════════════════════
+		fr := signal.FundingRate
+		if fr >= ExtremePositiveFunding {
+			if signal.Direction == "LONG" {
+				s.logger.Warn("[FUNDING FILTER] LONG rejected — extreme positive funding",
+					"symbol", signal.Symbol,
+					"funding_rate", fmt.Sprintf("%.4f%%", fr*100),
+					"risk", "Long Squeeze — longs overleveraged")
+				return nil
+			}
+			s.logger.Info("[FUNDING FILTER] SHORT favored — extreme positive funding",
+				"symbol", signal.Symbol,
+				"funding_rate", fmt.Sprintf("%.4f%%", fr*100))
+		}
+		if fr <= ExtremeNegativeFunding {
+			if signal.Direction == "SHORT" {
+				s.logger.Warn("[FUNDING FILTER] SHORT rejected — extreme negative funding",
+					"symbol", signal.Symbol,
+					"funding_rate", fmt.Sprintf("%.4f%%", fr*100),
+					"risk", "Short Squeeze — shorts overleveraged")
+				return nil
+			}
+			s.logger.Info("[FUNDING FILTER] LONG favored — extreme negative funding",
+				"symbol", signal.Symbol,
+				"funding_rate", fmt.Sprintf("%.4f%%", fr*100))
+		}
 	}
 
 	exPos, err := s.bybit.GetPosition(ctx, signal.Symbol)
@@ -746,6 +783,35 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 			"ev", fmt.Sprintf("%.4f", riskResult.EV),
 			"risk", fmt.Sprintf("%.2f%%", riskResult.RiskPct*100),
 			"kelly", fmt.Sprintf("%.2f%%", riskResult.KellyPct*100),
+		)
+	}
+
+	// ════════════════════════════════════════════════════════════════
+	// SQUEEZE DETECTION — funding + momentum alignment boost
+	// When extreme funding aligns with orderbook momentum, probability
+	// of a sharp directional move (squeeze) is maximal.
+	// Boost vol_mult (position size) by 1.5× for favorable squeeze setups.
+	// ════════════════════════════════════════════════════════════════
+	obMomentum := s.obMomentum.Momentum(signal.Symbol)
+	fr := signal.FundingRate
+	// Short Squeeze: extreme negative funding + buying pressure + LONG signal
+	if fr <= ExtremeNegativeFunding && obMomentum > 0.3 && signal.Direction == "LONG" {
+		signal.PositionScale *= 1.5
+		s.logger.Warn("[SQUEEZE DETECTED] Short Squeeze — funding + momentum alignment",
+			"symbol", signal.Symbol,
+			"funding_rate", fmt.Sprintf("%.4f%%", fr*100),
+			"momentum", fmt.Sprintf("%.4f", obMomentum),
+			"vol_boost", "1.5×",
+		)
+	}
+	// Long Squeeze: extreme positive funding + selling pressure + SHORT signal
+	if fr >= ExtremePositiveFunding && obMomentum < -0.3 && signal.Direction == "SHORT" {
+		signal.PositionScale *= 1.5
+		s.logger.Warn("[SQUEEZE DETECTED] Long Squeeze — funding + momentum alignment",
+			"symbol", signal.Symbol,
+			"funding_rate", fmt.Sprintf("%.4f%%", fr*100),
+			"momentum", fmt.Sprintf("%.4f", obMomentum),
+			"vol_boost", "1.5×",
 		)
 	}
 
