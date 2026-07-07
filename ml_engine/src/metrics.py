@@ -113,6 +113,11 @@ gpu_vram_utilization = Gauge("ml_gpu_vram_utilization_percent", "GPU VRAM utiliz
 cpu_utilization = Gauge("ml_cpu_utilization_percent", "CPU utilization")
 btc_correlation = Gauge("ml_btc_correlation", "BTC correlation per symbol", ["symbol"])
 
+# Gatekeeper
+gatekeeper_accuracy = Gauge("ml_gatekeeper_accuracy", "Gatekeeper model accuracy (rolling)")
+gatekeeper_sample_count = Gauge("ml_gatekeeper_sample_count", "Gatekeeper training samples")
+gatekeeper_train_count = Gauge("ml_gatekeeper_train_count", "Gatekeeper retrain count")
+
 # Model hot-swap
 model_version = Gauge("ml_model_version_timestamp", "Loaded ONNX model manifest updated_at unix timestamp")
 model_reloads = Counter("ml_model_hot_swap_total", "ONNX model hot-swap reload count (legacy)")
