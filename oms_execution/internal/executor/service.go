@@ -52,6 +52,7 @@ type Service struct {
 	symbolStats   map[string]*SymbolStats
 	obMomentum    *liquidity.OrderbookMomentum // orderbook pressure velocity tracker
 	densityExit   *DensityExitManager         // density/velocity exit intelligence
+	exitChaser    *ExitChaser                 // passive limit exit chaser (avoids Taker fees)
 }
 
 type SymbolStats struct {
@@ -148,6 +149,7 @@ func New(cfg config.Config, bc *bybit.Client, rc *redisx.Client, iw *influx.Writ
 		symbolStats:   make(map[string]*SymbolStats),
 		obMomentum:    liquidity.NewOrderbookMomentum(20),
 		densityExit:   NewDensityExitManager(logger, 3.5),
+		exitChaser:    NewExitChaser(logger, bc),
 	}
 	if cfg.ShadowMode {
 		s.shadow = NewShadowEngine(logger, cfg.ResultsChannel)
@@ -1870,18 +1872,30 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 						// ── Network I/O: no lock held ──
 						oi, oiErr := s.bybit.GetOrderRealtime(ctx, pos.Symbol, orderID)
 						if oiErr == nil && oi.OrderStatus == "New" {
-							s.logger.Warn("[KILL-SWITCH] Passive exit timed out — executing aggressive Market Kill-Switch!",
+							s.logger.Warn("[EXIT-CHASER] Passive exit timed out — starting limit chase",
 								"symbol", pos.Symbol, "order_id", orderID)
 							atomic.StoreInt32(&pos.State, int32(models.StateClosingAggressive))
 							_ = s.bybit.CancelOrder(ctx, pos.Symbol, orderID)
-							_, merr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, qtStep)
-							if merr != nil {
-								s.logger.Error("[KILL-SWITCH] Market Kill-Switch failed", "symbol", pos.Symbol, "error", merr)
-							} else {
-								s.logger.Info("[KILL-SWITCH] Market Kill-Switch executed", "symbol", pos.Symbol)
-								atomic.StoreInt32(&pos.State, int32(models.StateClosed))
-								s.tryFinalizePosition(ctx, pos, "time_stop", 0)
+
+							// Get fresh orderbook for chasing
+							freshOB, obErr := s.redis.GetOrderbook(ctx, pos.Symbol)
+							if obErr != nil || len(freshOB.Bids) == 0 {
+								freshOB = obSnap
 							}
+
+							// Execute passive limit chasing
+							exitPrice, chaseErr := s.exitChaser.ExecutePassiveExit(ctx, pos, freshOB, pos.TickSize)
+							if chaseErr != nil {
+								// ExitChaser exhausted — emergency market fallback
+								s.logger.Error("[KILL-SWITCH] Exit chaser failed, emergency market close",
+									"symbol", pos.Symbol, "error", chaseErr)
+								_, merr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, qtStep)
+								if merr != nil {
+									s.logger.Error("[KILL-SWITCH] Market Kill-Switch failed", "symbol", pos.Symbol, "error", merr)
+								}
+							}
+							atomic.StoreInt32(&pos.State, int32(models.StateClosed))
+							s.tryFinalizePosition(ctx, pos, "time_stop", exitPrice)
 						}
 					})
 					return
@@ -1902,27 +1916,36 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 			return
 		}
 
-		// ── Zombie Retry: hardTimeStopSec + 60s ──
+		// ── Zombie Retry: hardTimeStopSec + 60s — passive chase then market fallback ──
 		if tStopPlaced && holdSec > int64(hardTimeStopSec)+ZombieRetrySec {
 			if !atomic.CompareAndSwapInt32(&pos.State, int32(models.StateClosingPassive), int32(models.StateClosingAggressive)) {
 				if atomic.LoadInt32(&pos.State) != int32(models.StateClosingPassive) {
 					return
 				}
 			}
-			s.logger.Error("[KILL-SWITCH] ZOMBIE DETECTED — force market close",
+			s.logger.Error("[EXIT-CHASER] ZOMBIE DETECTED — passive chase + market fallback",
 				"symbol", pos.Symbol, "hold_sec", holdSec, "qty", exSize)
 			side := "Sell"
 			if dir != "LONG" {
 				side = "Buy"
 			}
 			normQty := bybit.NormalizeQty(exSize, qtStep, minQty)
-			_, mktErr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, qtStep)
-			if mktErr != nil {
-				s.logger.Error("[KILL-SWITCH] Zombie force close failed", "symbol", pos.Symbol, "error", mktErr)
-			} else {
-				s.logger.Info("[KILL-SWITCH] Zombie force close executed", "symbol", pos.Symbol)
-				atomic.StoreInt32(&pos.State, int32(models.StateClosed))
+
+			freshOB, obErr := s.redis.GetOrderbook(ctx, pos.Symbol)
+			if obErr != nil || len(freshOB.Bids) == 0 {
+				freshOB = ob
 			}
+			exitPrice, chaseErr := s.exitChaser.ExecutePassiveExit(ctx, pos, freshOB, pos.TickSize)
+			if chaseErr != nil {
+				s.logger.Error("[KILL-SWITCH] Zombie passive chase failed, emergency market",
+					"symbol", pos.Symbol, "error", chaseErr)
+				_, mktErr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, qtStep)
+				if mktErr != nil {
+					s.logger.Error("[KILL-SWITCH] Zombie market close failed", "symbol", pos.Symbol, "error", mktErr)
+				}
+			}
+			atomic.StoreInt32(&pos.State, int32(models.StateClosed))
+			s.tryFinalizePosition(ctx, pos, "time_stop", exitPrice)
 			return
 		}
 	}
