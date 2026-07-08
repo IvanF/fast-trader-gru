@@ -1,614 +1,506 @@
-# Fast Trader GRU — Текущая архитектура (2026-07-06)
+# Fast Trader GRU — Архитектура системы
+
+_Обновлено: 2026-07-08 14:12 UTC_
 
 ---
 
-## 1. Общая схема системы
+## 1. Общая архитектура
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                          Bybit V5 WebSocket (данные)                            │
-│  Orderbook L2 (20 уровней bid/ask/size)                                         │
-│  Trade Flow (price/size/direction)                                              │
-│  Funding Rate + Price History                                                   │
-└────────────────────────────────────┬────────────────────────────────────────────┘
-                                     │ Redis Pub/Sub (market:orderbook:*)
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                        ML ENGINE (Python 3.10 + ONNX GPU)                       │
-│                                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │ FeatureStore (50ms Delta Bars + 22 Macro Features)                     │   │
-│  │                                                                         │   │
-│  │ DeltaBarEncoder: 6→64→64  │  Macro: 22→64 (macro_proj)                │   │
-│  │ (delta_bid/ask_vol,       │                                             │   │
-│  │  buy/sell_vol, count,     │                                             │   │
-│  │  price_velocity)          │                                             │   │
-│  │                           │                                             │   │
-│  │ OrderbookCNN              │  FlowGRU + Attention                       │   │
-│  │ Conv1d (2,60→32)          │  GRU (3,60→32) + SelfAttention            │   │
-│  │ Conv2d (1×20×60→32)       │                                             │   │
-│  └───────────┬───────────────┴────────────────────────────────────────────┘   │
-│              │                                                                 │
-│              ▼                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │ FusionModel (backward-compat): CNN(32)+GRU(32)+Macro(22→64) → 128-dim  │  │
-│  └───────────────────────────┬──────────────────────────────────────────────┘  │
-│                              │                                                  │
-│                              ▼                                                  │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │ DecisionMLP (shared backbone → 3 heads):                                │  │
-│  │   Head 1: pred_pnl (float) — Expected PnL                               │  │
-│  │   Head 2: trap_logit → trap_prob (0-1)                                  │  │
-│  │   Head 3: toxic_logit → toxic_flow_prob (0-1)                           │  │
-│  │                                                                          │  │
-│  │ direction = LONG if pred_pnl > 0 else SHORT                             │  │
-│  │ confidence = min(|pred_pnl| / 0.01, 1.0)                               │  │
-│  └──────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                 │
-│  ┌──────────────────────┐  ┌───────────────────────────────────────────────┐   │
-│  │ FAISS Memory         │  │ Pattern Memory                                │   │
-│  │ 2,462 winning trades │  │ cosine_sim ≥ 0.92 → block                    │   │
-│  │ → 8-dim v_memory     │  │ TTL: 24h, min 3 similar losses              │   │
-│  └──────────────────────┘  └───────────────────────────────────────────────┘   │
-│                                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │ Online Learner (EWC) + Replay Buffer (200) + Retrain Worker             │  │
-│  │ Retrain: every 10 winning trades OR every 2h, 48h lookback, 12 epochs  │  │
-│  │ Loss: AsymmetricPnLLoss (2.5× overestimation penalty, fee-adjusted)    │  │
-│  └──────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                 │
-│  ФИЛЬТРЫ ДО ОТПРАВКИ В OMS:                                                    │
-│                                                                                 │
-│  1. Toxic flow:      toxic_prob > 0.40 → HOLD                                 │
-│  2. MIN_EDGE:        |pred_pnl| < 0.0025 → HOLD                               │
-│  3. Pattern memory:  3+ similar losses (cosine ≥ 0.92) → block                │
-│  4. Symbol+Setup:    3+ losses avg<-$0.10 → threshold 0.60                   │
-│  5. Symbol cooldown: 30-60min after loss                                       │
-│  6. Dynamic conf:    WR<40% → threshold raised                                 │
-│  7. Trend filter:    SHORT in uptrend → flip to LONG                          │
-│  8. Confidence:      threshold = 0.40 (SHORT), 0.40 (LONG)                   │
-│                                                                                 │
-│  direction = LONG if pred_pnl > 0 else SHORT                                  │
-│  confidence = min(|pred_pnl| / 0.01, 1.0)                                    │
-│  vol_mult = 1.0 (fixed for PnL mode)                                          │
-└────────────────────────────────────┬────────────────────────────────────────────┘
-                                     │ Redis Pub/Sub (orders:signals)
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           OMS EXECUTION (Go 1.22)                              │
-│                                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │ ENTRY FILTERS (handleSignal → placeNewEntry): 15 stages                  │  │
-│  │                                                                         │  │
-│  │  1. Dynamic confidence (OMS-side, cap 0.95)                              │  │
-│  │  2. Spread > 0.5% → reject                                              │  │
-│  │  3. Zero depth → reject                                                 │  │
-│  │  4. OBI momentum ±0.2 against direction → reject                       │  │
-│  │  5. Price trend > 0.5% against in 30s → reject                         │  │
-│  │  6. Exchange position cross-check                                        │  │
-│  │  7. RiskManager: ATR SL, tick filter, EV, Kelly sizing                  │  │
-│  └──────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │ RISK MANAGER (ProcessSignal)                                             │  │
-│  │                                                                          │  │
-│  │  a. Tick size filter: tick > 0.1% price → reject                        │  │
-│  │  b. SL: ATR(14) × 2.0 + wick buffer, clamped to [0.3%, 0.8%]           │  │
-│  │  c. EV check: (conf × RR - (1-conf)) ≤ 0 → reject                      │  │
-│  │  d. Kelly: half-Kelly, cap 2% risk, vol penalty if volMult > 1.5       │  │
-│  └──────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │ EXIT GRID (BuildExitGrid)                                                │  │
-│  │                                                                          │  │
-│  │  SL computation:                                                         │  │
-│  │    Priority: Dynamic SL > Signal SL > Liquidity SL > ATR SL             │  │
-│  │    Range: [0.3%, 0.8%] × sqrt(volMult), min 5 ticks                     │  │
-│  │                                                                          │  │
-│  │  TP computation (3-tier priority):                                       │  │
-│  │    1. Liquidity wall (orderbook support/resistance)                      │  │
-│  │    2. ML TP (from Python signal)                                         │  │
-│  │    3. Fee-aware formula: entry × (1 + fees + target) / (1 - exit_fee)   │  │
-│  │                                                                          │  │
-│  │  R:R enforcement: TP ≥ 1.2 × SL distance                                │  │
-│  │  Max TP: 3% | Max SL: 0.8% | Min TP: dynamic by price                   │  │
-│  └──────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │ POSITION MANAGEMENT (evaluatePosition)                                   │  │
-│  │                                                                          │  │
-│  │  1. Hard time-stop:    300s → market close (any remaining qty)           │  │
-│  │  2. 180s breakeven:    180s → SL to fillPrice ± 0.13% commission buffer  │  │
-│  │  3. monitorExitOrders: TP fills → breakeven → trailing SL               │  │
-│  │  4. PositionManager triggers:                                            │  │
-│  │     - Time-Stop: 4 candles + R<0.5 + no volume spike → close_full       │  │
-│  │     - Scale-Out: R≥1.0 → close 50% at market                           │  │
-│  │     - Breakeven: R≥1.5 → SL to entry + 0.15%                           │  │
-│  │     - Chandelier: R≥2.0 → trail SL at High/Low ± ATR×2.5               │  │
-│  │  5. Queue Monitor: Liquidity Mirage → emergency cancel (wall -75%)      │  │
-│  └──────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │ TRAILING STOP (multi-stage)                                              │  │
-│  │                                                                          │  │
-│  │  profitR ≥ 4.0 → lock at 3.0R (3× risk locked)                         │  │
-│  │  profitR ≥ 2.0 → lock at 1.5R (1.5× risk locked)                       │  │
-│  │  profitR ≥ 1.0 → lock at 0.5R (0.5× risk locked)                       │  │
-│  │  newSL = mid ± risk × lockR (only tighter, never wider)                 │  │
-│  └──────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │ CONFIDENCE DECAY (decay_exit.go)                                         │  │
-│  │                                                                          │  │
-│  │  decayDirectionFlipExit: only trails SL in profit (TPs preserved)       │  │
-│  │  decayMicrostructureAdverse: only trails SL in profit                   │  │
-│  │  NO TP cancellation (fixed from old aggressive behavior)                 │  │
-│  └──────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │ QUEUE MONITOR (queue_monitor.go)                                         │  │
-│  │                                                                          │  │
-│  │  Tracks passive order wall volumes via WebSocket                         │  │
-│  │  Liquidity Mirage: wall evaporated > 75% → emergency cancel             │  │
-│  │  Stale order cleanup: cancel after 30s without fill                      │  │
-│  └──────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │ BYBIT V5 API                                                            │  │
-│  │  PostOnly Maker entry + Stop-Market SL + PostOnly reduce-only TP        │  │
-│  └──────────────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         FAST TRADER GRU                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────────────────┐    │
+│  │   Screener   │────▶│  Ingestion   │────▶│       ML Engine           │    │
+│  │     (Go)     │     │     (Go)     │     │   (Python 3.10 + CUDA)   │    │
+│  │  Bybit WS    │     │  WS → Redis  │     │                           │    │
+│  │  65 symbols  │     │  orderbooks  │     │   ONNX Runtime (GPU)      │    │
+│  │              │     │  trades      │     │   FAISS Vector Memory     │    │
+│  └──────────────┘     └──────┬───────┘     │   CatBoost Gatekeeper     │    │
+│                              │              │   DensityExitManager      │    │
+│                              ▼              └──────────┬───────────────┘    │
+│                    ┌──────────────────┐                 │                    │
+│                    │    Redis 6.x     │◀────────────────│                    │
+│                    │  Central Bus     │                 │                    │
+│                    │  market:orderbook│   orders:signals│                    │
+│                    │  market:trades   │────────────────▶│                    │
+│                    │  execution:results│◀───────────────│                    │
+│                    └────────┬─────────┘                 │                    │
+│              ┌──────────────┼──────────────┐            │                    │
+│              ▼              ▼              ▼            │                    │
+│     ┌──────────────┐ ┌───────────┐ ┌────────────┐     │                    │
+│     │  History     │ │  InfluxDB │ │ Prometheus │     │                    │
+│     │  Logger      │ │  TSDB     │ │  Metrics   │     │                    │
+│     └──────────────┘ │           │ └────────────┘     │                    │
+│                       │ gatekeeper│                    │                    │
+│                       │ trade_out │                    │                    │
+│                       │ market_raw│                    │                    │
+│                       └─────┬─────┘                    │                    │
+│                             ▲                           │                    │
+│                    ┌────────┴─────────┐                 │                    │
+│                    │    OMS (Go)      │◀────────────────┘                    │
+│                    │                  │                                      │
+│                    │  RiskManager     │──────▶ Bybit V5 Demo API           │
+│                    │  PositionManager │                                      │
+│                    │  ExitGrid        │                                      │
+│                    │  DensityExitMgr  │                                      │
+│                    │  Time-Stop FSM   │                                      │
+│                    │  Smart Labeling  │                                      │
+│                    └──────────────────┘                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 2. Модель: формулы и параметры
+## 2. Pipeline сигналов (ML Engine)
 
-### 2.1 Нейросеть
-
-```
-Input: ob_seq (2, 60), flow_seq (3, 60), macro (22,), v_memory (8,)
-       delta_bars (100, 6) —备用, legacy Conv1d не использует
-
-OrderbookCNN:
-  Conv1d(OB_DIM=2 → 16, k=3, pad=1) → ReLU → Conv1d(16 → 32, k=3, pad=1) → ReLU
-  → AdaptiveAvgPool1d(1) → FC(32 → EMBED_DIM=32)
-
-FlowGRUAttention:
-  GRU(3 → 32, num_layers=1) → SelfAttention(32) → mean(dim=1) → FC(32 → 32)
-
-FusionModel:
-  cnn_out(32) + gru_out(32) + macro_proj(22→64) = concat → 128-dim state_vector
-
-DecisionMLP:
-  Linear(136 → 64) → ReLU → Dropout(0.45) → Linear(64 → 32) → ReLU → Dropout(0.45)
-  → Linear(32 → 3)
-  Output: [pred_pnl, trap_logit, toxic_logit]
-```
-
-### 2.2 PnL Prediction (текущий режим)
-
-```python
-pred_pnl = logits[0]           # Expected PnL (float)
-trap_prob = sigmoid(logits[1])  # Trap probability
-toxic_prob = sigmoid(logits[2]) # Toxic flow probability
-
-# Direction from sign of pred_pnl
-direction = "LONG" if pred_pnl > 0 else "SHORT"
-
-# Confidence = normalized |pred_pnl|
-confidence = min(|pred_pnl| / 0.01, 1.0)
-```
-
-### 2.3 AsymmetricPnLLoss
+### 2.1 Схема
 
 ```
-taker_fee = 0.00075  (0.075%)
-maker_fee = 0.00055  (0.055%)
-
-effective_true_pnl = true_pnl - (taker_fee + maker_fee)
-error = pred_pnl - effective_true_pnl
-
-weights = 2.5 if error > 0 (overestimation penalized)
-        = 1.0 if error ≤ 0 (underestimation)
-
-loss = mean(weights × error²)
+  Market Event (orderbook / trade)
+         │
+         ▼
+  SymbolBuffer.add_orderbook() / add_trade()
+         │
+         ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │              _run_tick_prediction()                       │
+  │                                                           │
+  │  ①  Buffer Warming:      len(points) < 10 → HOLD        │
+  │  ②  ONNX Inference:      direction / confidence / vol    │
+  │  ③  Toxic Flow Filter:   toxic_prob > 0.40 → HOLD       │
+  │  ④  MIN_EDGE:            |pred_pnl| < 0.0025 → HOLD     │
+  │  ⑤  Correlation Block:   BTC_corr > 0.70 → HOLD         │
+  │  ⑥  Pattern Memory:      cosine_sim ≥ 0.92 + 5 losses   │
+  │  ⑦  Symbol Cooldown:     30-60 min after SL              │
+  │  ⑧  Dynamic Confidence:  WR < 40% → raise threshold      │
+  │  ⑨  Setup Escalation:    3+ losses → threshold 0.80      │
+  │  ⑩  Trend Filter:        downtrend → conf = 0.30         │
+  │  ⑪  Confidence Threshold: conf ≤ threshold → HOLD        │
+  │  ⑫  ExitOptimizer:       SL/TP levels + trade_score      │
+  │  ⑬  Trade Score Gate:    score < 0.30 → HOLD             │
+  │  ⑭  Event-Driven Gate:   conf ≥ 0.85 OR OBI > 0.4       │
+  │  ⑮  Gatekeeper:          P(success) < 0.45 → REJECT     │
+  │       │                                                   │
+  │       ▼                                                   │
+  │  Publish → Redis "orders:signals"                         │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-### 2.4 Delta Bars (50ms time-bins)
+### 2.2 Формулы
 
+**Direction:**
 ```
-delta_bid_vol  = current_bid_top10 - previous_bid_top10
-delta_ask_vol  = current_ask_top10 - previous_ask_top10
-market_buy_vol = Σ(trade.size | side == BUY)  за 50ms
-market_sell_vol = Σ(trade.size | side == SELL) за 50ms
-trade_count    = count(trades) за 50ms
-price_velocity = (mid_now - mid_50ms_ago) / 0.050
-
-Output: (100, 6) — 100 бакетов × 6 фич
+direction = LONG    если pred_pnl > 0
+direction = SHORT   если pred_pnl < 0
+direction = HOLD    если pred_pnl == 0
 ```
 
-### 2.5 2D Orderbook Tensor
-
+**Confidence (PnL mode):**
 ```
-For each of 60 timesteps × 20 levels:
-  tensor[t, i, 0] = (price_i - mid) / mid      (relative price, normalized)
-  tensor[t, i, 1] = size_i / mean_size_snapshot  (Z-score normalization)
-
-Output: (60, 20, 2) — 60 timestamps × 20 levels × 2 features
+confidence = min(|pred_pnl| / 0.01, 1.0)     если |pred_pnl| ≥ 0.0025
+confidence = 0                                иначе
 ```
 
-### 2.6 Feature Vector (22 features)
-
+**MIN_EDGE Filter (UPDATED: 0.0015 → 0.0025):**
 ```
-[0]  obi                  = (bid_vol - ask_vol) / (bid_vol + ask_vol)
-[1]  cvd_norm             = tanh(cvd / 1e6)
-[2]  ofs                  = order_flow_speed = trades / duration
-[3]  vwap_dev             = (last_price - vwap) / vwap
-[4]  trend_5m             = (price[-1] - price[0]) / price[0] over 300s
-[5]  trend_15m            = same over 900s
-[6]  trend_1h             = same over 3600s
-[7]  trend_4h             = same over 14400s
-[8]  trend_1d             = same over 86400s
-[9]  funding_rate         = current funding rate
-[10] obi_reversal         = max(obi) - min(obi) over 60 ticks
-[11] pre_entry_sweep      = 1 if max_trade_size > 3× average in last 10
-[12] fill_delay_norm      = avg_delay / 60.0
-[13] vol_imbalance        = (buy_vol - sell_vol) / total (from trades)
-[14] funding_chg          = obi_last - obi_first (OBI delta as proxy)
-[15] depth_imbalance      = (bid_top10 - ask_top10) / total
-[16] depth_concentration  = (bid_top3 + ask_top3) / total
-[17] spread_bps           = (best_ask - best_bid) / best_bid × 10000
-[18] fill_to_depth        = avg_fill / avg_level_size
-[19] level_density        = (count_nonzero_bid + count_nonzero_ask) / 20
-[20] tanh(bid_vol / 1e6)
-[21] tanh(ask_vol / 1e6)
+if |pred_pnl| < 0.0025:
+    signal = HOLD (rejected — below noise floor)
+```
+_Зачем: при commission 0.13% (taker+maker) + spread ~0.05%, edge < 0.25% не покрывает издержки._
+
+**OBI (Order Book Imbalance):**
+```
+              Σ(top-5 bid_vol) − Σ(top-5 ask_vol)
+OBI = ────────────────────────────────────────────────
+              Σ(top-5 bid_vol) + Σ(top-5 ask_vol)
+```
+
+**Dynamic Confidence Threshold:**
+```
+penalty = max(1.0, 3.0 − 2.5 × (WR / 0.40))
+threshold = min(base_confidence × penalty, 0.95)
+```
+
+**Pattern Memory Similarity:**
+```
+similarity = cosine(state_vector_A, state_vector_B)
+block если: similarity ≥ 0.92 И ≥ 5 similar patterns с avg_loss < −$0.10
+```
+
+**Gatekeeper (CatBoost):**
+```
+P(success) = CatBoost.predict_proba(features)
+P(success) ≥ 0.45 → PASS
+P(success) < 0.45 → REJECT
 ```
 
 ---
 
-## 3. SL/TP: формулы и логика
+## 3. OMS Execution Pipeline
 
-### 3.1 SL Computation (BuildExitGrid)
-
-```
-minSLPct = 0.003  (0.3% — minimum SL distance)
-maxSLPct = 0.008  (0.8% — hard cap)
-slVolMult = sqrt(volatility_multiplier)
-minSLPct *= slVolMult
-maxSLPct *= slVolMult
-
-SL Priority Chain:
-  1. Dynamic SL (from ML Python): slPct clamped to [minSL, maxSL×3]
-  2. Signal SL (from ML signal): validated direction, min/max enforced
-  3. Liquidity SL: ComputeLiquiditySL — nearest support/resistance zone
-  4. Min tick: ≥ 5 ticks from entry
-
-SL for LONG:  fillPrice × (1 - slPct)
-SL for SHORT: fillPrice × (1 + slPct)
-```
-
-### 3.2 TP Computation (3-tier priority)
+### 3.1 Схема обработки сигнала
 
 ```
-maxTPDist = MaxTPPct (default 0.015)
-if volMult > 1.5: maxTPDist *= 1.5 / volMult
-
-Priority 1: Liquidity Wall
-  support/resistance in orderbook
-  Must be: feeMinDist ≤ wallDist ≤ maxTPDist
-  TP = wall_price ± 2 ticks
-
-Priority 2: ML TP (from Python signal)
-  Must be in correct direction, within maxTPDist
-
-Priority 3: Fee-aware formula
-  LONG: fillPrice × (1 + entryFee + target) / (1 - exitFee)
-  SHORT: fillPrice × (1 - entryFee - target) / (1 + exitFee)
+  Signal (Redis pub/sub)
+         │
+         ▼
+  ┌───────────────────────────────────────────────────────────────┐
+  │                     handleSignal()                             │
+  │                                                                │
+  │  Entry Filters (12 steps):                                     │
+  │  Blacklist → DynamicConf → Spread → ZeroDepth → OBI           │
+  │  → Momentum → PriceTrend → Volume → FundingRate               │
+  │  → Correlation → ExchangeCheck → RiskManager                  │
+  │                                                                │
+  │  Order Placement:                                              │
+  │  conf ≥ 0.95 → Market-Take (immediate)                        │
+  │  conf < 0.95 → Limit Chasing (3× 5s)                          │
+  └───────────────────────────────────────────────────────────────┘
+         │
+         ▼
+  ActivePosition Created
+         │
+         ▼
+  ┌───────────────────────────────────────────────────────────────┐
+  │            Position Lifecycle (500ms tick)                     │
+  │                                                                │
+  │  ┌───────────────────────────────────────────────────────┐    │
+  │  │ Time-Stop FSM (UPDATED):                               │    │
+  │  │   Normal mode:  180s (unified, all confidence)         │    │
+  │  │   HFT mode:      60s                                   │    │
+  │  │                                                        │    │
+  │  │   Stage 1: PostOnly Maker (5s passive window)          │    │
+  │  │   Stage 2: 5s → Market Kill-Switch                     │    │
+  │  │   Zombie:  +60s → force market close                   │    │
+  │  └───────────────────────────────────────────────────────┘    │
+  │                                                                │
+  │  ┌───────────────────────────────────────────────────────┐    │
+  │  │ PositionManager (ATR triggers):                        │    │
+  │  │   Scale-Out: R ≥ 1.0 → close 50%                      │    │
+  │  │   Breakeven: R ≥ 1.5 → SL = fill + fee (90s timer)   │    │
+  │  │   Chandelier: R ≥ 2.0 → trailing SL (ATR × 2.5)      │    │
+  │  └───────────────────────────────────────────────────────┘    │
+  │                                                                │
+  │  ┌───────────────────────────────────────────────────────┐    │
+  │  │ DensityExitManager:                                    │    │
+  │  │   Wall Push: bid/ask > 15x → adjust TP async          │    │
+  │  │   Velocity Reversal: momentum > 0.4 → Market exit     │    │
+  │  │   Stagnation: hold > 90s + R < 0.15 → breakeven       │    │
+  │  └───────────────────────────────────────────────────────┘    │
+  │                                                                │
+  │  ┌───────────────────────────────────────────────────────┐    │
+  │  │ MFE/MAE Tracking + Smart Labeling:                     │    │
+  │  │   Every tick: track MaxFavorablePrice / MaxAdversePrice│    │
+  │  │   At close: MFE > 75% of TP → label = 1 (override)   │    │
+  │  └───────────────────────────────────────────────────────┘    │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-### 3.3 R:R Enforcement
+### 3.2 Risk Management Formulas
 
+**Stop Loss (ATR-based):**
 ```
-slDist = |fillPrice - slPrice|
-tpDist = |tpPrice - fillPrice|
-
-// Primary check: TP must be ≥ 1.2× SL distance
-if tpDist < slDist × 1.2:
-    tpPrice = fillPrice ± slDist × 1.2 ± tickSize
-
-// Re-verify after rounding
-if tpDistFinal < slDist × 1.0:
-    tpPrice = fillPrice ± slDist × 1.2
-
-// Max TP cap: 3% from entry
-if tpDist > 0.03:
-    tpPrice = fillPrice × (1 ± 0.03)
+SL_distance = max(0.006, min(0.008, ATR_14 × mult))
+SL_price = FillPrice ∓ SL_distance
 ```
 
-### 3.4 RiskManager ProcessSignal
-
+**Take Profit:**
 ```
-Input: direction, confidence, entryPrice, tpPrice, prices[], balance, volMult, tickSize
-
-Step 1: Tick filter — reject if tickSize / entryPrice > 0.1%
-
-Step 2: ATR-based SL
-  atr = CalculateATR(prices, 14)  // Wilder's smoothing
-  atrFallback = mean(|price_change|) × 5  // if ATR=0
-  extrema = FindNearestExtrema(prices, direction, 20)
-  wickBuffer = (max(prices) - min(prices)) × 1.5
-  
-  LONG SL = entryPrice - atr × 2.0 - wickBuffer
-  SHORT SL = entryPrice + atr × 2.0 + wickBuffer
-  
-  Hard cap: slDistancePct ≤ 0.008 (0.8%)
-
-Step 3: EV check
-  rr = tpDistancePct / slDistancePct
-  ev = (confidence × rr) - ((1 - confidence) × 1)
-  reject if ev ≤ 0
-
-Step 4: Kelly sizing
-  kellyPct = confidence - (1 - confidence) / rr
-  adjustedKelly = kellyPct × 0.5  (half-Kelly)
-  finalRiskPct = min(adjustedKelly, 0.02)  (2% cap)
-  if volMult > 1.5: finalRiskPct *= 1.5 / volMult
-  
-  qty = (balance × finalRiskPct) / slDistancePct
+TP_distance = SL_distance × R:R       # R:R = 1.2
+TP_price = FillPrice ± TP_distance
 ```
 
-### 3.5 Dynamic MinTPPct
-
+**R-Multiple:**
 ```
-if mid_price < 0.01:   MinTPPct = 0.01   (1%)
-if mid_price < 0.10:   MinTPPct = 0.005  (0.5%)
-else:                   MinTPPct = 0.003  (0.3%)
+R = unrealized_pnl / OriginalRisk
+OriginalRisk = |FillPrice − PlannedSL|
+```
+
+**Breakeven (90s timer):**
+```
+SL_breakeven = FillPrice ± 0.0015 × FillPrice
+# Only tightens, never widens
 ```
 
 ---
 
-## 4. Position Management: формулы
-
-### 4.1 PositionManager Triggers
+## 4. Time-Stop FSM (UPDATED)
 
 ```
-CurrentR = unrealizedPnL / OriginalRisk
+  holdSec > hardTimeStopSec
+       │
+       ▼
+  ┌──────────────────────────┐
+  │ hardTimeStopSec =         │
+  │   HFT:     60s            │
+  │   Normal:  180s (all)     │
+  └──────────────┬───────────┘
+       │
+       ▼
+  ┌──────────────────────────┐
+  │ Profitable at time-stop? │──── YES ──▶ Breakeven Market Close
+  └──────────────┬───────────┘
+                 │ NO
+                 ▼
+  ┌──────────────────────────┐
+  │ LONG + loss > 0.3%?      │──── YES ──▶ Force Market Close
+  └──────────────┬───────────┘
+                 │ NO
+                 ▼
+  ┌──────────────────────────┐
+  │ Stage 1: PostOnly Maker  │
+  │ Passive limit exit        │
+  │ 5-second window           │
+  └──────────────┬───────────┘
+                 │
+       ┌─────────┴──────────┐
+       ▼                    ▼
+  Filled? YES          Filled? NO (5s)
+       │                    │
+       ▼                    ▼
+    [DONE]          ┌──────────────────┐
+                     │ KILL-SWITCH:      │
+                     │ Cancel PostOnly   │
+                     │ Market Reduce     │
+                     │ tryFinalize()     │
+                     └──────────────────┘
 
-TRIGGER 1 — Time-Stop:
-  if candlesHeld ≥ 4 AND currentR < 0.5 AND NO volume_spike:
-    action: close_full
-
-TRIGGER 2 — Scale-Out:
-  if currentR ≥ 1.0 AND !ScaledOut:
-    action: close_partial (50% of remaining)
-
-TRIGGER 3 — Breakeven:
-  if currentR ≥ 1.5 AND !BreakevenSet:
-    LONG:  newSL = entryPrice × (1 + 0.0015)
-    SHORT: newSL = entryPrice × (1 - 0.0015)
-    action: move_sl
-
-TRIGGER 4 — Chandelier Exit:
-  if currentR ≥ 2.0:
-    atr = CalculateATR(priceHistory, 14)
-    LONG:  newSL = candleHigh - atr × 2.5
-    SHORT: newSL = candleLow + atr × 2.5
-    action: move_sl (tighter only)
+  Zombie: holdSec > hardTimeStopSec + 60s → emergency market close
 ```
 
-### 4.2 Hard Time-Stop (300s)
-
-```
-holdSec = (now - pos.EntryTime) / 1000
-if holdSec > 300:
-    side = "Buy" if SHORT, "Sell" if LONG
-    PlaceReduceMarket(side, fullRemainingQty)
-    // Always checks exchange, never trusts TimeStopPlaced flag
-```
-
-### 4.3 180s Breakeven
-
-```
-holdSec > 180 AND !BreakevenSet:
-    commissionBuffer = fillPrice × 0.0013  (0.13% for both sides)
-    LONG:  breakevenPrice = fillPrice + commissionBuffer
-    SHORT: breakevenPrice = fillPrice - commissionBuffer
-    
-    // Only tighten (never widen)
-    if newSL tighter than current SL:
-        atomicReplaceStopLoss(breakevenPrice, slQty, "breakeven")
-        BreakevenSet = true
-```
-
-### 4.4 Trailing Stop
-
-```
-profitDist = mid - fillPrice (LONG) or fillPrice - mid (SHORT)
-risk = |fillPrice - PlannedSL|
-profitR = profitDist / risk
-
-if profitR ≥ 4.0: lockR = 3.0
-if profitR ≥ 2.0: lockR = 1.5
-if profitR ≥ 1.0: lockR = 0.5
-
-LONG:  newSL = mid - risk × lockR
-SHORT: newSL = mid + risk × lockR
-// Only tighter (never wider)
-```
-
-### 4.5 Confidence Decay
-
-```
-decayDirectionFlipExit:
-  → Only trails SL tighter in profit
-  → TPs preserved (NOT cancelled)
-  → Grid stays active
-
-decayMicrostructureAdverse:
-  → Same behavior: trail SL, preserve grid
-```
+**Key changes from previous version:**
+| Parameter | Before | After |
+|-----------|--------|-------|
+| Normal time-stop | 240s/150s (high/low conf) | **180s (unified)** |
+| Passive window | 30s | **5s** |
+| Zombie retry | 120s | **60s** |
+| Breakeven timer | 60s | **90s** |
+| Kill-Switch prefix | Mixed | `[TIME-STOP FSM]` + `[KILL-SWITCH]` |
 
 ---
 
-## 5. Фильтры: полная цепочка
+## 5. ML Architecture
 
-### ML Engine (8 фильтров)
-
-| # | Фильтр | Порог | Эффект |
-|---|--------|-------|--------|
-| 1 | Toxic flow | toxic_prob > 0.40 | HOLD |
-| 2 | MIN_EDGE | |pred_pnl| < 0.0025 | HOLD |
-| 3 | Pattern memory | 3+ similar losses (cosine ≥ 0.92) | block |
-| 4 | Symbol+Setup | 3+ losses avg<-$0.10 | threshold → 0.60 |
-| 5 | Symbol cooldown | 30-60min after loss | block |
-| 6 | Dynamic confidence | WR < 40% | threshold raised |
-| 7 | Trend filter | SHORT in uptrend > 0.3% | flip → LONG |
-| 8 | Confidence threshold | SHORT: 0.40, LONG: 0.40 | block |
-
-### OMS (15 фильтров)
-
-| # | Фильтр | Порог | Эффект |
-|---|--------|-------|--------|
-| 9 | Dynamic confidence (OMS) | cap 0.95, penalty × streak | block |
-| 10 | Spread | > 0.5% | reject |
-| 11 | Zero depth | total = 0 | reject |
-| 12 | OBI momentum | ±0.2 against direction | reject |
-| 13 | Price trend | > 0.5% against in 30s | reject |
-| 14 | Exchange cross-check | opposite position | skip |
-| 15 | RiskManager | tick/SL/EV/Kelly | reject |
-
-### Position Management
-
-| # | Триггер | Условие | Действие |
-|---|---------|---------|----------|
-| 16 | Hard time-stop | 300s | market close |
-| 17 | 180s breakeven | 180s + !BreakevenSet | SL → breakeven |
-| 18 | Scale-Out | R ≥ 1.0 | close 50% |
-| 19 | Breakeven | R ≥ 1.5 | SL → entry+0.15% |
-| 20 | Chandelier | R ≥ 2.0 | trail SL |
-| 21 | Queue Monitor | wall -75% | emergency cancel |
-
----
-
-## 6. Конфигурация
-
-### 6.1 ML Engine (config.py + .env)
-
-| Параметр | Env | Default | Описание |
-|----------|-----|---------|----------|
-| PREDICT_PNL | PREDICT_PNL | **true** | Режим PnL regression |
-| TOXIC_THRESHOLD | TOXIC_THRESHOLD | **0.40** | Порог токсичности |
-| MIN_PNL_THRESHOLD | MIN_PNL_THRESHOLD | **0.0025** | Минимальный edge |
-| CONFIDENCE_THRESHOLD | CONFIDENCE_THRESHOLD | 0.40 | Base confidence |
-| LONG_CONFIDENCE_THRESHOLD | LONG_CONFIDENCE_THRESHOLD | 0.40 | LONG confidence |
-| RETRAIN_EPOCHS | RETRAIN_EPOCHS | 12 | Эпохи обучения |
-| RETRAIN_TRADE_THRESHOLD | RETRAIN_TRADE_THRESHOLD | 10 | Winning trades → retrain |
-| RETRAIN_LOOKBACK_HOURS | RETRAIN_LOOKBACK_HOURS | 24 | Lookback |
-| STATE_DIM | STATE_DIM | 128 | State vector size |
-| MEMORY_DIM | MEMORY_DIM | 8 | FAISS memory size |
-| PATTERN_SIMILARITY | PATTERN_SIMILARITY_THRESHOLD | 0.92 | Cosine threshold |
-| PATTERN_TTL | PATTERN_TTL_HOURS | 24 | Pattern expiry |
-
-### 6.2 Go OMS (config.go + .env)
-
-| Параметр | Env | Default | Описание |
-|----------|-----|---------|----------|
-| MinSLPct | MIN_SL_PCT | 0.006 | Мин SL (overridden by BuildExitGrid: 0.003) |
-| MaxSLPct | MAX_SL_PCT | 0.008 | Макс SL (overridden by BuildExitGrid: 0.008) |
-| MinTPPct | MIN_TP_PCT | 0.003 | Мин TP (dynamic: 1%/0.5%/0.3% by price) |
-| MaxTPPct | MAX_TP_PCT | 0.02 | Макс TP: 2% |
-| TradeMarginUSD | TRADE_MARGIN_USD | 10 | Маржа на сделку |
-| Leverage | LEVERAGE | 5 | Плечо |
-| TimeStopSeconds | TIME_STOP_SECONDS | 3600 | Legacy time stop |
-| EntryMakerTicks | ENTRY_MAKER_TICKS | 1 | Ticks for maker entry |
-
-### 6.3 RiskManager Constants
-
-| Константа | Значение | Описание |
-|-----------|----------|----------|
-| MaxSLPct | 0.008 (0.8%) | Hard SL cap |
-| MaxTickSizePct | 0.001 (0.1%) | Reject if tick too large |
-| MaxRiskPerTrade | 0.02 (2%) | Kelly risk cap |
-| KellyFraction | 0.5 | Half-Kelly |
-| ATRMult | 2.0 | ATR multiplier |
-| WickBufferMult | 1.5 | Wick buffer multiplier |
-
-### 6.4 PositionManager Constants
-
-| Константа | Значение | Описание |
-|-----------|----------|----------|
-| ScaleOutR | 1.0 | Scale-out at 1R |
-| ScaleOutPct | 0.50 | Close 50% |
-| BreakevenR | 1.5 | Breakeven at 1.5R |
-| ChandelierR | 2.0 | Chandelier at 2R |
-| ChandelierATRMult | 2.5 | ATR multiplier |
-| BreakevenFeeBuffer | 0.0015 | 0.15% buffer |
-| TimeStopCandles | 4 | Candles for time-stop |
-
-### 6.5 Queue Monitor Constants
-
-| Константа | Значение | Описание |
-|-----------|----------|----------|
-| LiquidityEvaporationThreshold | 0.25 | Wall -75% → cancel |
-| MaxOrderAge | 30s | Stale order cleanup |
-
----
-
-## 7. Data Flow
+### 5.1 Модельная архитектура
 
 ```
-Bybit WebSocket → Redis (market:orderbook:*)
-                      │
-                      ├──→ FeatureStore.add_orderbook()
-                      │    → 22 macro features
-                      │    → 20×60 orderbook tensor
-                      │    → 100×6 delta bars
-                      │    → 60×3 flow sequence
-                      │
-                      ├──→ priceHistory[] (rolling 100 mids)
-                      └──→ volumeHistory[] (rolling 20 bid volumes)
-
-Model: Fusion(128) → DecisionMLP([pred_pnl, trap, toxic])
+  Orderbook (Redis)                    Trade Flow (Redis)
+       │                                     │
+       ▼                                     ▼
+  ┌──────────────────┐           ┌──────────────────────────┐
+  │ 2D Tensor 10×10  │           │ Delta Bars (50ms bins)   │
+  │ [bid, ask] depth │           │ [Δbid, Δask, buy, sell, │
+  └────────┬─────────┘           │  count, velocity]        │
+           │                     └────────────┬─────────────┘
+           ▼                                  ▼
+  ┌──────────────────┐           ┌──────────────────────────┐
+  │  orderbook_cnn   │           │  flow_gru_attention       │
+  │  Conv2d(2→32,3)  │           │  GRU(6→64) + CrossAttn   │
+  │  Conv2d(32→64,3) │           │  Q=flow, K,V=orderbook    │
+  │  Linear(64→64)   │           │  → 64d vector             │
+  │  → 64d            │           └────────────┬─────────────┘
+  └────────┬─────────┘                         │
+           └──────────┬───────────────────────┘
+                      ▼
+           ┌──────────────────┐
+           │  Concatenate 128d│
+           └────────┬─────────┘
+          ┌─────────┴──────────┐
+          ▼                    ▼
+  ┌──────────────────┐ ┌──────────────────┐
+  │  decision_mlp    │ │  exit_optimizer  │
+  │  128→64→32→3    │ │  128→32→2       │
+  │  → direction     │ │  → sl_pct        │
+  │  → confidence    │ │  → tp_pct        │
+  │  → vol_mult      │ └──────────────────┘
+  └──────────────────┘
            │
-           ├──→ direction = LONG/SHORT
-           ├──→ confidence = |pred_pnl|/0.01
-           └──→ toxic_prob → block if > 0.40
-                    │
-                    ▼
-         OMS Filters (15 stages)
-                    │
-                    ▼
-         RiskManager (ATR SL + Kelly)
-                    │
-                    ▼
-         PostOnly Maker Entry → PendingEntry
-                    │
-                    ▼
-         Fill Monitor (500ms) → ActivePosition
-                    │
-                    ▼
-         Exit Grid Deploy: SL + TP
-                    │
-                    ▼
-         Position Monitor (500ms):
-           ├── Hard time-stop (300s)
-           ├── 180s breakeven
-           ├── TP fills → breakeven → trailing
-           ├── PositionManager triggers
-           └── Queue Monitor → emergency cancel
+           ▼
+  ┌──────────────────────────────────────────────┐
+  │  AsymmetricPnLLoss (2.5× overestimation)     │
+  │                                               │
+  │  loss = {  2.5 × (pred − true)²  (overest)  │
+  │          {  1.0 × (pred − true)²  (underest) │
+  │                                               │
+  │  effective_true_pnl = pnl − commissions       │
+  │  commissions = 0.13% (taker 0.075% + maker 0.055%) │
+  └──────────────────────────────────────────────┘
+```
+
+### 5.2 Gatekeeper v2
+
+```
+  InfluxDB → gatekeeper_features (20 fields + label)
+       │
+       ▼
+  ┌──────────────────────────────────────┐
+  │ gatekeeper_trainer.py (batch)        │
+  │                                      │
+  │  CatBoost (500 iter, depth=6, AUC)  │
+  │  Temporal split 80/20 (no shuffle)   │
+  │  Export: gatekeeper_model.cbm        │
+  └──────────────────────────────────────┘
+
+  20 features:
+  confidence, spread_pct, obi, volume_ratio, momentum,
+  price_velocity, atr_pct, funding_rate, btc_correlation,
+  volatility_multiplier, symbol_wr, symbol_pnl_sum,
+  symbol_consec_losses, hour_of_day, open_positions_count,
+  recent_wr_20, pred_pnl
+
+  P(success) ≥ 0.45 → PASS
+  P(success) < 0.45 → REJECT
+  No model → PASS (fail-safe)
+
+  Current: AUC=0.7842, Acc=79.17%, 423 samples (WR=31.2%)
 ```
 
 ---
 
-## 8. Git History (PR)
+## 6. DensityExitManager
 
-| PR | Описание | Статус |
-|----|----------|--------|
-| PR #1 | Hard SL cap 0.5% + Conv2d + entry filters | ✅ MERGED |
-| PR #2 | Hard time-stop market order | ✅ MERGED |
-| PR #3 | Side inversion fix | ✅ MERGED |
-| PR #4 | Multimodal Cross-Attention + Queue Toxicity | ✅ MERGED |
-| PR #5 | AsymmetricPnLLoss + PnL regression | ✅ MERGED |
-| PR #6 | Toxic threshold 0.35→0.50 | ✅ MERGED |
-| PR #7 | SL [0.3%-0.8%] + R:R≥1.2 + PnL forced + 180s breakeven + logging | ✅ MERGED |
+```
+  ┌─────────────────────────────────────────────────────┐
+  │           DensityExitManager (500ms tick)            │
+  │                                                      │
+  │  Wall Push:                                          │
+  │    wall_ratio = bid_depth / ask_depth (LONG)         │
+  │    if wall_ratio > 15 → adjust TP to current ± 0.2% │
+  │    → goroutine: cancel old TP, place new limit       │
+  │                                                      │
+  │  Velocity Reversal:                                  │
+  │    momentum = OBI_velocity                           │
+  │    shift = PressureShift(0.3)                        │
+  │    LONG + shift=-1 + mom < −0.4 → Market Kill-Switch │
+  │    SHORT + shift=+1 + mom > 0.4 → Market Kill-Switch │
+  │                                                      │
+  │  Stagnation:                                         │
+  │    holdSec > 90 AND currentR < 0.15                  │
+  │    → SL = fillPrice ± 0.15% fee buffer               │
+  └─────────────────────────────────────────────────────┘
+```
+
+---
+
+## 7. Smart Labeling (MFE)
+
+```
+  During position lifetime (every 500ms tick):
+  LONG:  MaxFavorablePrice = max(mid, prev)
+  SHORT: MaxFavorablePrice = min(mid, prev)
+
+  At close (finalizeClose):
+  ┌──────────────────────────────────────────────┐
+  │ if pnl ≤ 0 AND MaxFavorablePrice > 0:        │
+  │   tpDist  = |TP − FillPrice|                  │
+  │   mfeDist = |MaxFavorable − FillPrice|        │
+  │   mfePct  = mfeDist / tpDist                  │
+  │                                               │
+  │   if mfePct > 0.75:                           │
+  │     label = 1  (entry accurate, bad exec)     │
+  │     log: [LABEL CLEANUP]                      │
+  │   else:                                       │
+  │     label = 0                                 │
+  │ else:                                         │
+  │   label = (pnl > 0) ? 1 : 0                  │
+  └──────────────────────────────────────────────┘
+```
+
+---
+
+## 8. Data Flow
+
+```
+Bybit WS ──▶ Screener ──▶ Ingestion ──▶ Redis ──▶ ML Engine
+                                                │
+                                                ▼
+                                        ONNX Inference
+                                        (orderbook_cnn + flow_gru + decision_mlp)
+                                                │
+                                                ▼
+                                        Signal Pipeline (15 gates)
+                                        + Gatekeeper (CatBoost)
+                                                │
+                                     Redis "orders:signals"
+                                                │
+                                                ▼
+                                         OMS Execution
+                                        (12 entry filters)
+                                                │
+                                    Bybit V5 Demo API
+                                                │
+                                     Redis "execution:results"
+                                     ┌──────────┴──────────┐
+                                     ▼                     ▼
+                              ML Engine               OMS finalizeClose
+                              (online learning)      (Smart Labeling)
+                                     │                     │
+                                     ▼                     ▼
+                              Pattern Memory         InfluxDB
+                              FAISS vectors          ├─ gatekeeper_features
+                                                     ├─ trade_outcomes
+                                                     └─ market_raw
+```
+
+---
+
+## 9. Entry Filters
+
+| # | Filter | Threshold | Action |
+|---|--------|-----------|--------|
+| 1 | Blacklist | ETF tokens | REJECT |
+| 2 | Dynamic Confidence | WR < 40% → raise | REJECT |
+| 3 | Spread | > 0.5% | REJECT |
+| 4 | Zero Depth | bid+ask = 0 | REJECT |
+| 5 | OBI Direction | ±0.4 | REJECT |
+| 6 | Momentum (shift) | against direction | REJECT |
+| 7 | Price Trend | 30s move > 0.5% | REJECT |
+| 8 | Volume | < 0.5× SMA(20) | REJECT |
+| 9 | Funding Rate | ±0.05% | REJECT |
+| 10 | Correlation | > 0.70 + conf < 0.95 | HOLD |
+| 11 | Exchange Cross-Check | no position | REJECT |
+| 12 | RiskManager | SL constraints | REJECT |
+
+---
+
+## 10. Key Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| MIN_EDGE | **0.0025** | Min expected PnL (0.25%) — **UPDATED** |
+| GK_THRESHOLD | 0.45 | Gatekeeper threshold |
+| PATTERN_SIMILARITY | 0.92 | Cosine similarity threshold |
+| R:R | 1.2 | Risk:Reward ratio |
+| MIN_SL_PCT | 0.006 | Min SL (0.6%) |
+| MAX_SL_PCT | 0.008 | Max SL (0.8%) |
+| MAX_CORRELATION | 0.70 | BTC correlation limit |
+| VOL_MULTIPLIER_CAP | 2.0 | Max vol_mult |
+| NORMAL_TSTOP | **180s** | Time-stop (all confidence) — **UPDATED** |
+| HFT_TSTOP | 60s | Time-stop (HFT mode) |
+| PASSIVE_WINDOW | **5s** | PostOnly → Market timeout — **UPDATED** |
+| ZOMBIE_RETRY | **60s** | Zombie force close — **UPDATED** |
+| BREAKEVEN_SEC | **90s** | Breakeven timer — **UPDATED** |
+| MFE_THRESHOLD | 0.75 | Smart labeling override |
+| DENSITY_WALL | 15.0 | Wall push threshold |
+| DENSITY_STALL | 90s | Stagnation time |
+| DENSITY_STALL_R | 0.15 | Stagnation R threshold |
+
+---
+
+## 11. Infrastructure
+
+| Component | Tech | Container |
+|-----------|------|-----------|
+| Screener | Go | ftg-screener |
+| Ingestion | Go | ftg-ingestion |
+| ML Engine | Python + CUDA | ftg-ml-engine |
+| OMS | Go | ftg-oms |
+| History Logger | Go | ftg-history-logger |
+| Redis | 6.x | ftg-redis |
+| InfluxDB | 2.x | ftg-influxdb |
+| Prometheus | Go | ftg-prometheus |
+| Grafana | Go | ftg-grafana |
+
+**Trading:** $2,000 balance, 5× leverage, $10 margin, 200 max concurrent, R:R=1.2

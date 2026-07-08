@@ -1,0 +1,232 @@
+{
+  "period": "last_1h",
+  "generated_at": "2026-07-08T14:12:00Z",
+  "summary": {
+    "total_opens": 65,
+    "total_closes": 66,
+    "total_pnl": -3.0434,
+    "win_count": 21,
+    "loss_count": 39,
+    "breakeven_count": 6,
+    "win_rate_pct": 31.8,
+    "avg_win": 0.1938,
+    "avg_loss": -0.1824,
+    "profit_factor": 0.57,
+    "rr_ratio": 1.06,
+    "avg_hold_sec": 245.7
+  },
+  "by_exit_reason": {
+    "time_stop": {
+      "count": 29,
+      "pnl": -4.3835,
+      "wins": 1,
+      "losses": 28
+    },
+    "fee_loss": {
+      "count": 7,
+      "pnl": -1.1364,
+      "wins": 0,
+      "losses": 7
+    },
+    "stale_tracker_removed": {
+      "count": 6,
+      "pnl": 0.0,
+      "wins": 0,
+      "losses": 0
+    },
+    "take_profit": {
+      "count": 20,
+      "pnl": 4.0326,
+      "wins": 20,
+      "losses": 0
+    },
+    "stop_loss": {
+      "count": 4,
+      "pnl": -1.5565,
+      "wins": 0,
+      "losses": 4
+    }
+  },
+  "by_direction": {
+    "SHORT": {
+      "count": 21,
+      "pnl": 0.4723,
+      "wins": 12,
+      "losses": 8
+    },
+    "LONG": {
+      "count": 45,
+      "pnl": -3.5161,
+      "wins": 9,
+      "losses": 31
+    }
+  },
+  "by_symbol_top15": {
+    "CLOUSDT": {
+      "count": 7,
+      "pnl": 1.8014,
+      "wins": 6,
+      "losses": 1
+    },
+    "EPICUSDT": {
+      "count": 1,
+      "pnl": -0.4069,
+      "wins": 0,
+      "losses": 1
+    },
+    "DOTUSDT": {
+      "count": 1,
+      "pnl": -0.3853,
+      "wins": 0,
+      "losses": 1
+    },
+    "SLXUSDT": {
+      "count": 1,
+      "pnl": -0.3386,
+      "wins": 0,
+      "losses": 1
+    },
+    "MUSDT": {
+      "count": 1,
+      "pnl": -0.3113,
+      "wins": 0,
+      "losses": 1
+    },
+    "XRPUSDT": {
+      "count": 2,
+      "pnl": -0.3098,
+      "wins": 1,
+      "losses": 1
+    },
+    "ENAUSDT": {
+      "count": 1,
+      "pnl": -0.2911,
+      "wins": 0,
+      "losses": 1
+    },
+    "VIRTUALUSDT": {
+      "count": 1,
+      "pnl": -0.2635,
+      "wins": 0,
+      "losses": 1
+    },
+    "AGLDUSDT": {
+      "count": 2,
+      "pnl": -0.2379,
+      "wins": 1,
+      "losses": 1
+    },
+    "INJUSDT": {
+      "count": 1,
+      "pnl": -0.2274,
+      "wins": 0,
+      "losses": 1
+    },
+    "XPLUSDT": {
+      "count": 3,
+      "pnl": 0.2163,
+      "wins": 2,
+      "losses": 1
+    },
+    "BLURUSDT": {
+      "count": 2,
+      "pnl": -0.2116,
+      "wins": 1,
+      "losses": 1
+    },
+    "VELVETUSDT": {
+      "count": 5,
+      "pnl": 0.211,
+      "wins": 2,
+      "losses": 1
+    },
+    "TIAUSDT": {
+      "count": 4,
+      "pnl": -0.2038,
+      "wins": 2,
+      "losses": 1
+    },
+    "WIFUSDT": {
+      "count": 1,
+      "pnl": -0.188,
+      "wins": 0,
+      "losses": 1
+    }
+  },
+  "time_distribution": {
+    "count": {
+      "0-60s": 1,
+      "60-180s": 28,
+      "180-300s": 18,
+      "300-600s": 14,
+      "600+s": 5
+    },
+    "pnl": {
+      "0-60s": 0.2897,
+      "60-180s": 0.1634,
+      "180-300s": -1.3959,
+      "300-600s": -1.4151,
+      "600+s": -0.6859
+    }
+  },
+  "signal_rejections": {
+    "momentum against LONG": 112,
+    "spread too wide": 633,
+    "volume too low": 230,
+    "dynamic confidence": 195,
+    "momentum against SHORT": 62,
+    "price falling against LONG": 12,
+    "buying pressure building": 1,
+    "price rising against SHORT": 7
+  },
+  "ml_pipeline": {
+    "symbols_active": 65,
+    "market_events": 625511,
+    "predictions": 583637,
+    "signals_generated": 56865,
+    "holds_low_conf": 449064,
+    "holds_direction": 20073,
+    "holds_correlation": 8,
+    "holds_warming": 9310,
+    "holds_pattern_block": 19311,
+    "faiss_vectors": 4795,
+    "retrain_trades": 58
+  },
+  "gatekeeper": {
+    "model_backend": "catboost",
+    "model_auc": 0.7842,
+    "model_accuracy": 0.7917,
+    "threshold": 0.45,
+    "influxdb_samples": 423,
+    "influxdb_wins": 132,
+    "influxdb_losses": 291,
+    "influxdb_wr_pct": 31.2
+  },
+  "density_exit_manager": {
+    "wall_threshold": 15.0,
+    "velocity_threshold": 0.4,
+    "stagnation_sec": 90,
+    "stagnation_r": 0.15,
+    "tp_push_pct": 0.2
+  },
+  "smart_labeling": {
+    "mfe_threshold_pct": 75
+  },
+  "time_stop_config": {
+    "normal_sec": 180,
+    "hft_sec": 60,
+    "passive_window_sec": 5,
+    "kill_switch_timeout_sec": 5,
+    "breakeven_sec": 90,
+    "zombie_retry_sec": 60,
+    "min_edge": 0.0025
+  },
+  "infrastructure": {
+    "balance_usd": 2000,
+    "shadow_mode": false,
+    "leverage": 5,
+    "max_concurrent": 200,
+    "margin_usd": 10,
+    "rr_target": 1.2
+  }
+}
