@@ -28,7 +28,8 @@ from .regime import RegimeDetector
 from .exit_plan import build_exit_plan
 from .online_learner import OnlineLearner, CONSECUTIVE_LOSS_THRESHOLD
 from .retrain_worker import RollingRetrainWorker
-from .gatekeeper import Gatekeeper, FEATURE_NAMES
+from .gatekeeper import Gatekeeper, FEATURE_NAMES, GK_THRESHOLD
+from .features import _level_price, _level_size
 from .train_device import log_cuda_status
 
 logger = logging.getLogger(__name__)
@@ -1445,7 +1446,7 @@ class MLEngine:
         # ════════════════════════════════════════════════════════════════
         if self._gatekeeper.is_trained:
             gk_features = self._collect_gatekeeper_features(
-                symbol, confidence, pred_pnl if predict_pnl else 0.0,
+                symbol, confidence, self._pred_pnl_cache,
                 buf, corr, regime,
             )
             gk_result = self._gatekeeper.predict(gk_features)
@@ -1476,16 +1477,16 @@ class MLEngine:
             asks = buf.latest_asks
             if bids and asks and len(bids) > 0 and len(asks) > 0:
                 try:
-                    best_bid = float(bids[0][0])
-                    best_ask = float(asks[0][0])
+                    best_bid = _level_price(bids[0])
+                    best_ask = _level_price(asks[0])
                     if best_bid > 0:
                         spread_pct = (best_ask - best_bid) / best_bid
                 except (IndexError, ValueError, TypeError):
                     pass
 
                 # OBI (top-5 levels)
-                bid_vol = sum(float(b[1]) for b in bids[:5]) if bids else 0
-                ask_vol = sum(float(a[1]) for a in asks[:5]) if asks else 0
+                bid_vol = sum(_level_size(b) for b in bids[:5]) if bids else 0
+                ask_vol = sum(_level_size(a) for a in asks[:5]) if asks else 0
                 total = bid_vol + ask_vol
                 if total > 0:
                     obi = (bid_vol - ask_vol) / total

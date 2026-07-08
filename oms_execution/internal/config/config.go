@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -58,6 +59,7 @@ type Config struct {
 	ShadowMode                 bool
 	ShadowAlwaysEnabled        bool
 	ShadowTimeStopSec          int
+	BlacklistSymbols           map[string]bool
 }
 
 type SymbolConfig struct {
@@ -161,6 +163,7 @@ func Load() Config {
 		ShadowMode:                 envOr("SHADOW_MODE", "false") == "true",
 		ShadowAlwaysEnabled:        envOr("SHADOW_ALWAYS_ENABLED", "false") == "true",
 		ShadowTimeStopSec:          intEnv("SHADOW_TIME_STOP_SEC", 1800),
+		BlacklistSymbols:           parseBlacklist(envOr("BLACKLIST_SYMBOLS", "")),
 	}
 }
 
@@ -248,4 +251,28 @@ func intEnv(key string, def int) int {
 		}
 	}
 	return def
+}
+
+func parseBlacklist(s string) map[string]bool {
+	m := make(map[string]bool)
+	if s == "" {
+		return m
+	}
+	for _, sym := range splitCSV(s) {
+		if sym != "" {
+			m[sym] = true
+		}
+	}
+	return m
+}
+
+func splitCSV(s string) []string {
+	var parts []string
+	for _, p := range strings.Split(s, ",") {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	return parts
 }
