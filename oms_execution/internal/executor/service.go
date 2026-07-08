@@ -2179,7 +2179,7 @@ func (s *Service) finalizeClose(
 	_ = s.redis.Publish(ctx, s.cfg.ResultsChannel, result)
 	if s.influx != nil {
 		s.influx.WriteTradeOutcome(result)
-		s.influx.WriteGatekeeperFeatures(pos, pnl, s.tracker.RecentWinRate())
+		s.influx.WriteGatekeeperFeatures(pos, pnl, s.tracker.RecentWinRate(), reason)
 	}
 
 	s.mu.Lock()

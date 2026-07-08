@@ -75,7 +75,7 @@ func (w *Writer) Close() {
 	w.writeAPI.Flush()
 }
 
-func (w *Writer) WriteGatekeeperFeatures(pos *models.ActivePosition, netPnL float64, recentWR float64) {
+func (w *Writer) WriteGatekeeperFeatures(pos *models.ActivePosition, netPnL float64, recentWR float64, closeReason string) {
 	if pos == nil {
 		return
 	}
@@ -89,7 +89,7 @@ func (w *Writer) WriteGatekeeperFeatures(pos *models.ActivePosition, netPnL floa
 	tags := map[string]string{
 		"symbol":       pos.Symbol,
 		"direction":    pos.Direction,
-		"close_reason": pos.Signal.ExitReason,
+		"close_reason": closeReason,
 	}
 
 	fields := map[string]interface{}{
