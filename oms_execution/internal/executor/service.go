@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fast-trader-gru/oms_execution/internal/bybit"
@@ -592,7 +593,7 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 				}
 			}
 
-			// Volume filter: reject if volume < 0.5× SMA (dead market)
+			// Volume filter: asymmetric — LONG needs 1.2×SMA (active buying), SHORT needs 0.5×SMA (dead market)
 			if vh := s.volumeHistory[signal.Symbol]; len(vh) >= 5 {
 				sum := 0.0
 				for _, v := range vh {
@@ -608,9 +609,15 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 				if smaVol > 0 {
 					gkVolumeRatio = currentVol / smaVol
 				}
-				if smaVol > 0 && currentVol < smaVol*0.5 {
+				volumeThreshold := 0.5
+				if signal.Direction == "LONG" {
+					volumeThreshold = 1.2
+				}
+				if smaVol > 0 && currentVol < smaVol*volumeThreshold {
 					s.logger.Info("signal rejected — volume too low",
 						"symbol", signal.Symbol,
+						"direction", signal.Direction,
+						"threshold", fmt.Sprintf("%.1f×", volumeThreshold),
 						"current_vol", fmt.Sprintf("%.1f", currentVol),
 						"sma_vol", fmt.Sprintf("%.1f", smaVol))
 					return nil
@@ -694,6 +701,25 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 				"btc_correlation", fmt.Sprintf("%.3f", signal.BTCorrelation),
 				"corr_positions", corrPositions,
 				"limit", 3)
+			return nil
+		}
+	}
+
+	// LONG-specific clustering guard: max 2 correlated LONG positions
+	if signal.Direction == "LONG" && signal.BTCorrelation > MaxCorrelationThreshold {
+		s.mu.Lock()
+		longCorrCount := 0
+		for _, pos := range s.positions {
+			if pos.Direction == "LONG" && pos.Signal.BTCorrelation > MaxCorrelationThreshold {
+				longCorrCount++
+			}
+		}
+		s.mu.Unlock()
+		if longCorrCount >= 2 {
+			s.logger.Warn("signal rejected — LONG cluster risk",
+				"symbol", signal.Symbol,
+				"long_corr_positions", longCorrCount,
+				"limit", 2)
 			return nil
 		}
 	}
@@ -1361,6 +1387,7 @@ func (s *Service) promotePending(ctx context.Context, p *models.PendingEntry, av
 		Leverage:     p.Leverage,
 		Signal:       p.Signal,
 		OrderID:      p.OrderID,
+		State:        int32(models.StateActive),
 		FilledAt:     entryTime,
 		OriginalRisk: originalRisk,
 		PriceHistory: priceSnap,
@@ -1720,150 +1747,173 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	s.retryMissingTakeProfits(ctx, pos, ob)
 
 	// ════════════════════════════════════════════════════════════════
-	// [TIME-STOP FSM] — strict 5s passive → Market Kill-Switch
+	// [TIME-STOP FSM] — lock-decoupled, atomic state transitions
 	// ════════════════════════════════════════════════════════════════
 	mode := risk.TradingMode(pos.TradingMode)
-	normalTimeStop := s.cfg.TimeStopSeconds
+	normalTimeStop := 180
 	hftTimeStop := s.cfg.HFTTimeStopSec
-	// Unified: all confidence levels → 180s (3 minutes)
-	normalTimeStop = 180
 	hardTimeStopSec := risk.ModeTimeStopSec(mode, normalTimeStop, hftTimeStop)
 	const PassiveWindowSec = 5
 	const ZombieRetrySec = 60
 	holdSec := (time.Now().UnixMilli() - pos.EntryTime) / 1000
+	posState := atomic.LoadInt32(&pos.State)
+
+	if posState == int32(models.StateClosingAggressive) || posState == int32(models.StateClosed) {
+		return
+	}
+
 	if holdSec > int64(hardTimeStopSec) {
-		exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
-		if hasPos && exSize > 0 {
-			mid := grid.MidPrice(ob)
+		// ── State Snapshot (read under lock, then release) ──
+		s.mu.Lock()
+		currentPos, exists := s.positions[pos.Symbol]
+		if !exists || currentPos == nil {
+			s.mu.Unlock()
+			return
+		}
+		exSize := currentPos.RemainingQty
+		tStopPlaced := currentPos.TimeStopPlaced
+		dir := currentPos.Direction
+		fillPx := currentPos.FillPrice
+		qtStep := currentPos.QtyStep
+		minQty := currentPos.MinOrderQty
+		s.mu.Unlock()
 
-			// Breakeven exit if in profit at time-stop
-			if mid > 0 && !pos.TimeStopPlaced {
-				commissionBuffer := pos.FillPrice * 0.0013
-				var isProfitable bool
-				if pos.Direction == "LONG" {
-					isProfitable = mid > pos.FillPrice+commissionBuffer
-				} else {
-					isProfitable = mid < pos.FillPrice-commissionBuffer
-				}
-				if isProfitable {
-					s.logger.Info("[TIME-STOP FSM] Breakeven exit — position in profit",
-						"symbol", pos.Symbol, "entry", pos.FillPrice, "current", mid, "hold_sec", holdSec)
-					s.cancelExitOrders(ctx, pos)
-					side := "Sell"
-					if pos.Direction == "LONG" {
-						side = "Sell"
-					}
-					normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
-					if _, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep); err != nil {
-						s.logger.Error("[TIME-STOP FSM] breakeven exit failed", "symbol", pos.Symbol, "error", err)
-					}
-					pos.TimeStopPlaced = true
-					s.tryFinalizePosition(ctx, pos, "time_stop", mid)
-					return
-				}
+		obSnap := ob
+		mid := grid.MidPrice(obSnap)
+		hasPos := exSize > 0
+
+		if !hasPos {
+			s.tryFinalizePosition(ctx, pos, "time_stop", 0)
+			return
+		}
+
+		// ── Breakeven exit if in profit (network I/O outside lock) ──
+		if mid > 0 && !tStopPlaced {
+			commissionBuffer := fillPx * 0.0013
+			var isProfitable bool
+			if dir == "LONG" {
+				isProfitable = mid > fillPx+commissionBuffer
+			} else {
+				isProfitable = mid < fillPx-commissionBuffer
 			}
-
-			// LONG penalty: force immediate close if loss > 0.3%
-			if pos.Direction == "LONG" && !pos.TimeStopPlaced && mid > 0 {
-				longLoss := (pos.FillPrice - mid) / pos.FillPrice
-				if longLoss > 0.003 {
-					s.logger.Warn("[TIME-STOP FSM] LONG penalty — force immediate close",
-						"symbol", pos.Symbol, "loss_pct", fmt.Sprintf("%.2f%%", longLoss*100), "hold_sec", holdSec)
-					s.cancelExitOrders(ctx, pos)
-					normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
-					if _, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, "Sell", normQty, pos.QtyStep); err != nil {
-						s.logger.Error("[TIME-STOP FSM] LONG penalty close failed", "symbol", pos.Symbol, "error", err)
-					}
-					pos.TimeStopPlaced = true
-					s.tryFinalizePosition(ctx, pos, "time_stop", mid)
-					return
-				}
-			}
-
-			// 2-stage FSM: PostOnly (5s window) → Market Kill-Switch
-			if !pos.TimeStopPlaced {
-				s.logger.Warn("[TIME-STOP FSM] Initiating 2-stage exit",
-					"symbol", pos.Symbol, "hold_sec", holdSec, "qty", exSize)
+			if isProfitable {
+				s.logger.Info("[TIME-STOP FSM] Breakeven exit — position in profit",
+					"symbol", pos.Symbol, "entry", fillPx, "current", mid, "hold_sec", holdSec)
 				s.cancelExitOrders(ctx, pos)
-
 				side := "Sell"
-				if pos.Direction == "LONG" {
-					side = "Sell"
-				} else {
-					side = "Buy"
+				normQty := bybit.NormalizeQty(exSize, qtStep, minQty)
+				if _, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, qtStep); err != nil {
+					s.logger.Error("[TIME-STOP FSM] breakeven exit failed", "symbol", pos.Symbol, "error", err)
 				}
-				normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
-				exitPrice := grid.PassiveMakerExitPrice(pos.Direction, ob, pos.TickSize, s.cfg.EntryMakerTicks)
-
-				if exitPrice > 0 {
-					orderID, orderErr := s.bybit.PlaceReducePostOnlyLimit(ctx, pos.Symbol, side, normQty, pos.QtyStep, bybit.FormatPrice(exitPrice))
-					if orderErr == nil {
-						pos.TimeStopPlaced = true
-						s.logger.Info("[TIME-STOP FSM] Stage 1 — PostOnly Maker placed (5s window)",
-							"symbol", pos.Symbol, "price", exitPrice, "qty", normQty, "order_id", orderID)
-
-						s.goWithTimeout(ctx, PassiveWindowSec, func() {
-							s.mu.Lock()
-							currentPos, exists := s.positions[pos.Symbol]
-							if !exists || currentPos == nil || !currentPos.TimeStopPlaced {
-								s.mu.Unlock()
-								return
-							}
-							s.mu.Unlock()
-
-							oi, oiErr := s.bybit.GetOrderRealtime(ctx, pos.Symbol, orderID)
-							if oiErr == nil && oi.OrderStatus == "New" {
-								s.logger.Warn("[KILL-SWITCH] Passive exit timed out — executing aggressive Market Kill-Switch!",
-									"symbol", pos.Symbol, "order_id", orderID)
-								_ = s.bybit.CancelOrder(ctx, pos.Symbol, orderID)
-								_, merr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
-								if merr != nil {
-									s.logger.Error("[KILL-SWITCH] Market Kill-Switch failed", "symbol", pos.Symbol, "error", merr)
-								} else {
-									s.logger.Info("[KILL-SWITCH] Market Kill-Switch executed", "symbol", pos.Symbol)
-									s.tryFinalizePosition(ctx, pos, "time_stop", 0)
-								}
-							}
-						})
-						return
-					}
-				}
-
-				// PostOnly failed — immediate Market Kill-Switch
-				s.logger.Warn("[TIME-STOP FSM] PostOnly failed, immediate Market Kill-Switch", "symbol", pos.Symbol)
-				_, mktErr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
-				if mktErr != nil {
-					s.logger.Error("[KILL-SWITCH] Market Kill-Switch failed", "symbol", pos.Symbol, "error", mktErr)
-				} else {
-					pos.TimeStopPlaced = true
-					s.tryFinalizePosition(ctx, pos, "time_stop", 0)
-				}
-				return
-			}
-			// ZOMBIE RETRY: hardTimeStopSec + 60s → force market close
-			if pos.TimeStopPlaced && holdSec > int64(hardTimeStopSec)+ZombieRetrySec {
-				s.logger.Error("[KILL-SWITCH] ZOMBIE DETECTED — force market close",
-					"symbol", pos.Symbol, "hold_sec", holdSec, "qty", exSize)
-				pos.TimeStopPlaced = false
-				side := "Sell"
-				if pos.Direction == "LONG" {
-					side = "Sell"
-				} else {
-					side = "Buy"
-				}
-				normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
-				_, mktErr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
-				if mktErr != nil {
-					s.logger.Error("[KILL-SWITCH] Zombie force close failed", "symbol", pos.Symbol, "error", mktErr)
-				} else {
-					s.logger.Info("[KILL-SWITCH] Zombie force close executed", "symbol", pos.Symbol)
-					pos.TimeStopPlaced = true
-				}
+				atomic.StoreInt32(&pos.State, int32(models.StateClosed))
+				pos.TimeStopPlaced = true
+				s.tryFinalizePosition(ctx, pos, "time_stop", mid)
 				return
 			}
 		}
-		if !hasPos {
-			s.tryFinalizePosition(ctx, pos, "time_stop", 0)
+
+		// ── LONG penalty: force close if loss > 0.3% ──
+		if dir == "LONG" && !tStopPlaced && mid > 0 {
+			longLoss := (fillPx - mid) / fillPx
+			if longLoss > 0.003 {
+				s.logger.Warn("[TIME-STOP FSM] LONG penalty — force immediate close",
+					"symbol", pos.Symbol, "loss_pct", fmt.Sprintf("%.2f%%", longLoss*100), "hold_sec", holdSec)
+				s.cancelExitOrders(ctx, pos)
+				normQty := bybit.NormalizeQty(exSize, qtStep, minQty)
+				if _, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, "Sell", normQty, qtStep); err != nil {
+					s.logger.Error("[TIME-STOP FSM] LONG penalty close failed", "symbol", pos.Symbol, "error", err)
+				}
+				atomic.StoreInt32(&pos.State, int32(models.StateClosed))
+				pos.TimeStopPlaced = true
+				s.tryFinalizePosition(ctx, pos, "time_stop", mid)
+				return
+			}
+		}
+
+		// ── 2-stage FSM: atomic transition → PostOnly (5s) → Kill-Switch ──
+		if !tStopPlaced {
+			if !atomic.CompareAndSwapInt32(&pos.State, int32(models.StateActive), int32(models.StateClosingPassive)) {
+				return
+			}
+			s.logger.Warn("[TIME-STOP FSM] Stage 1 — PostOnly Maker (5s window)",
+				"symbol", pos.Symbol, "hold_sec", holdSec, "qty", exSize)
+
+			side := "Sell"
+			if dir != "LONG" {
+				side = "Buy"
+			}
+			normQty := bybit.NormalizeQty(exSize, qtStep, minQty)
+			exitPrice := grid.PassiveMakerExitPrice(dir, obSnap, pos.TickSize, s.cfg.EntryMakerTicks)
+
+			if exitPrice > 0 {
+				orderID, orderErr := s.bybit.PlaceReducePostOnlyLimit(ctx, pos.Symbol, side, normQty, qtStep, bybit.FormatPrice(exitPrice))
+				if orderErr == nil {
+					pos.TimeStopPlaced = true
+					s.logger.Info("[TIME-STOP FSM] PostOnly placed",
+						"symbol", pos.Symbol, "price", exitPrice, "qty", normQty, "order_id", orderID)
+
+					s.goWithTimeout(ctx, PassiveWindowSec, func() {
+						// ── Lock-free check: read state atomically ──
+						if atomic.LoadInt32(&pos.State) != int32(models.StateClosingPassive) {
+							return
+						}
+
+						// ── Network I/O: no lock held ──
+						oi, oiErr := s.bybit.GetOrderRealtime(ctx, pos.Symbol, orderID)
+						if oiErr == nil && oi.OrderStatus == "New" {
+							s.logger.Warn("[KILL-SWITCH] Passive exit timed out — executing aggressive Market Kill-Switch!",
+								"symbol", pos.Symbol, "order_id", orderID)
+							atomic.StoreInt32(&pos.State, int32(models.StateClosingAggressive))
+							_ = s.bybit.CancelOrder(ctx, pos.Symbol, orderID)
+							_, merr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, qtStep)
+							if merr != nil {
+								s.logger.Error("[KILL-SWITCH] Market Kill-Switch failed", "symbol", pos.Symbol, "error", merr)
+							} else {
+								s.logger.Info("[KILL-SWITCH] Market Kill-Switch executed", "symbol", pos.Symbol)
+								atomic.StoreInt32(&pos.State, int32(models.StateClosed))
+								s.tryFinalizePosition(ctx, pos, "time_stop", 0)
+							}
+						}
+					})
+					return
+				}
+			}
+
+			// PostOnly failed → immediate Kill-Switch
+			s.logger.Warn("[TIME-STOP FSM] PostOnly failed, immediate Market Kill-Switch", "symbol", pos.Symbol)
+			atomic.StoreInt32(&pos.State, int32(models.StateClosingAggressive))
+			_, mktErr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, qtStep)
+			if mktErr != nil {
+				s.logger.Error("[KILL-SWITCH] Market Kill-Switch failed", "symbol", pos.Symbol, "error", mktErr)
+			} else {
+				atomic.StoreInt32(&pos.State, int32(models.StateClosed))
+				pos.TimeStopPlaced = true
+				s.tryFinalizePosition(ctx, pos, "time_stop", 0)
+			}
+			return
+		}
+
+		// ── Zombie Retry: hardTimeStopSec + 60s ──
+		if tStopPlaced && holdSec > int64(hardTimeStopSec)+ZombieRetrySec {
+			if !atomic.CompareAndSwapInt32(&pos.State, int32(models.StateClosingPassive), int32(models.StateClosingAggressive)) {
+				if atomic.LoadInt32(&pos.State) != int32(models.StateClosingPassive) {
+					return
+				}
+			}
+			s.logger.Error("[KILL-SWITCH] ZOMBIE DETECTED — force market close",
+				"symbol", pos.Symbol, "hold_sec", holdSec, "qty", exSize)
+			side := "Sell"
+			if dir != "LONG" {
+				side = "Buy"
+			}
+			normQty := bybit.NormalizeQty(exSize, qtStep, minQty)
+			_, mktErr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, qtStep)
+			if mktErr != nil {
+				s.logger.Error("[KILL-SWITCH] Zombie force close failed", "symbol", pos.Symbol, "error", mktErr)
+			} else {
+				s.logger.Info("[KILL-SWITCH] Zombie force close executed", "symbol", pos.Symbol)
+				atomic.StoreInt32(&pos.State, int32(models.StateClosed))
+			}
 			return
 		}
 	}

@@ -265,6 +265,7 @@ func (s *Service) adoptExchangePosition(ctx context.Context, exPos bybit.Positio
 		OriginalRisk: originalRisk,
 		PriceHistory: priceSnap,
 		EntryCandleIdx: candleIdx,
+		State:        int32(models.StateActive),
 	}
 
 	s.mu.Lock()

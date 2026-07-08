@@ -115,6 +115,15 @@ type ExitOrder struct {
 	IsStop    bool // true for conditional stop-market orders
 }
 
+type ActivePositionState int32
+
+const (
+	StateActive             ActivePositionState = 0
+	StateClosingPassive     ActivePositionState = 1
+	StateClosingAggressive  ActivePositionState = 2
+	StateClosed             ActivePositionState = 3
+)
+
 type ActivePosition struct {
 	Symbol          string
 	Direction       string
@@ -147,16 +156,16 @@ type ActivePosition struct {
 	GridDeployFailures    int
 	LastGridDeployFailure int64
 	// PositionManager fields
-	ScaledOut       bool      // Scale-out at 1R executed?
-	BreakevenPMSet  bool      // Breakeven at 1.5R executed?
-	OriginalRisk    float64   // Original SL distance from entry
-	PriceHistory    []float64 // Rolling mid prices for ATR
-	EntryCandleIdx  int       // Candle index at entry time
-	CandleHigh      float64   // Current candle high
-	CandleLow       float64   // Current candle low
+	ScaledOut       bool
+	BreakevenPMSet  bool
+	OriginalRisk    float64
+	PriceHistory    []float64
+	EntryCandleIdx  int
+	CandleHigh      float64
+	CandleLow       float64
 	// Dynamic Trading Mode (0=Normal, 1=HFT Scalping)
-	TradingMode     int       // 0=Normal, 1=HFTScalping — set by DetectTradingMode at entry
-	// Gatekeeper entry-time feature snapshot (captured at entry for InfluxDB logging)
+	TradingMode     int
+	// Gatekeeper entry-time feature snapshot
 	SpreadPctAtEntry      float64
 	OBIAtEntry            float64
 	MomentumAtEntry       float64
@@ -167,6 +176,8 @@ type ActivePosition struct {
 	// MFE/MAE tracking for smart labeling
 	MaxFavorablePrice float64
 	MaxAdversePrice   float64
+	// Thread-safe state machine (atomic access via Load/Store)
+	State int32
 }
 
 type PendingEntryState string

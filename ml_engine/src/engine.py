@@ -1147,6 +1147,32 @@ class MLEngine:
         corr = self.features.correlation_with_btc(symbol)
         prom.btc_correlation.labels(symbol=symbol).set(corr)
 
+        # ════════════════════════════════════════════════════════════════
+        # [KNIFE-GUARD] — asymmetric LONG protection
+        # ════════════════════════════════════════════════════════════════
+        LONG_BTC_VELOCITY_THRESH = -0.0005
+        LONG_OBI_MIN = 0.1
+
+        if direction == "LONG":
+            # BTC structural trend validation
+            btc_1m_returns = self.features.btc_returns(60)
+            if len(btc_1m_returns) >= 5:
+                btc_velocity_1m = sum(btc_1m_returns) / len(btc_1m_returns)
+                if corr > 0.60 and btc_velocity_1m < LONG_BTC_VELOCITY_THRESH:
+                    self._stats["knife_guard_blocked"] = self._stats.get("knife_guard_blocked", 0) + 1
+                    logger.info("[KNIFE-GUARD] Overriding LONG for %s. BTC bearish (vel=%.6f, corr=%.3f)",
+                                symbol, btc_velocity_1m, corr)
+                    direction = "HOLD"
+                    return None
+
+            # OBI buying pressure check
+            obi_current = buf.order_book_imbalance() if hasattr(buf, 'order_book_imbalance') else 0.0
+            if obi_current < LONG_OBI_MIN:
+                self._stats["obi_long_blocked"] = self._stats.get("obi_long_blocked", 0) + 1
+                logger.info("[KNIFE-GUARD] BLOCKED LONG for %s: OBI=%.3f < %.3f (no buying pressure)",
+                            symbol, obi_current, LONG_OBI_MIN)
+                return None
+
         # Trap Head: now in LOGGING mode — reduce position size instead of blocking
         TRAP_THRESHOLD = float(os.getenv("TRAP_THRESHOLD", "0.60"))
         if trap_prob > TRAP_THRESHOLD:
@@ -1441,8 +1467,7 @@ class MLEngine:
 
         # ════════════════════════════════════════════════════════════════
         # GATEKEEPER: CatBoost binary classifier
-        # Predicts probability of trade being profitable.
-        # Replaces hardcoded DynamicConfCap with data-driven decision.
+        # Asymmetric threshold: LONG=0.65 (conservative), SHORT=0.45 (permissive)
         # ════════════════════════════════════════════════════════════════
         if self._gatekeeper.is_trained:
             gk_features = self._collect_gatekeeper_features(
@@ -1452,13 +1477,20 @@ class MLEngine:
             gk_result = self._gatekeeper.predict(gk_features)
             self._stats["gatekeeper_predictions"] = self._stats.get("gatekeeper_predictions", 0) + 1
 
-            if gk_result.prediction == 0:
+            gk_threshold = GK_THRESHOLD
+            if direction == "LONG":
+                gk_threshold = float(os.getenv("GATEKEEPER_LONG_THRESHOLD", "0.65"))
+            elif direction == "SHORT":
+                gk_threshold = float(os.getenv("GATEKEEPER_SHORT_THRESHOLD", "0.45"))
+
+            if gk_result.prob < gk_threshold:
                 self._stats["gatekeeper_rejected"] = self._stats.get("gatekeeper_rejected", 0) + 1
-                logger.info("GATEKEEPER REJECT: %s prob=%.3f < %.3f",
-                           symbol, gk_result.prob, GK_THRESHOLD)
+                logger.info("GATEKEEPER REJECT: %s dir=%s prob=%.3f < %.3f (threshold=%s)",
+                           symbol, direction, gk_result.prob, gk_threshold,
+                           "LONG" if direction == "LONG" else "SHORT")
                 return None
 
-            logger.info("GATEKEEPER PASS: %s prob=%.3f", symbol, gk_result.prob)
+            logger.info("GATEKEEPER PASS: %s dir=%s prob=%.3f ≥ %.3f", symbol, direction, gk_result.prob, gk_threshold)
 
         return signal
 
