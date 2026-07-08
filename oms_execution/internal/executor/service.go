@@ -50,6 +50,7 @@ type Service struct {
 	volumeHistory map[string][]float64 // symbol -> rolling bid volume for SMA
 	symbolStats   map[string]*SymbolStats
 	obMomentum    *liquidity.OrderbookMomentum // orderbook pressure velocity tracker
+	densityExit   *DensityExitManager         // density/velocity exit intelligence
 }
 
 type SymbolStats struct {
@@ -145,6 +146,7 @@ func New(cfg config.Config, bc *bybit.Client, rc *redisx.Client, iw *influx.Writ
 		volumeHistory: make(map[string][]float64),
 		symbolStats:   make(map[string]*SymbolStats),
 		obMomentum:    liquidity.NewOrderbookMomentum(20),
+		densityExit:   NewDensityExitManager(logger, 3.5),
 	}
 	if cfg.ShadowMode {
 		s.shadow = NewShadowEngine(logger, cfg.ResultsChannel)
@@ -1522,6 +1524,7 @@ func (s *Service) runOrderbookCache(ctx context.Context) {
 			if err := s.redis.SetOrderbook(ctx, ob.Symbol, ob); err != nil {
 				s.logger.Warn("orderbook cache write failed", "symbol", ob.Symbol, "error", err)
 			}
+			s.densityExit.UpdateOrderbook(ob.Symbol, ob)
 			// Update price history for ATR computation
 			mid := grid.MidPrice(ob)
 			if mid > 0 {
@@ -1722,11 +1725,11 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	mode := risk.TradingMode(pos.TradingMode)
 	normalTimeStop := s.cfg.TimeStopSeconds
 	hftTimeStop := s.cfg.HFTTimeStopSec
-	// Dynamic: high-confidence signals get 600s, low-confidence get 180s
+	// Dynamic: high-confidence signals get 240s, low-confidence get 150s
 	if pos.Signal.Confidence >= 0.90 {
-		normalTimeStop = 600
+		normalTimeStop = 240
 	} else {
-		normalTimeStop = 300
+		normalTimeStop = 150
 	}
 	hardTimeStopSec := risk.ModeTimeStopSec(mode, normalTimeStop, hftTimeStop)
 	const MakerFillTimeoutSec = 30
@@ -1991,6 +1994,63 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	// PositionManager: ATR-based triggers (scale-out, breakeven, chandelier)
 	s.runPositionManager(ctx, pos, ob)
 
+	// ════════════════════════════════════════════════════════════════
+	// DENSITY EXIT MANAGER — orderbook density + velocity intelligence
+	// ════════════════════════════════════════════════════════════════
+	priceNow := grid.MidPrice(ob)
+	if !pos.TimeStopPlaced && pos.ExitGridReady && priceNow > 0 {
+		densityActions := s.densityExit.EvaluateExits(pos, ob, priceNow, pos.TickSize)
+		for _, action := range densityActions {
+			switch action.Type {
+			case "adjust_tp":
+				if len(pos.TakeProfitOrders) > 0 {
+					go s.adjustTPAsync(ctx, pos, action.TPPrice)
+					s.logger.Info("[DENSITY INTEL] Adapting TP", "symbol", action.Symbol, "new_tp", action.TPPrice, "reason", action.Reason)
+				}
+			case "velocity_reversal_exit":
+				s.logger.Info("[VELOCITY INTEL] Reversal detected", "symbol", action.Symbol, "reason", action.Reason)
+				s.cancelExitOrders(ctx, pos)
+				go s.velocityKillSwitch(ctx, pos, action.Reason)
+				return
+			case "stagnation_breakeven":
+				if !pos.BreakevenSet {
+					feeBuf := pos.FillPrice * 0.0015
+					var newSL float64
+					if pos.Direction == "LONG" {
+						newSL = pos.FillPrice + feeBuf
+					} else {
+						newSL = pos.FillPrice - feeBuf
+					}
+					if err := s.atomicReplaceStopLoss(ctx, pos, newSL, pos.RemainingQty, "stagnation_breakeven"); err == nil {
+						pos.BreakevenSet = true
+						s.logger.Info("[DENSITY INTEL] Stagnation breakeven", "symbol", pos.Symbol, "sl", newSL)
+					}
+				}
+			}
+		}
+	}
+
+	// ════════════════════════════════════════════════════════════════
+	// MFE/MAE TRACKING — price excursion for smart labeling
+	// ════════════════════════════════════════════════════════════════
+	if priceNow > 0 {
+		if pos.Direction == "LONG" {
+			if pos.MaxFavorablePrice == 0 || priceNow > pos.MaxFavorablePrice {
+				pos.MaxFavorablePrice = priceNow
+			}
+			if pos.MaxAdversePrice == 0 || priceNow < pos.MaxAdversePrice {
+				pos.MaxAdversePrice = priceNow
+			}
+		} else {
+			if pos.MaxFavorablePrice == 0 || priceNow < pos.MaxFavorablePrice {
+				pos.MaxFavorablePrice = priceNow
+			}
+			if pos.MaxAdversePrice == 0 || priceNow > pos.MaxAdversePrice {
+				pos.MaxAdversePrice = priceNow
+			}
+		}
+	}
+
 	// ABSOLUTE SAFETY NET: runs AFTER all other logic, guarantees every open position has TPs
 	activeTPs := 0
 	for _, tp := range pos.TakeProfitOrders {
@@ -2179,7 +2239,34 @@ func (s *Service) finalizeClose(
 	_ = s.redis.Publish(ctx, s.cfg.ResultsChannel, result)
 	if s.influx != nil {
 		s.influx.WriteTradeOutcome(result)
-		s.influx.WriteGatekeeperFeatures(pos, pnl, s.tracker.RecentWinRate(), reason)
+
+		// Smart labeling: override label=1 when MFE proves entry was accurate
+		overriddenPnl := pnl
+		if pnl <= 0 && len(pos.TakeProfitOrders) > 0 && pos.MaxFavorablePrice > 0 {
+			originalTP := pos.TakeProfitOrders[0].Price
+			if originalTP > 0 && pos.OriginalRisk > 0 {
+				var tpDist, mfeDist float64
+				if pos.Direction == "LONG" {
+					tpDist = originalTP - pos.FillPrice
+					mfeDist = pos.MaxFavorablePrice - pos.FillPrice
+				} else {
+					tpDist = pos.FillPrice - originalTP
+					mfeDist = pos.FillPrice - pos.MaxFavorablePrice
+				}
+				if tpDist > 0 && mfeDist > 0 {
+					mfePct := mfeDist / tpDist
+					if mfePct > 0.75 {
+						overriddenPnl = 0.01
+						s.logger.Info("[LABEL CLEANUP] Entry setup accurate — label=1",
+							"symbol", pos.Symbol,
+							"mfe_pct", fmt.Sprintf("%.1f%%", mfePct*100),
+							"actual_pnl", pnl,
+						)
+					}
+				}
+			}
+		}
+		s.influx.WriteGatekeeperFeatures(pos, overriddenPnl, s.tracker.RecentWinRate(), reason)
 	}
 
 	s.mu.Lock()
@@ -2302,4 +2389,57 @@ func (s *Service) runShadowPriceMonitor(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (s *Service) adjustTPAsync(ctx context.Context, pos *models.ActivePosition, newTP float64) {
+	if len(pos.TakeProfitOrders) == 0 {
+		return
+	}
+	tp := pos.TakeProfitOrders[0]
+	if tp.Filled {
+		return
+	}
+	if err := s.bybit.CancelOrder(ctx, pos.Symbol, tp.OrderID); err != nil {
+		s.logger.Warn("[DENSITY INTEL] Failed to cancel old TP",
+			"symbol", pos.Symbol, "order_id", tp.OrderID, "error", err)
+		return
+	}
+	newOrderID, err := s.bybit.PlaceReduceLimit(ctx, pos.Symbol, pos.Direction, newTP, pos.RemainingQty, bybit.FormatPrice(newTP))
+	if err != nil {
+		s.logger.Warn("[DENSITY INTEL] Failed to place new TP",
+			"symbol", pos.Symbol, "new_tp", newTP, "error", err)
+		return
+	}
+	s.mu.Lock()
+	pos.TakeProfitOrders[0] = models.ExitOrder{
+		OrderID: newOrderID,
+		Price:   newTP,
+		Qty:     pos.RemainingQty,
+		Kind:    "density_adjusted_tp",
+	}
+	s.mu.Unlock()
+	s.logger.Info("[DENSITY INTEL] TP adjusted",
+		"symbol", pos.Symbol, "new_tp", newTP, "order_id", newOrderID)
+}
+
+func (s *Service) velocityKillSwitch(ctx context.Context, pos *models.ActivePosition, reason string) {
+	ob, err := s.redis.GetOrderbook(ctx, pos.Symbol)
+	if err != nil || len(ob.Bids) == 0 || len(ob.Asks) == 0 {
+		return
+	}
+	exitPrice := grid.MidPrice(ob)
+	side := "Buy"
+	if pos.Direction == "LONG" {
+		side = "Sell"
+	}
+	normQty := pos.RemainingQty
+	if normQty < pos.MinOrderQty {
+		normQty = pos.MinOrderQty
+	}
+	if _, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep); err != nil {
+		s.logger.Error("[VELOCITY INTEL] Market kill-switch failed",
+			"symbol", pos.Symbol, "error", err)
+		return
+	}
+	s.tryFinalizePosition(ctx, pos, "velocity_exit", exitPrice)
 }

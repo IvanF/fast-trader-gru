@@ -164,6 +164,9 @@ type ActivePosition struct {
 	ATRPctAtEntry         float64
 	VolumeRatioAtEntry    float64
 	OpenPositionsAtEntry  int
+	// MFE/MAE tracking for smart labeling
+	MaxFavorablePrice float64
+	MaxAdversePrice   float64
 }
 
 type PendingEntryState string
