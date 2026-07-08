@@ -1,121 +1,214 @@
 {
   "period": "last_1h",
-  "generated_at": "2026-07-08T16:05:00Z",
+  "generated_at": "2026-07-08T16:48:00Z",
   "summary": {
-    "total_opens": 11,
-    "total_closes": 3,
-    "total_pnl": 0.1035,
-    "win_count": 1,
-    "loss_count": 2,
-    "breakeven_count": 0,
-    "win_rate_pct": 33.3,
-    "avg_win": 0.2272,
-    "avg_loss": -0.0618,
-    "profit_factor": 1.84,
-    "rr_ratio": 3.67,
-    "avg_hold_sec": 133.1
+    "total_opens": 58,
+    "total_closes": 69,
+    "total_pnl": -3.8157,
+    "win_count": 17,
+    "loss_count": 41,
+    "breakeven_count": 11,
+    "win_rate_pct": 24.6,
+    "avg_win": 0.1047,
+    "avg_loss": -0.1365,
+    "profit_factor": 0.32,
+    "rr_ratio": 0.77,
+    "avg_hold_sec": 171.1
   },
   "by_exit_reason": {
     "take_profit": {
-      "count": 1,
-      "pnl": 0.2272,
-      "wins": 1,
-      "losses": 0
+      "count": 18,
+      "pnl": 1.7227,
+      "wins": 17,
+      "losses": 1
     },
     "fee_loss": {
-      "count": 1,
-      "pnl": -0.0367,
+      "count": 29,
+      "pnl": -2.6582,
       "wins": 0,
-      "losses": 1
+      "losses": 29
     },
     "time_stop": {
-      "count": 1,
-      "pnl": -0.087,
+      "count": 5,
+      "pnl": -0.4086,
       "wins": 0,
-      "losses": 1
+      "losses": 5
+    },
+    "stale_tracker_removed": {
+      "count": 11,
+      "pnl": 0.0,
+      "wins": 0,
+      "losses": 0
+    },
+    "stop_loss": {
+      "count": 6,
+      "pnl": -2.4716,
+      "wins": 0,
+      "losses": 6
     }
   },
   "by_direction": {
     "SHORT": {
-      "count": 1,
-      "pnl": 0.2272,
-      "wins": 1,
-      "losses": 0
+      "count": 8,
+      "pnl": -0.245,
+      "wins": 4,
+      "losses": 3
     },
     "LONG": {
-      "count": 2,
-      "pnl": -0.1237,
-      "wins": 0,
-      "losses": 2
+      "count": 61,
+      "pnl": -3.5707,
+      "wins": 13,
+      "losses": 38
     }
   },
   "by_symbol": {
+    "EDGEUSDT": {
+      "count": 1,
+      "pnl": -0.4508,
+      "wins": 0,
+      "losses": 1
+    },
+    "VELVETUSDT": {
+      "count": 3,
+      "pnl": -0.444,
+      "wins": 0,
+      "losses": 1
+    },
+    "CLOUSDT": {
+      "count": 1,
+      "pnl": -0.4206,
+      "wins": 0,
+      "losses": 1
+    },
+    "FARTCOINUSDT": {
+      "count": 2,
+      "pnl": -0.3804,
+      "wins": 0,
+      "losses": 2
+    },
+    "GRASSUSDT": {
+      "count": 4,
+      "pnl": -0.3707,
+      "wins": 1,
+      "losses": 2
+    },
+    "VANRYUSDT": {
+      "count": 1,
+      "pnl": -0.3487,
+      "wins": 0,
+      "losses": 1
+    },
+    "MUSDT": {
+      "count": 3,
+      "pnl": -0.301,
+      "wins": 2,
+      "losses": 1
+    },
+    "ENAUSDT": {
+      "count": 1,
+      "pnl": 0.2927,
+      "wins": 1,
+      "losses": 0
+    },
+    "ARBUSDT": {
+      "count": 4,
+      "pnl": -0.277,
+      "wins": 0,
+      "losses": 2
+    },
+    "DOTUSDT": {
+      "count": 3,
+      "pnl": -0.2681,
+      "wins": 0,
+      "losses": 2
+    },
+    "BLURUSDT": {
+      "count": 3,
+      "pnl": 0.2648,
+      "wins": 2,
+      "losses": 1
+    },
+    "APTUSDT": {
+      "count": 2,
+      "pnl": 0.2559,
+      "wins": 2,
+      "losses": 0
+    },
     "LABUSDT": {
       "count": 1,
       "pnl": 0.2272,
       "wins": 1,
       "losses": 0
     },
-    "MONUSDT": {
+    "WIFUSDT": {
       "count": 1,
-      "pnl": -0.087,
+      "pnl": -0.2015,
       "wins": 0,
       "losses": 1
     },
-    "SUIUSDT": {
+    "NEARUSDT": {
       "count": 1,
-      "pnl": -0.0367,
+      "pnl": -0.1942,
       "wins": 0,
       "losses": 1
     }
   },
   "time_distribution": {
     "count": {
-      "0-60s": 1,
-      "60-180s": 1,
-      "180-300s": 1,
+      "0-60s": 4,
+      "60-180s": 20,
+      "180-300s": 45,
       "300-600s": 0,
       "600+s": 0
     },
     "pnl": {
-      "0-60s": 0.2272,
-      "60-180s": -0.087,
-      "180-300s": -0.0367,
+      "0-60s": -0.6033,
+      "60-180s": -2.4055,
+      "180-300s": -0.8069,
       "300-600s": 0.0,
       "600+s": 0.0
     }
   },
   "signal_rejections": {
-    "spread too wide": 81,
-    "volume too low": 247,
-    "momentum against LONG": 166,
-    "selling pressure building": 10,
-    "price falling against LONG": 5
+    "spread too wide": 431,
+    "volume too low": 925,
+    "momentum against LONG": 380,
+    "selling pressure building": 49,
+    "price falling against LONG": 15,
+    "dynamic confidence": 303,
+    "price rising against SHORT": 5,
+    "momentum against SHORT": 10,
+    "buying pressure building": 1
   },
   "new_features_activity": {
-    "[DENSITY INTEL] Stagnation detected \u2014 forcing brea": 9,
-    "[DENSITY INTEL] Stagnation breakeven": 4,
-    "[TIME-STOP FSM] Stage 1 \u2014 PostOnly Maker (5s windo": 2,
-    "[TIME-STOP FSM] PostOnly placed": 2,
-    "[KILL-SWITCH] ZOMBIE DETECTED \u2014 force market close": 1,
-    "[KILL-SWITCH] Zombie force close executed": 1,
-    "[KILL-SWITCH] Passive exit timed out \u2014 executing a": 1,
-    "[KILL-SWITCH] Market Kill-Switch executed": 1,
-    "[DENSITY INTEL] Adapting TP": 1,
-    "[DENSITY INTEL] Failed to place new TP": 1
+    "[DENSITY INTEL] Stagnation detected \u2014 forcing brea": 124,
+    "[DENSITY INTEL] Stagnation breakeven": 34,
+    "[TIME-STOP FSM] Stage 1 \u2014 PostOnly Maker (5s windo": 36,
+    "[TIME-STOP FSM] PostOnly placed": 36,
+    "[KILL-SWITCH] ZOMBIE DETECTED \u2014 force market close": 6,
+    "[KILL-SWITCH] Zombie force close executed": 6,
+    "[KILL-SWITCH] Passive exit timed out \u2014 executing a": 27,
+    "[KILL-SWITCH] Market Kill-Switch executed": 27,
+    "[DENSITY INTEL] Adapting TP": 16,
+    "[DENSITY INTEL] Failed to place new TP": 13,
+    "[LABEL CLEANUP] Entry setup accurate \u2014 label=1": 2,
+    "[TIME-STOP FSM] Breakeven exit \u2014 position in profi": 13,
+    "[DENSITY INTEL] Failed to cancel old TP": 3,
+    "[TIME-STOP FSM] breakeven exit failed": 2,
+    "[TIME-STOP FSM] LONG penalty \u2014 force immediate clo": 3
   },
   "ml_pipeline": {
-    "symbols_active": 68,
-    "market_events": 207365,
-    "predictions": 181275,
-    "signals_generated": 27393,
-    "holds_low_conf": 99752,
-    "holds_direction": 3297,
-    "holds_correlation": 2,
-    "holds_warming": 2457,
-    "holds_pattern_block": 1095,
-    "faiss_vectors": 4971,
-    "retrain_trades": 12
+    "symbols_active": 66,
+    "market_events": 56770,
+    "predictions": 55393,
+    "signals_generated": 5239,
+    "holds_low_conf": 22054,
+    "holds_direction": 44,
+    "holds_correlation": 0,
+    "holds_warming": 1215,
+    "holds_pattern_block": 11138,
+    "faiss_vectors": 5006,
+    "retrain_trades": 28
   },
   "gatekeeper": {
     "model_backend": "catboost",
@@ -123,10 +216,10 @@
     "model_accuracy": 0.7917,
     "threshold_long": 0.65,
     "threshold_short": 0.45,
-    "influxdb_samples": 576,
-    "influxdb_wins": 191,
-    "influxdb_losses": 385,
-    "influxdb_wr_pct": 33.2
+    "influxdb_samples": 641,
+    "influxdb_wins": 208,
+    "influxdb_losses": 433,
+    "influxdb_wr_pct": 32.4
   },
   "deployed_features": {
     "density_exit_manager": {
@@ -161,7 +254,7 @@
     },
     "knife_guard": {
       "btc_velocity_thresh": -0.0005,
-      "obi_negative_thresh": -0.1,
+      "obi_negative_thresh": -0.4,
       "long_gk_threshold": 0.65,
       "short_gk_threshold": 0.45
     },

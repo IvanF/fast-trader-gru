@@ -1,6 +1,6 @@
 # Fast Trader GRU — Архитектура системы
 
-_Обновлено: 2026-07-08 16:05 UTC_
+_Обновлено: 2026-07-08 16:48 UTC_
 
 ---
 
@@ -15,7 +15,7 @@ _Обновлено: 2026-07-08 16:05 UTC_
 │  │   Screener   │────▶│  Ingestion   │────▶│       ML Engine           │    │
 │  │     (Go)     │     │     (Go)     │     │   (Python 3.10 + CUDA)   │    │
 │  │  Bybit WS    │     │  WS → Redis  │     │   ONNX Runtime (GPU)      │    │
-│  │  68 symbols  │     │  orderbooks  │     │   FAISS (4971 vectors)    │    │
+│  │  66 symbols  │     │  orderbooks  │     │   FAISS (5006 vectors)    │    │
 │  └──────────────┘     └──────┬───────┘     │   CatBoost Gatekeeper     │    │
 │                              │              │   DensityExitManager      │    │
 │                              ▼              └──────────┬───────────────┘    │
@@ -53,12 +53,15 @@ _Обновлено: 2026-07-08 16:05 UTC_
 
 ---
 
-## 2. Pipeline сигналов (ML Engine → OMS)
+## 2. Pipeline сигналов (ML Engine)
 
 ```
-  Market Event
-       │
-       ▼
+  Market Event (orderbook / trade)
+         │
+         ▼
+  SymbolBuffer.add_orderbook() / add_trade()
+         │
+         ▼
   ┌──────────────────────────────────────────────────────────────┐
   │              _run_tick_prediction()                           │
   │                                                               │
@@ -66,7 +69,7 @@ _Обновлено: 2026-07-08 16:05 UTC_
   │  ②  ONNX Inference:       direction / conf / vol             │
   │  ③  [KNIFE-GUARD]:        BTC vel < -0.0005 + corr > 0.6    │
   │                            AND direction=LONG → HOLD          │
-  │  ④  [KNIFE-GUARD]:        OBI < -0.1 + direction=LONG → HOLD│
+  │  ④  [KNIFE-GUARD]:        OBI < -0.4 + direction=LONG → HOLD│
   │  ⑤  Toxic Flow Filter:    toxic > 0.40 → HOLD               │
   │  ⑥  MIN_EDGE:             |pred_pnl| < 0.0025 → HOLD       │
   │  ⑦  Correlation Block:    BTC_corr > 0.70 → HOLD            │
@@ -88,10 +91,15 @@ _Обновлено: 2026-07-08 16:05 UTC_
 
 ### Ключевые формулы
 
-**Confidence:**
+**Confidence (PnL mode):**
 ```
 confidence = min(|pred_pnl| / 0.01, 1.0)     если |pred_pnl| ≥ 0.0025
 confidence = 0                                иначе
+```
+
+**MIN_EDGE Filter (актуальный):**
+```
+if |pred_pnl| < 0.0025 → HOLD
 ```
 
 **OBI (Order Book Imbalance):**
@@ -107,10 +115,17 @@ penalty = max(1.0, 3.0 − 2.5 × (WR / 0.40))
 threshold = min(base × penalty, 0.95)
 ```
 
-**BTC Knife Guard:**
+**Pattern Memory:**
 ```
-block LONG если: corr > 0.60 И btc_1m_trend < -0.0005
-block LONG если: OBI < -0.1 (asks доминируют)
+similarity = cosine(state_vector_A, state_vector_B)
+block если: similarity ≥ 0.92 И ≥ 5 similar patterns с avg_loss < -$0.10
+```
+
+**Gatekeeper (asymmetric CatBoost):**
+```
+P(success) ≥ 0.65 → PASS  (LONG — консервативно)
+P(success) ≥ 0.45 → PASS  (SHORT — пермиссивно)
+No model → PASS (fail-safe)
 ```
 
 ---
@@ -122,7 +137,7 @@ block LONG если: OBI < -0.1 (asks доминируют)
        │
        ▼
   ┌───────────────────────────────────────────────────────────────┐
-  │  Entry Filters (12 steps):                                     │
+  │  Entry Filters (12+):                                          │
   │  Blacklist → DynamicConf → Spread → ZeroDepth → OBI           │
   │  → Momentum → PriceTrend → Volume (asymmetric!) → FundingRate │
   │  → Correlation → LONG Cluster (max 2) → ExchangeCheck          │
@@ -139,11 +154,12 @@ block LONG если: OBI < -0.1 (asks доминируют)
   │  ┌───────────────────────────────────────────────────────┐    │
   │  │ [STALE GUARD] — holdMs < 60s → skip ghost check       │    │
   │  │  Prevents premature removal from API lag               │    │
+  │  │  Ghost path: fetch actual PnL via GetRecentClosedPnL   │    │
   │  └───────────────────────────────────────────────────────┘    │
   │                                                                │
   │  ┌───────────────────────────────────────────────────────┐    │
-  │  │ Time-Stop FSM (State Machine):                         │    │
-  │  │  StateActive → StateClosingPassive → StateClosingAggr  │    │
+  │  │ Time-Stop FSM (State Machine — atomic CAS):            │    │
+  │  │  StateActive → ClosingPassive → ClosingAggressive      │    │
   │  │                                                       │    │
   │  │  Normal: 180s, HFT: 60s                               │    │
   │  │  Stage 1: PostOnly Maker (5s window)                  │    │
@@ -173,13 +189,13 @@ block LONG если: OBI < -0.1 (asks доминируют)
 
 ### Asymmetric Volume Filter
 ```
-LONG:  current_vol ≥ 1.2 × SMA(20)   (active buying interest)
-SHORT: current_vol ≥ 0.5 × SMA(20)   (dead market)
+LONG:  current_vol ≥ 1.2 × SMA(20)   (активное давление покупателей)
+SHORT: current_vol ≥ 0.5 × SMA(20)   (мёртвый рынок)
 ```
 
 ### LONG Cluster Guard
 ```
-block LONG если: ≥ 2 коррелированных LONG позиции с BTC_corr > 0.70
+block LONG если: ≥ 2 коррелированных LONG с BTC_corr > 0.70
 ```
 
 ---
@@ -198,13 +214,13 @@ const (
 ```
 
 **Thread-Safe Transitions:**
-```go
+```
 atomic.CompareAndSwapInt32(&pos.State, StateActive, StateClosingPassive)
 atomic.StoreInt32(&pos.State, StateClosingAggressive)
 atomic.StoreInt32(&pos.State, StateClosed)
 ```
 
-**State Snapshot Pattern (Lock-Decoupled):**
+**Lock-Decoupled Pattern:**
 ```
 1. s.mu.Lock() → copy fields → s.mu.Unlock()
 2. Network I/O (no lock held)
@@ -300,10 +316,10 @@ atomic.StoreInt32(&pos.State, StateClosed)
 
 ```
   20 features → CatBoost (AUC=0.7842, Acc=79.17%)
-  576 samples (191 wins / 385 losses, WR=33.2%)
+  641 samples (208 wins / 433 losses, WR=32.4%)
 
-  LONG signals:  threshold = 0.65 (conservative)
-  SHORT signals: threshold = 0.45 (permissive)
+  LONG:  threshold = 0.65 (консервативно)
+  SHORT: threshold = 0.45 (пермиссивно)
   No model: pass-through (fail-safe)
 ```
 
@@ -319,16 +335,50 @@ atomic.StoreInt32(&pos.State, StateClosed)
 | PASSIVE_WINDOW | **5s** | PostOnly → Kill-Switch |
 | ZOMBIE_RETRY | **60s** | Zombie force close |
 | BREAKEVEN_SEC | **90s** | Breakeven timer |
-| STALE_GUARD | **60s** | Grace period before ghost check |
+| STALE_GUARD | **60s** | Grace period before ghost |
 | GK_LONG | **0.65** | LONG Gatekeeper threshold |
 | GK_SHORT | **0.45** | SHORT Gatekeeper threshold |
 | LONG_VOL_SMA | **1.2** | LONG volume requirement |
 | SHORT_VOL_SMA | 0.5 | SHORT volume requirement |
-| LONG_CLUSTER | **2** | Max correlated LONG positions |
+| LONG_CLUSTER | **2** | Max correlated LONG |
 | BTC_VEL_THRESH | -0.0005 | BTC trend filter |
-| OBI_NEG_THRESH | -0.1 | OBI LONG block |
+| OBI_NEG_THRESH | **-0.4** | OBI LONG block |
 | MFE_THRESHOLD | 0.75 | Smart label override |
 | DENSITY_WALL | 15.0 | Wall push ratio |
 | DENSITY_STALL | 90s | Stagnation time |
 | DENSITY_STALL_R | 0.15 | Stagnation R |
 | R:R | 1.2 | Risk:Reward |
+
+---
+
+## 11. Деплой и управление
+
+```bash
+# Пересборка OMS (Go)
+docker compose build oms_execution && docker compose up -d oms_execution
+
+# Hot-patch Python (быстрее пересборки)
+docker cp src/engine.py ftg-ml-engine:/app/src/engine.py
+docker exec ftg-ml-engine find /app -name "__pycache__" -exec rm -rf {} +
+docker restart ftg-ml-engine
+
+# Batch Gatekeeper training
+docker compose run --rm gatekeeper-trainer
+
+# Check GK features in InfluxDB
+docker exec ftg-ml-engine python3 -c "
+from influxdb_client import InfluxDBClient
+c = InfluxDBClient(url='http://influxdb:8086', token='...', org='fasttrader')
+tables = c.query_api().query('from(bucket:\"market_raw\") |> range(start:-7d) |> filter(fn:(r) => r[\"_measurement\"] == \"gatekeeper_features\") |> filter(fn:(r) => r[\"_field\"] == \"label\")')
+total = sum(len(t) for t in tables)
+print(f'Records: {total}')
+c.close()"
+
+# Установить GK threshold
+echo 'GATEKEEPER_THRESHOLD=0.45' >> .env
+docker compose up -d --build ml_engine
+
+# Установить time-stop
+echo 'TIME_STOP_SECONDS=180' >> .env
+docker compose up -d --build oms_execution
+```
