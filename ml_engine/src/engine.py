@@ -882,7 +882,7 @@ class MLEngine:
                 str(self._payload_scalar(payload, "S", "side", "Side", default="Buy")),
             )
 
-        if len(buf.points) < 20:
+        if len(buf.points) < 10:
             self._stats["buffer_warming"] += 1
             return
 

@@ -227,7 +227,6 @@ def train_model(X: np.ndarray, y: np.ndarray, cat_data: dict) -> object | None:
     model.fit(
         X_train_cb, y_train,
         cat_features=cat_indices,
-        feature_names=all_feature_names,
         eval_set=(X_test_cb, y_test),
     )
 
@@ -271,14 +270,9 @@ def export_onnx(model, auc: float, acc: float) -> bool:
 
         # Export to ONNX
         try:
-            model.export_model(
+            model.save_model(
                 GK_MODEL_PATH,
                 format="onnx",
-                export_parameters={
-                    "onnx_domain": "ai.catboost",
-                    "model_version": 0,
-                    "onnx_doc_string": f"Gatekeeper AUC={auc:.4f} Acc={acc:.4f}",
-                },
             )
             logger.info("Exported ONNX model to %s", GK_MODEL_PATH)
             return True
