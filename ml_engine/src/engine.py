@@ -1165,11 +1165,11 @@ class MLEngine:
                     direction = "HOLD"
                     return None
 
-            # OBI buying pressure check — block if asks actively dominate (OBI < 0)
+            # OBI buying pressure check — block only when asks overwhelmingly dominate
             obi_current = buf.order_book_imbalance() if hasattr(buf, 'order_book_imbalance') else 0.0
-            if obi_current < -0.1:
+            if obi_current < -0.4:
                 self._stats["obi_long_blocked"] = self._stats.get("obi_long_blocked", 0) + 1
-                logger.info("[KNIFE-GUARD] BLOCKED LONG for %s: OBI=%.3f < -0.1 (asks dominate)",
+                logger.info("[KNIFE-GUARD] BLOCKED LONG for %s: OBI=%.3f < -0.4 (asks dominate)",
                             symbol, obi_current)
                 return None
 
