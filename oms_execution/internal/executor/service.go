@@ -1719,32 +1719,25 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 
 	s.retryMissingTakeProfits(ctx, pos, ob)
 
-	// HARD TIME-STOP: 2-stage FSM — PostOnly → Kill-Switch after 30s
-	// Timing adapts to trading mode: HFT gets shorter windows
-	// Also adapts to signal confidence: high-conf gets longer runway
+	// ════════════════════════════════════════════════════════════════
+	// [TIME-STOP FSM] — strict 5s passive → Market Kill-Switch
+	// ════════════════════════════════════════════════════════════════
 	mode := risk.TradingMode(pos.TradingMode)
 	normalTimeStop := s.cfg.TimeStopSeconds
 	hftTimeStop := s.cfg.HFTTimeStopSec
-	// Dynamic: high-confidence signals get 240s, low-confidence get 150s
-	if pos.Signal.Confidence >= 0.90 {
-		normalTimeStop = 240
-	} else {
-		normalTimeStop = 150
-	}
+	// Unified: all confidence levels → 180s (3 minutes)
+	normalTimeStop = 180
 	hardTimeStopSec := risk.ModeTimeStopSec(mode, normalTimeStop, hftTimeStop)
-	const MakerFillTimeoutSec = 30
-	const ZombieRetrySec = 120
+	const PassiveWindowSec = 5
+	const ZombieRetrySec = 60
 	holdSec := (time.Now().UnixMilli() - pos.EntryTime) / 1000
 	if holdSec > int64(hardTimeStopSec) {
 		exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
 		if hasPos && exSize > 0 {
-			// ════════════════════════════════════════════════════════════════
-			// FIX 3: BREAKEVEN EXIT — if in profit at time-stop, close at breakeven
-			// instead of taking market loss. Protects profitable trades from
-			// being killed by time-stop.
-			// ════════════════════════════════════════════════════════════════
 			mid := grid.MidPrice(ob)
-			if mid > 0 {
+
+			// Breakeven exit if in profit at time-stop
+			if mid > 0 && !pos.TimeStopPlaced {
 				commissionBuffer := pos.FillPrice * 0.0013
 				var isProfitable bool
 				if pos.Direction == "LONG" {
@@ -1752,22 +1745,17 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 				} else {
 					isProfitable = mid < pos.FillPrice-commissionBuffer
 				}
-				if isProfitable && !pos.TimeStopPlaced {
-					s.logger.Info("[TIME-STOP FIX] Breakeven exit — position in profit",
-						"symbol", pos.Symbol,
-						"direction", pos.Direction,
-						"entry", pos.FillPrice,
-						"current", mid,
-						"hold_sec", holdSec)
+				if isProfitable {
+					s.logger.Info("[TIME-STOP FSM] Breakeven exit — position in profit",
+						"symbol", pos.Symbol, "entry", pos.FillPrice, "current", mid, "hold_sec", holdSec)
 					s.cancelExitOrders(ctx, pos)
-					side := "Buy"
+					side := "Sell"
 					if pos.Direction == "LONG" {
 						side = "Sell"
 					}
 					normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
-					_, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
-					if err != nil {
-						s.logger.Error("breakeven exit failed", "symbol", pos.Symbol, "error", err)
+					if _, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep); err != nil {
+						s.logger.Error("[TIME-STOP FSM] breakeven exit failed", "symbol", pos.Symbol, "error", err)
 					}
 					pos.TimeStopPlaced = true
 					s.tryFinalizePosition(ctx, pos, "time_stop", mid)
@@ -1775,54 +1763,46 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 				}
 			}
 
-			// ════════════════════════════════════════════════════════════════
-			// FIX 5: LONG PENALTY — for LONG positions with big loss at time-stop,
-			// force immediate market close to limit damage.
-			// ════════════════════════════════════════════════════════════════
-			if pos.Direction == "LONG" && !pos.TimeStopPlaced {
-				if mid > 0 {
-					longLoss := (pos.FillPrice - mid) / pos.FillPrice
-					if longLoss > 0.003 { // > 0.3% loss
-						s.logger.Warn("[TIME-STOP FIX] LONG penalty — force immediate close",
-							"symbol", pos.Symbol,
-							"loss_pct", fmt.Sprintf("%.2f%%", longLoss*100),
-							"hold_sec", holdSec)
-						s.cancelExitOrders(ctx, pos)
-						normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
-						_, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, "Sell", normQty, pos.QtyStep)
-						if err != nil {
-							s.logger.Error("LONG penalty close failed", "symbol", pos.Symbol, "error", err)
-						}
-						pos.TimeStopPlaced = true
-						s.tryFinalizePosition(ctx, pos, "time_stop", mid)
-						return
+			// LONG penalty: force immediate close if loss > 0.3%
+			if pos.Direction == "LONG" && !pos.TimeStopPlaced && mid > 0 {
+				longLoss := (pos.FillPrice - mid) / pos.FillPrice
+				if longLoss > 0.003 {
+					s.logger.Warn("[TIME-STOP FSM] LONG penalty — force immediate close",
+						"symbol", pos.Symbol, "loss_pct", fmt.Sprintf("%.2f%%", longLoss*100), "hold_sec", holdSec)
+					s.cancelExitOrders(ctx, pos)
+					normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
+					if _, err := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, "Sell", normQty, pos.QtyStep); err != nil {
+						s.logger.Error("[TIME-STOP FSM] LONG penalty close failed", "symbol", pos.Symbol, "error", err)
 					}
+					pos.TimeStopPlaced = true
+					s.tryFinalizePosition(ctx, pos, "time_stop", mid)
+					return
 				}
 			}
 
+			// 2-stage FSM: PostOnly (5s window) → Market Kill-Switch
 			if !pos.TimeStopPlaced {
-				s.logger.Warn("HARD TIME-STOP — initiating 2-stage exit",
-					"symbol", pos.Symbol,
-					"hold_sec", holdSec,
-					"qty", exSize,
-				)
+				s.logger.Warn("[TIME-STOP FSM] Initiating 2-stage exit",
+					"symbol", pos.Symbol, "hold_sec", holdSec, "qty", exSize)
 				s.cancelExitOrders(ctx, pos)
 
-				side := "Buy"
+				side := "Sell"
 				if pos.Direction == "LONG" {
 					side = "Sell"
+				} else {
+					side = "Buy"
 				}
 				normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
-
 				exitPrice := grid.PassiveMakerExitPrice(pos.Direction, ob, pos.TickSize, s.cfg.EntryMakerTicks)
+
 				if exitPrice > 0 {
 					orderID, orderErr := s.bybit.PlaceReducePostOnlyLimit(ctx, pos.Symbol, side, normQty, pos.QtyStep, bybit.FormatPrice(exitPrice))
 					if orderErr == nil {
 						pos.TimeStopPlaced = true
-						s.logger.Info("HARD TIME-STOP stage 1 — PostOnly Maker order placed",
+						s.logger.Info("[TIME-STOP FSM] Stage 1 — PostOnly Maker placed (5s window)",
 							"symbol", pos.Symbol, "price", exitPrice, "qty", normQty, "order_id", orderID)
 
-						s.goWithTimeout(ctx, MakerFillTimeoutSec, func() {
+						s.goWithTimeout(ctx, PassiveWindowSec, func() {
 							s.mu.Lock()
 							currentPos, exists := s.positions[pos.Symbol]
 							if !exists || currentPos == nil || !currentPos.TimeStopPlaced {
@@ -1833,109 +1813,50 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 
 							oi, oiErr := s.bybit.GetOrderRealtime(ctx, pos.Symbol, orderID)
 							if oiErr == nil && oi.OrderStatus == "New" {
-								s.logger.Warn("HARD TIME-STOP stage 2 — Market Kill-Switch!",
-									"symbol", pos.Symbol,
-									"order_id", orderID)
+								s.logger.Warn("[KILL-SWITCH] Passive exit timed out — executing aggressive Market Kill-Switch!",
+									"symbol", pos.Symbol, "order_id", orderID)
 								_ = s.bybit.CancelOrder(ctx, pos.Symbol, orderID)
-
 								_, merr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
 								if merr != nil {
-									s.logger.Error("Market Kill-Switch failed",
-										"symbol", pos.Symbol, "error", merr)
+									s.logger.Error("[KILL-SWITCH] Market Kill-Switch failed", "symbol", pos.Symbol, "error", merr)
 								} else {
-									s.logger.Info("Market Kill-Switch executed",
-										"symbol", pos.Symbol)
+									s.logger.Info("[KILL-SWITCH] Market Kill-Switch executed", "symbol", pos.Symbol)
 									s.tryFinalizePosition(ctx, pos, "time_stop", 0)
 								}
-	}
-
-	// ════════════════════════════════════════════════════════════════
-	// FIX 4: TRAILING TIME-STOP — if position reached 50% of TP
-	// distance, move SL to breakeven immediately (don't wait for
-	// breakevenSec timer). Protects profits from time-stop reversal.
-	// ════════════════════════════════════════════════════════════════
-	if !pos.BreakevenSet && holdSec > 60 {
-		mid := grid.MidPrice(ob)
-		if mid > 0 && len(pos.TakeProfitOrders) > 0 {
-			tpPrice := pos.TakeProfitOrders[0].Price
-			if tpPrice > 0 {
-				riskDist := math.Abs(pos.FillPrice - pos.StopLoss)
-				if riskDist > 0 {
-					profitPct := math.Abs(mid - pos.FillPrice)
-					halfTP := math.Abs(tpPrice-pos.FillPrice) * 0.5
-					if profitPct >= halfTP {
-						commissionBuffer := pos.FillPrice * 0.0013
-						var trailingBE float64
-						if pos.Direction == "LONG" {
-							trailingBE = pos.FillPrice + commissionBuffer
-						} else {
-							trailingBE = pos.FillPrice - commissionBuffer
-						}
-						trailingBE = math.Round(trailingBE/pos.TickSize) * pos.TickSize
-
-						if pos.Direction == "LONG" && trailingBE > pos.StopLoss ||
-							pos.Direction == "SHORT" && trailingBE < pos.StopLoss {
-							exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
-							if hasPos && exSize > 0 {
-								slQty := s.slCoverQty(pos, exSize)
-								if slQty > 0 {
-									if err := s.atomicReplaceStopLoss(ctx, pos, trailingBE, slQty, "trailing_breakeven"); err != nil {
-										s.logger.Warn("trailing breakeven failed",
-											"symbol", pos.Symbol, "error", err)
-									} else {
-										pos.BreakevenSet = true
-										s.logger.Info("[TIME-STOP FIX] Trailing breakeven — 50% TP reached",
-											"symbol", pos.Symbol,
-											"direction", pos.Direction,
-											"entry", pos.FillPrice,
-											"current", mid,
-											"tp", tpPrice,
-											"trailing_be", trailingBE,
-											"hold_sec", holdSec,
-										)
-									}
-								}
 							}
-						}
-					}
-				}
-			}
-		}
-	}
 						})
 						return
 					}
-					s.logger.Warn("HARD TIME-STOP — PostOnly failed, immediate market Kill-Switch",
-						"symbol", pos.Symbol, "error", orderErr)
 				}
 
-				s.logger.Warn("HARD TIME-STOP — immediate market Kill-Switch",
-					"symbol", pos.Symbol, "qty", normQty)
+				// PostOnly failed — immediate Market Kill-Switch
+				s.logger.Warn("[TIME-STOP FSM] PostOnly failed, immediate Market Kill-Switch", "symbol", pos.Symbol)
 				_, mktErr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
 				if mktErr != nil {
-					s.logger.Error("Market Kill-Switch failed",
-						"symbol", pos.Symbol, "error", mktErr)
+					s.logger.Error("[KILL-SWITCH] Market Kill-Switch failed", "symbol", pos.Symbol, "error", mktErr)
 				} else {
+					pos.TimeStopPlaced = true
 					s.tryFinalizePosition(ctx, pos, "time_stop", 0)
 				}
-				pos.TimeStopPlaced = true
 				return
 			}
-			// ZOMBIE RETRY: if TimeStopPlaced but still open after ZombieRetrySec, force market
+			// ZOMBIE RETRY: hardTimeStopSec + 60s → force market close
 			if pos.TimeStopPlaced && holdSec > int64(hardTimeStopSec)+ZombieRetrySec {
-				s.logger.Error("ZOMBIE DETECTED — force market close",
+				s.logger.Error("[KILL-SWITCH] ZOMBIE DETECTED — force market close",
 					"symbol", pos.Symbol, "hold_sec", holdSec, "qty", exSize)
 				pos.TimeStopPlaced = false
-				side := "Buy"
+				side := "Sell"
 				if pos.Direction == "LONG" {
 					side = "Sell"
+				} else {
+					side = "Buy"
 				}
 				normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
 				_, mktErr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
 				if mktErr != nil {
-					s.logger.Error("ZOMBIE force close failed", "symbol", pos.Symbol, "error", mktErr)
+					s.logger.Error("[KILL-SWITCH] Zombie force close failed", "symbol", pos.Symbol, "error", mktErr)
 				} else {
-					s.logger.Info("ZOMBIE force close executed", "symbol", pos.Symbol)
+					s.logger.Info("[KILL-SWITCH] Zombie force close executed", "symbol", pos.Symbol)
 					pos.TimeStopPlaced = true
 				}
 				return
@@ -1951,8 +1872,8 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 		return
 	}
 
-	// BREAKEVEN: move SL to breakeven after 60 seconds
-	if holdSec > 60 && !pos.BreakevenSet {
+	// BREAKEVEN: move SL to breakeven after 90 seconds (was 60s)
+	if holdSec > 90 && !pos.BreakevenSet {
 		mid := grid.MidPrice(ob)
 		if mid > 0 {
 			commissionBuffer := pos.FillPrice * 0.0013 // 0.13% covers both sides

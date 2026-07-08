@@ -125,7 +125,7 @@ func Load() Config {
 		TradeMarginUSD:    tradeMargin,
 		Leverage:          intEnv("LEVERAGE", 5),
 		DefaultQty:        floatEnv("DEFAULT_ORDER_QTY", 0.01),
-		TimeStopSeconds:   intEnv("TIME_STOP_SECONDS", 3600),
+		TimeStopSeconds:   intEnv("TIME_STOP_SECONDS", 180),
 		PartialClosePct:   floatEnv("PARTIAL_CLOSE_PCT", 0.45),
 		Demo:              demo,
 		Testnet:           testnet,

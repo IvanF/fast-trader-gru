@@ -962,7 +962,7 @@ class MLEngine:
         if predict_pnl:
             pred_pnl, trap_prob, toxic_prob = self.inference.decide_pnl(v_state, v_memory)
             direction = "LONG" if pred_pnl > 0 else "SHORT" if pred_pnl < 0 else "HOLD"
-            confidence = min(abs(pred_pnl) / 0.01, 1.0) if abs(pred_pnl) >= 0.0015 else 0.0
+            confidence = min(abs(pred_pnl) / 0.01, 1.0) if abs(pred_pnl) >= 0.0025 else 0.0
             vol_mult = 1.0
             # Store toxic_prob and pred_pnl for later use
             self._toxic_prob_cache = toxic_prob
@@ -1169,7 +1169,7 @@ class MLEngine:
                             symbol, toxic_prob, TOXIC_THRESHOLD)
                 return None
 
-            MIN_EDGE = 0.0015  # 0.15% minimum expected PnL (quality filter)
+            MIN_EDGE = 0.0025  # 0.25% minimum expected PnL (quality filter)
             if abs(self._pred_pnl_cache) < MIN_EDGE:
                 self._stats["hold_low_conf"] += 1
                 return None
