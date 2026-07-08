@@ -30,7 +30,7 @@ REPLAY_BUFFER_SIZE = int(os.getenv("REPLAY_BUFFER_SIZE", "200"))
 REPLAY_BATCH = int(os.getenv("REPLAY_BATCH", "16"))
 PATTERN_MEMORY_SIZE = int(os.getenv("PATTERN_MEMORY_SIZE", "5000"))
 PATTERN_SIMILARITY_THRESHOLD = float(os.getenv("PATTERN_SIMILARITY_THRESHOLD", "0.85"))
-PATTERN_TTL_HOURS = float(os.getenv("PATTERN_TTL_HOURS", "1"))
+PATTERN_TTL_HOURS = float(os.getenv("PATTERN_TTL_HOURS", "0.5"))
 CONSECUTIVE_LOSS_THRESHOLD = int(os.getenv("CONSECUTIVE_LOSS_THRESHOLD", "10"))
 ONLINE_UPDATE_INTERVAL = int(os.getenv("ONLINE_UPDATE_INTERVAL", "5"))
 
@@ -121,7 +121,7 @@ class PatternMemory:
 
             # Symbol-level: 3+ consecutive losses of same symbol in last 60 minutes → block
             if symbol:
-                recent_cutoff = now - 3600  # 60 minutes
+                recent_cutoff = now - PATTERN_TTL_HOURS * 3600  # use TTL
                 symbol_losses = [p for p in similar if p.symbol == symbol and p.pnl < 0 and p.timestamp > recent_cutoff]
                 if len(symbol_losses) >= 3:
                     return True, np.mean([p.pnl for p in symbol_losses])

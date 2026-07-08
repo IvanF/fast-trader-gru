@@ -962,7 +962,7 @@ class MLEngine:
         if predict_pnl:
             pred_pnl, trap_prob, toxic_prob = self.inference.decide_pnl(v_state, v_memory)
             direction = "LONG" if pred_pnl > 0 else "SHORT" if pred_pnl < 0 else "HOLD"
-            confidence = min(abs(pred_pnl) / 0.01, 1.0) if abs(pred_pnl) >= 0.0025 else 0.0
+            confidence = min(abs(pred_pnl) / 0.01, 1.0) if abs(pred_pnl) >= 0.0035 else 0.0
             vol_mult = 1.0
             # Store toxic_prob and pred_pnl for later use
             self._toxic_prob_cache = toxic_prob
@@ -1150,7 +1150,7 @@ class MLEngine:
         # ════════════════════════════════════════════════════════════════
         # [KNIFE-GUARD] — asymmetric LONG protection
         # ════════════════════════════════════════════════════════════════
-        LONG_BTC_VELOCITY_THRESH = -0.0005
+        LONG_BTC_VELOCITY_THRESH = -0.0002
         LONG_OBI_MIN = 0.1
 
         if direction == "LONG":
@@ -1160,14 +1160,14 @@ class MLEngine:
                 btc_velocity_1m = sum(btc_1m_returns) / len(btc_1m_returns)
                 if corr > 0.60 and btc_velocity_1m < LONG_BTC_VELOCITY_THRESH:
                     self._stats["knife_guard_blocked"] = self._stats.get("knife_guard_blocked", 0) + 1
-                    logger.info("[KNIFE-GUARD] Overriding LONG for %s. BTC bearish (vel=%.6f, corr=%.3f)",
+                    logger.info("[KNIFE-GUARD] Overriding LONG for %s. BTC bearish drift (vel=%.6f, corr=%.3f)",
                                 symbol, btc_velocity_1m, corr)
                     direction = "HOLD"
                     return None
 
             # OBI buying pressure check — block only when asks overwhelmingly dominate
             obi_current = buf.order_book_imbalance() if hasattr(buf, 'order_book_imbalance') else 0.0
-            if obi_current < -0.4:
+            if obi_current < -0.1:
                 self._stats["obi_long_blocked"] = self._stats.get("obi_long_blocked", 0) + 1
                 logger.info("[KNIFE-GUARD] BLOCKED LONG for %s: OBI=%.3f < -0.4 (asks dominate)",
                             symbol, obi_current)
@@ -1195,7 +1195,7 @@ class MLEngine:
                             symbol, toxic_prob, TOXIC_THRESHOLD)
                 return None
 
-            MIN_EDGE = 0.0025  # 0.25% minimum expected PnL (quality filter)
+            MIN_EDGE = 0.0035  # 0.35% minimum expected PnL (quality filter)
             if abs(self._pred_pnl_cache) < MIN_EDGE:
                 self._stats["hold_low_conf"] += 1
                 return None
