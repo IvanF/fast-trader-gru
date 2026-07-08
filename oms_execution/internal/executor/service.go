@@ -1632,11 +1632,20 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	}
 	s.mu.Unlock()
 
+	holdMs := time.Now().UnixMilli() - pos.EntryTime
+
 	exSize, hasPos, err := s.syncPositionFromExchange(ctx, pos)
 	if err != nil {
 		return
 	}
 	if !hasPos || exSize <= 0 {
+		// ── STALE GUARD: don't ghost-check positions younger than 60s ──
+		// Exchange API can lag after fill confirmation. Prevents premature stale removal.
+		if holdMs < 60_000 {
+			s.logger.Info("[STALE GUARD] Position missing on exchange, deferring (hold_ms < 60s)",
+				"symbol", pos.Symbol, "hold_ms", holdMs)
+			return
+		}
 		s.handleGhostPosition(ctx, pos)
 		return
 	}
@@ -2137,12 +2146,11 @@ func (s *Service) handleGhostPosition(ctx context.Context, pos *models.ActivePos
 
 	// ════════════════════════════════════════════════════════════════
 	// STALE TRACKER: Position exists in OMS but exchange is flat.
-	// Before removing, attempt one final market close to be safe.
+	// Try to flatten (safety net), then fetch actual PnL.
 	// ════════════════════════════════════════════════════════════════
-	// Try to flatten on exchange as safety net (in case exchange has tiny remainder)
 	exSize, hasPos, _ := s.syncPositionFromExchange(ctx, pos)
 	if hasPos && exSize > 0 {
-		s.logger.Warn("stale tracker: exchange still has position, forcing market close",
+		s.logger.Warn("[STALE GUARD] Exchange still has position, forcing market close",
 			"symbol", pos.Symbol, "ex_size", exSize)
 		side := "Buy"
 		if pos.Direction == "LONG" {
@@ -2151,13 +2159,24 @@ func (s *Service) handleGhostPosition(ctx context.Context, pos *models.ActivePos
 		normQty := bybit.NormalizeQty(exSize, pos.QtyStep, pos.MinOrderQty)
 		_, mktErr := s.bybit.PlaceReduceMarketRetry(ctx, pos.Symbol, side, normQty, pos.QtyStep)
 		if mktErr != nil {
-			s.logger.Error("stale tracker market close failed", "symbol", pos.Symbol, "error", mktErr)
+			s.logger.Error("[STALE GUARD] market close failed", "symbol", pos.Symbol, "error", mktErr)
 		} else {
-			s.logger.Info("stale tracker market close executed", "symbol", pos.Symbol)
+			s.logger.Info("[STALE GUARD] market close executed", "symbol", pos.Symbol)
 		}
 	}
 
-	s.finalizeClose(ctx, pos, 0, pos.FillPrice, pos.FillPrice, "stale_tracker_removed", false)
+	// Fetch actual PnL from exchange before finalizing
+	pnl := 0.0
+	exitPrice := pos.FillPrice
+	closed, closedErr := s.bybit.GetRecentClosedPnL(ctx, pos.Symbol, pos.EntryTime)
+	if closedErr == nil && closed != nil {
+		pnl = closed.ClosedPnL
+		exitPrice = closed.AvgExitPrice
+		s.logger.Info("[STALE GUARD] fetched actual PnL from exchange",
+			"symbol", pos.Symbol, "pnl", pnl, "exit", exitPrice)
+	}
+
+	s.finalizeClose(ctx, pos, pnl, pos.FillPrice, exitPrice, "stale_tracker_removed", false)
 
 	s.mu.Lock()
 	s.ghostCooldown[pos.Symbol] = time.Now().UnixMilli()+120_000
