@@ -493,7 +493,7 @@ class MLEngine:
                 symbol, float(data.get("confidence", 0.5)),
                 float(data.get("pred_pnl", 0.0)),
                 None, float(data.get("btc_correlation", 0.0)),
-                regime,
+                regime, float(data.get("volatility_multiplier", 1.0)),
             )
             self._gatekeeper.record_trade(gk_features, pnl)
             self._stats["gatekeeper_trades"] = self._stats.get("gatekeeper_trades", 0) + 1
@@ -1447,7 +1447,7 @@ class MLEngine:
         if self._gatekeeper.is_trained:
             gk_features = self._collect_gatekeeper_features(
                 symbol, confidence, self._pred_pnl_cache,
-                buf, corr, regime,
+                buf, corr, regime, vol_mult,
             )
             gk_result = self._gatekeeper.predict(gk_features)
             self._stats["gatekeeper_predictions"] = self._stats.get("gatekeeper_predictions", 0) + 1
@@ -1464,7 +1464,7 @@ class MLEngine:
 
     def _collect_gatekeeper_features(self, symbol: str, confidence: float,
                                      pred_pnl: float, buf, corr: float,
-                                     regime) -> Dict[str, float]:
+                                     regime, vol_mult: float = 1.0) -> Dict[str, float]:
         """Collect 20 features for Gatekeeper from real market data."""
         mid = buf.last_mid() if hasattr(buf, 'last_mid') and buf.last_mid() else 0.0
 
@@ -1517,12 +1517,14 @@ class MLEngine:
 
         # === ATR percentage ===
         atr_pct = 0.0
-        if mid > 0 and hasattr(self, 'priceHistory') and symbol in self.priceHistory:
-            hist = self.priceHistory[symbol]
-            if len(hist) >= 14:
-                import numpy as np
-                arr = np.array(hist[-14:], dtype=np.float64)
-                atr_val = np.mean(np.abs(np.diff(arr)))
+        if buf is not None and mid > 0:
+            ph = []
+            if hasattr(buf, 'price_history'):
+                ph = list(buf.price_history) if hasattr(buf.price_history, '__iter__') else []
+            if len(ph) >= 14:
+                prices = [p[1] if isinstance(p, (tuple, list)) else p for p in ph[-14:]]
+                arr = np.array(prices, dtype=np.float64)
+                atr_val = float(np.mean(np.abs(np.diff(arr))))
                 atr_pct = atr_val / mid if mid > 0 else 0.0
 
         # === Symbol stats ===
@@ -1550,7 +1552,7 @@ class MLEngine:
             "atr_pct": atr_pct,
             "funding_rate": self._funding_rates.get(symbol, 0.0),
             "btc_correlation": corr,
-            "volatility_multiplier": 1.0,
+            "volatility_multiplier": vol_mult,
             "symbol_wr": symbol_wr,
             "symbol_pnl_sum": symbol_pnl_sum,
             "symbol_consec_losses": symbol_consec_losses,

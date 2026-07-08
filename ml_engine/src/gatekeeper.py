@@ -1,7 +1,11 @@
-"""Gatekeeper — CatBoost binary classifier for trade success prediction.
+"""Gatekeeper — Binary classifier for trade success prediction.
 
-Replaces hardcoded DynamicConfCap and MIN_EDGE with data-driven decisions.
-Trains online on trade outcomes stored in InfluxDB.
+Supports:
+- ONNX Runtime for fast inference (gatekeeper.onnx)
+- CatBoost fallback for online retraining (gatekeeper_model.cbm)
+- Batch training via gatekeeper_trainer.py
+
+Fail-safe: if no model is loaded, all signals PASS through.
 """
 
 from __future__ import annotations
@@ -10,17 +14,17 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Gatekeeper config
 GK_THRESHOLD = float(os.getenv("GATEKEEPER_THRESHOLD", "0.55"))
 GK_MIN_SAMPLES = int(os.getenv("GATEKEEPER_MIN_SAMPLES", "50"))
 GK_RETRAIN_EVERY = int(os.getenv("GATEKEEPER_RETRAIN_EVERY", "50"))
-GK_MODEL_PATH = os.getenv("GATEKEEPER_MODEL_PATH", "/app/data/gatekeeper_model.cbm")
+GK_CB_MODEL_PATH = os.getenv("GATEKEEPER_CB_MODEL_PATH", "/app/data/gatekeeper_model.cbm")
+GK_ONNX_MODEL_PATH = os.getenv("GATEKEEPER_MODEL_PATH", "/app/data/gatekeeper.onnx")
 
 FEATURE_NAMES = [
     "confidence", "pred_pnl", "spread_pct", "obi", "volume_ratio",
@@ -34,21 +38,25 @@ FEATURE_NAMES = [
 @dataclass
 class GatekeeperResult:
     prob: float
-    prediction: int  # 1=PASS, 0=REJECT
+    prediction: int
     features: List[float]
     threshold: float
 
 
 class Gatekeeper:
-    """Online-learning CatBoost classifier for trade success prediction.
+    """Binary classifier for trade success prediction.
 
-    Trains on historical trade outcomes from InfluxDB.
-    Predicts probability of trade being profitable before OMS entry.
+    Inference priority:
+    1. ONNX Runtime (gatekeeper.onnx) — fastest, from batch training
+    2. CatBoost native (gatekeeper_model.cbm) — from online retraining
+    3. Pass-through (no model) — fail-safe, never blocks signals
     """
 
     def __init__(self) -> None:
-        self._model = None
+        self._cb_model = None
+        self._onnx_session = None
         self._trained = False
+        self._inference_backend = "none"
         self._train_count = 0
         self._trade_buffer: List[Dict[str, Any]] = []
         self._last_train_time = 0.0
@@ -65,32 +73,45 @@ class Gatekeeper:
         """
         feat_vec = [features.get(name, 0.0) for name in FEATURE_NAMES]
 
-        if self._model is None:
-            # No model yet → pass through (don't block)
+        if not self._trained:
             return GatekeeperResult(
                 prob=0.55, prediction=1, features=feat_vec,
                 threshold=GK_THRESHOLD,
             )
 
         try:
-            prob = self._model.predict_proba([feat_vec])[0][1]
+            if self._onnx_session is not None:
+                prob = self._predict_onnx(feat_vec)
+            elif self._cb_model is not None:
+                prob = float(self._cb_model.predict_proba([feat_vec])[0][1])
+            else:
+                return GatekeeperResult(
+                    prob=0.55, prediction=1, features=feat_vec,
+                    threshold=GK_THRESHOLD,
+                )
+
             prediction = 1 if prob >= GK_THRESHOLD else 0
             return GatekeeperResult(
-                prob=float(prob), prediction=prediction,
+                prob=prob, prediction=prediction,
                 features=feat_vec, threshold=GK_THRESHOLD,
             )
         except Exception as e:
-            logger.warning("Gatekeeper predict failed: %s", e)
+            logger.warning("Gatekeeper predict failed (fail-safe PASS): %s", e)
             return GatekeeperResult(
                 prob=0.55, prediction=1, features=feat_vec,
                 threshold=GK_THRESHOLD,
             )
 
-    def record_trade(self, features: Dict[str, float], pnl: float) -> None:
-        """Record trade outcome for online training.
+    def _predict_onnx(self, feat_vec: list) -> float:
+        """Run ONNX inference."""
+        input_name = self._onnx_session.get_inputs()[0].name
+        data = np.array([feat_vec], dtype=np.float32)
+        output = self._onnx_session.run(None, {input_name: data})
+        prob = float(output[0][0][1]) if len(output[0][0]) > 1 else float(output[0][0])
+        return prob
 
-        Called after each trade closes with its PnL.
-        """
+    def record_trade(self, features: Dict[str, float], pnl: float) -> None:
+        """Record trade outcome for online training."""
         self._trade_buffer.append({
             **features,
             "net_pnl": pnl,
@@ -98,26 +119,22 @@ class Gatekeeper:
             "timestamp": time.time(),
         })
 
-        # Auto-retrain every N trades
         if len(self._trade_buffer) >= GK_RETRAIN_EVERY:
             self._try_retrain()
 
     def _try_retrain(self) -> None:
-        """Retrain model on accumulated trade buffer."""
+        """Online retrain with CatBoost (saves .cbm for fallback)."""
         if len(self._trade_buffer) < GK_MIN_SAMPLES:
-            logger.debug("Gatekeeper: %d/%d samples, skipping retrain",
-                        len(self._trade_buffer), GK_MIN_SAMPLES)
             return
 
         try:
             import catboost
         except ImportError:
-            logger.warning("CatBoost not installed — gatekeeper disabled")
+            logger.warning("CatBoost not installed — online retrain disabled")
             return
 
         try:
-            X = []
-            y = []
+            X, y = [], []
             for trade in self._trade_buffer:
                 row = [trade.get(name, 0.0) for name in FEATURE_NAMES]
                 X.append(row)
@@ -126,14 +143,17 @@ class Gatekeeper:
             X = np.array(X, dtype=np.float32)
             y = np.array(y, dtype=np.int32)
 
-            # Balance classes
             pos_count = int(y.sum())
             neg_count = len(y) - pos_count
             if pos_count == 0 or neg_count == 0:
-                logger.debug("Gatekeeper: one class empty (%d/%d), skipping", pos_count, neg_count)
                 return
 
-            # CatBoost with class weights
+            split = int(len(X) * 0.8)
+            X_train, X_val = X[:split], X[split:]
+            y_train, y_val = y[:split], y[split:]
+
+            weights = {0: neg_count / len(y), 1: pos_count / len(y)}
+
             model = catboost.CatBoostClassifier(
                 iterations=500,
                 learning_rate=0.05,
@@ -144,48 +164,40 @@ class Gatekeeper:
                 eval_metric="Accuracy",
                 early_stopping_rounds=50,
                 verbose=0,
-                class_weights={0: neg_count / len(y), 1: pos_count / len(y)},
+                class_weights=weights,
                 random_seed=42,
             )
 
-            # 80/20 split
-            split = int(len(X) * 0.8)
-            X_train, X_val = X[:split], X[split:]
-            y_train, y_val = y[:split], y[split:]
-
             model.fit(X_train, y_train, eval_set=(X_val, y_val))
 
-            # Evaluate
             val_pred = model.predict(X_val)
             val_acc = float((val_pred == y_val).mean())
 
             if val_acc < 0.50:
-                logger.warning("Gatekeeper: val_acc=%.3f < 0.50, skipping retrain", val_acc)
+                logger.warning("Gatekeeper online retrain: val_acc=%.3f < 0.50, skipping", val_acc)
                 return
 
-            self._model = model
+            self._cb_model = model
             self._trained = True
+            self._inference_backend = "catboost"
             self._train_count += 1
             self._last_train_time = time.time()
 
-            # Feature importance
             fi = model.get_feature_importance()
             self._feature_importance = {
                 FEATURE_NAMES[i]: float(fi[i]) for i in range(len(FEATURE_NAMES))
             }
 
-            # Save model
             try:
-                os.makedirs(os.path.dirname(GK_MODEL_PATH), exist_ok=True)
-                model.save_model(GK_MODEL_PATH)
-                logger.info("Gatekeeper retrained: samples=%d val_acc=%.3f importance=%s",
-                           len(self._trade_buffer), val_acc,
-                           dict(sorted(self._feature_importance.items(),
-                                       key=lambda x: x[1], reverse=True)[:5]))
+                os.makedirs(os.path.dirname(GK_CB_MODEL_PATH), exist_ok=True)
+                model.save_model(GK_CB_MODEL_PATH)
+                logger.info("Gatekeeper online retrain: samples=%d val_acc=%.3f top=%s",
+                            len(self._trade_buffer), val_acc,
+                            dict(sorted(self._feature_importance.items(),
+                                         key=lambda x: x[1], reverse=True)[:5]))
             except Exception as e:
-                logger.warning("Gatekeeper: failed to save model: %s", e)
+                logger.warning("Gatekeeper: failed to save CB model: %s", e)
 
-            # Keep last 500 samples for next retrain
             if len(self._trade_buffer) > 1000:
                 self._trade_buffer = self._trade_buffer[-500:]
 
@@ -193,25 +205,43 @@ class Gatekeeper:
             logger.error("Gatekeeper retrain failed: %s", e)
 
     def load_model(self) -> bool:
-        """Load pre-trained model from disk."""
-        if not os.path.exists(GK_MODEL_PATH):
-            logger.info("Gatekeeper: no saved model found")
-            return False
+        """Load pre-trained model. Tries ONNX first, then CatBoost."""
+        # Try ONNX first
+        if os.path.exists(GK_ONNX_MODEL_PATH):
+            try:
+                import onnxruntime as ort
+                self._onnx_session = ort.InferenceSession(
+                    GK_ONNX_MODEL_PATH,
+                    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+                )
+                self._trained = True
+                self._inference_backend = "onnx"
+                logger.info("Gatekeeper: loaded ONNX model from %s (provider=%s)",
+                            GK_ONNX_MODEL_PATH,
+                            self._onnx_session.get_providers()[0])
+                return True
+            except Exception as e:
+                logger.warning("Gatekeeper: ONNX load failed (%s), trying CatBoost", e)
 
-        try:
-            import catboost
-            self._model = catboost.CatBoostClassifier()
-            self._model.load_model(GK_MODEL_PATH)
-            self._trained = True
-            fi = self._model.get_feature_importance()
-            self._feature_importance = {
-                FEATURE_NAMES[i]: float(fi[i]) for i in range(len(FEATURE_NAMES))
-            }
-            logger.info("Gatekeeper: loaded model from %s", GK_MODEL_PATH)
-            return True
-        except Exception as e:
-            logger.warning("Gatekeeper: failed to load model: %s", e)
-            return False
+        # Try CatBoost fallback
+        if os.path.exists(GK_CB_MODEL_PATH):
+            try:
+                import catboost
+                self._cb_model = catboost.CatBoostClassifier()
+                self._cb_model.load_model(GK_CB_MODEL_PATH)
+                self._trained = True
+                self._inference_backend = "catboost"
+                fi = self._cb_model.get_feature_importance()
+                self._feature_importance = {
+                    FEATURE_NAMES[i]: float(fi[i]) for i in range(len(FEATURE_NAMES))
+                }
+                logger.info("Gatekeeper: loaded CatBoost model from %s", GK_CB_MODEL_PATH)
+                return True
+            except Exception as e:
+                logger.warning("Gatekeeper: CatBoost load failed: %s", e)
+
+        logger.info("Gatekeeper: no saved model found (pass-through mode)")
+        return False
 
     @property
     def is_trained(self) -> bool:
@@ -224,6 +254,10 @@ class Gatekeeper:
     @property
     def train_count(self) -> int:
         return self._train_count
+
+    @property
+    def backend(self) -> str:
+        return self._inference_backend
 
     def get_feature_importance(self) -> Dict[str, float]:
         return self._feature_importance.copy()

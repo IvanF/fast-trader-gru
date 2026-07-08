@@ -30,7 +30,7 @@ func (s *Service) reconcileExistingSignal(ctx context.Context, signal models.Tra
 		return s.reconcilePendingEntry(ctx, signal, pending, recvAt)
 	}
 	s.mu.Unlock()
-	return s.placeNewEntry(ctx, signal, recvAt)
+	return s.placeNewEntry(ctx, signal, recvAt, models.GKSnapshot{})
 }
 
 func (s *Service) reconcilePendingEntry(ctx context.Context, signal models.TradeSignal, p *models.PendingEntry, recvAt time.Time) error {

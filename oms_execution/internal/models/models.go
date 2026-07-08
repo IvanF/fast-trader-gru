@@ -58,6 +58,15 @@ type OrderbookLevel struct {
 	Size  string `json:"size" msgpack:"size"`
 }
 
+type GKSnapshot struct {
+	SpreadPct     float64
+	OBI            float64
+	Momentum       float64
+	PriceVelocity  float64
+	ATRPct         float64
+	VolumeRatio    float64
+}
+
 type OrderbookSnapshot struct {
 	Symbol string           `json:"symbol" msgpack:"symbol"`
 	Ts     int64            `json:"ts" msgpack:"ts"`
@@ -147,6 +156,14 @@ type ActivePosition struct {
 	CandleLow       float64   // Current candle low
 	// Dynamic Trading Mode (0=Normal, 1=HFT Scalping)
 	TradingMode     int       // 0=Normal, 1=HFTScalping — set by DetectTradingMode at entry
+	// Gatekeeper entry-time feature snapshot (captured at entry for InfluxDB logging)
+	SpreadPctAtEntry      float64
+	OBIAtEntry            float64
+	MomentumAtEntry       float64
+	PriceVelocityAtEntry  float64
+	ATRPctAtEntry         float64
+	VolumeRatioAtEntry    float64
+	OpenPositionsAtEntry  int
 }
 
 type PendingEntryState string
@@ -175,4 +192,11 @@ type PendingEntry struct {
 	Signal       TradeSignal
 	PlacedAt     int64
 	Orderbook    OrderbookSnapshot
+	// Gatekeeper entry-time feature snapshot
+	GKSpreadPct     float64
+	GKOBI           float64
+	GKMomentum      float64
+	GKPriceVelocity float64
+	GKATRPct        float64
+	GKVolumeRatio   float64
 }

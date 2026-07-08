@@ -56,6 +56,9 @@ type PnLTracker struct {
 	total   float64
 	holdSum time.Duration
 	trades  int
+	recent  [20]bool // ring buffer: true=win, false=loss
+	recentN int      // how many recorded in ring
+	recentP int      // write pointer
 }
 
 func (p *PnLTracker) Record(pnl float64, hold time.Duration) {
@@ -66,8 +69,14 @@ func (p *PnLTracker) Record(pnl float64, hold time.Duration) {
 	p.holdSum += hold
 	if pnl >= 0 {
 		p.wins++
+		p.recent[p.recentP] = true
 	} else {
 		p.losses++
+		p.recent[p.recentP] = false
+	}
+	p.recentP = (p.recentP + 1) % 20
+	if p.recentN < 20 {
+		p.recentN++
 	}
 	TotalPnL.Set(p.total)
 	if p.losses > 0 {
@@ -78,6 +87,21 @@ func (p *PnLTracker) Record(pnl float64, hold time.Duration) {
 	if p.trades > 0 {
 		AvgHoldingTime.Set(p.holdSum.Seconds() / float64(p.trades))
 	}
+}
+
+func (p *PnLTracker) RecentWinRate() float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.recentN == 0 {
+		return 0.5
+	}
+	wins := 0
+	for i := 0; i < p.recentN; i++ {
+		if p.recent[i] {
+			wins++
+		}
+	}
+	return float64(wins) / float64(p.recentN)
 }
 
 func init() {

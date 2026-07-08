@@ -454,6 +454,14 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 		}
 	}
 
+	// Entry-time feature snapshot for Gatekeeper logging
+	gkSpreadPct := 0.0
+	gkOBI := 0.0
+	gkMomentum := 0.0
+	gkPriceVelocity := 0.0
+	gkATRPct := 0.0
+	gkVolumeRatio := 1.0
+
 	// Entry quality filters: momentum, volume, spread
 	ob, obErr := s.redis.GetOrderbook(ctx, signal.Symbol)
 	if obErr == nil {
@@ -464,6 +472,7 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 				bestAsk, _ := strconv.ParseFloat(ob.Asks[0].Price, 64)
 				if bestBid > 0 && bestAsk > 0 {
 					spreadPct := (bestAsk - bestBid) / bestBid
+					gkSpreadPct = spreadPct
 					if spreadPct > 0.005 {
 						s.logger.Info("signal rejected — spread too wide",
 							"symbol", signal.Symbol,
@@ -500,10 +509,12 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 			}
 			if bidV+askV > 0 {
 				obi := (bidV - askV) / (bidV + askV)
+				gkOBI = obi
 
 				// Record OBI for momentum tracking
 				s.obMomentum.Update(signal.Symbol, ob)
 				momentum := s.obMomentum.Momentum(signal.Symbol)
+				gkMomentum = momentum
 				shift := s.obMomentum.PressureShift(signal.Symbol, 0.3)
 
 				// Static OBI filter: reject if opposite pressure too strong
@@ -556,6 +567,13 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 				if len(recent) >= 2 {
 					p30 := recent[0]
 					pNow := recent[len(recent)-1]
+					// Price velocity: 5s move
+					if len(recent) >= 6 {
+						p5s := recent[len(recent)-6]
+						if p5s > 0 {
+							gkPriceVelocity = (pNow - p5s) / p5s
+						}
+					}
 					if p30 > 0 {
 						move := (pNow - p30) / p30
 						if signal.Direction == "SHORT" && move > 0.005 {
@@ -584,6 +602,9 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 					var v float64
 					fmt.Sscanf(lv.Size, "%f", &v)
 					currentVol += v
+				}
+				if smaVol > 0 {
+					gkVolumeRatio = currentVol / smaVol
 				}
 				if smaVol > 0 && currentVol < smaVol*0.5 {
 					s.logger.Info("signal rejected — volume too low",
@@ -675,7 +696,10 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 		}
 	}
 
-	return s.placeNewEntry(ctx, signal, recvAt)
+	return s.placeNewEntry(ctx, signal, recvAt, models.GKSnapshot{
+		SpreadPct: gkSpreadPct, OBI: gkOBI, Momentum: gkMomentum,
+		PriceVelocity: gkPriceVelocity, ATRPct: gkATRPct, VolumeRatio: gkVolumeRatio,
+	})
 }
 
 // goWithTimeout runs fn in a goroutine that is cancelled after timeoutSec
@@ -693,7 +717,7 @@ func (s *Service) goWithTimeout(ctx context.Context, timeoutSec int, fn func()) 
 	}()
 }
 
-func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, recvAt time.Time) error {
+func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, recvAt time.Time, gk models.GKSnapshot) error {
 	signal = s.capSignalVol(signal)
 	s.mu.Lock()
 	if p, ok := s.pending[signal.Symbol]; ok {
@@ -926,6 +950,12 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 			}
 			s.mu.Lock()
 			s.pending[plan.Symbol] = pending
+			s.pending[plan.Symbol].GKSpreadPct = gk.SpreadPct
+			s.pending[plan.Symbol].GKOBI = gk.OBI
+			s.pending[plan.Symbol].GKMomentum = gk.Momentum
+			s.pending[plan.Symbol].GKPriceVelocity = gk.PriceVelocity
+			s.pending[plan.Symbol].GKATRPct = gk.ATRPct
+			s.pending[plan.Symbol].GKVolumeRatio = gk.VolumeRatio
 			s.mu.Unlock()
 			return nil
 		}
@@ -1055,6 +1085,12 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 
 	s.mu.Lock()
 	s.pending[plan.Symbol] = pending
+	s.pending[plan.Symbol].GKSpreadPct = gk.SpreadPct
+	s.pending[plan.Symbol].GKOBI = gk.OBI
+	s.pending[plan.Symbol].GKMomentum = gk.Momentum
+	s.pending[plan.Symbol].GKPriceVelocity = gk.PriceVelocity
+	s.pending[plan.Symbol].GKATRPct = gk.ATRPct
+	s.pending[plan.Symbol].GKVolumeRatio = gk.VolumeRatio
 	s.mu.Unlock()
 
 	s.publishPendingOrder(ctx, "placed", pending)
@@ -1328,6 +1364,14 @@ func (s *Service) promotePending(ctx context.Context, p *models.PendingEntry, av
 		PriceHistory: priceSnap,
 		EntryCandleIdx: candleIdx,
 		TradingMode:  int(tradingMode),
+		// Gatekeeper entry-time feature snapshot
+		SpreadPctAtEntry:     p.GKSpreadPct,
+		OBIAtEntry:           p.GKOBI,
+		MomentumAtEntry:      p.GKMomentum,
+		PriceVelocityAtEntry: p.GKPriceVelocity,
+		ATRPctAtEntry:        p.GKATRPct,
+		VolumeRatioAtEntry:   p.GKVolumeRatio,
+		OpenPositionsAtEntry: len(s.positions),
 	}
 
 	// ════════════════════════════════════════════════════════════════
@@ -2135,6 +2179,7 @@ func (s *Service) finalizeClose(
 	_ = s.redis.Publish(ctx, s.cfg.ResultsChannel, result)
 	if s.influx != nil {
 		s.influx.WriteTradeOutcome(result)
+		s.influx.WriteGatekeeperFeatures(pos, pnl, s.tracker.RecentWinRate())
 	}
 
 	s.mu.Lock()

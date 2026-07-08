@@ -211,6 +211,9 @@ services:
       PREDICT_PNL: ${PREDICT_PNL:-true}
       TOXIC_THRESHOLD: ${TOXIC_THRESHOLD:-0.40}
       MIN_PNL_THRESHOLD: ${MIN_PNL_THRESHOLD:-0.0015}
+      GATEKEEPER_THRESHOLD: ${GATEKEEPER_THRESHOLD:-0.55}
+      GATEKEEPER_MODEL_PATH: /app/data/gatekeeper.onnx
+      GATEKEEPER_CB_MODEL_PATH: /app/data/gatekeeper_model.cbm
       HEALTH_PORT: "10103"
       NVIDIA_VISIBLE_DEVICES: all
       ORT_DISABLE_CPU_AFFINITY: "1"
@@ -245,6 +248,29 @@ services:
               count: 1
               capabilities: [gpu]
     restart: unless-stopped
+
+  gatekeeper-trainer:
+    build: ./ml_engine
+    container_name: ftg-gk-trainer
+    entrypoint: ["python3", "-m", "src.gatekeeper_trainer"]
+    environment:
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: ${INFLUX_TOKEN:-ftg-super-secret-token-change-me}
+      INFLUX_ORG: ${INFLUX_ORG:-fasttrader}
+      INFLUX_BUCKET_RAW: market_raw
+      GATEKEEPER_MODEL_PATH: /app/data/gatekeeper.onnx
+      GATEKEEPER_CB_MODEL_PATH: /app/data/gatekeeper_model.cbm
+      GATEKEEPER_THRESHOLD: ${GATEKEEPER_THRESHOLD:-0.55}
+    volumes:
+      - ml_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    networks:
+      - ftg-net
+    restart: "no"
 
   oms_execution:
     build: ./oms_execution
