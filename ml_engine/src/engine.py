@@ -1169,9 +1169,33 @@ class MLEngine:
             obi_current = buf.order_book_imbalance() if hasattr(buf, 'order_book_imbalance') else 0.0
             if obi_current < -0.1:
                 self._stats["obi_long_blocked"] = self._stats.get("obi_long_blocked", 0) + 1
-                logger.info("[KNIFE-GUARD] BLOCKED LONG for %s: OBI=%.3f < -0.4 (asks dominate)",
+                logger.info("[KNIFE-GUARD] BLOCKED LONG for %s: OBI=%.3f < -0.1 (asks dominate)",
                             symbol, obi_current)
                 return None
+
+            # ════════════════════════════════════════════════════════════════
+            # [MICRO-OBI] Top-2 level imbalance filter
+            # Prevents adverse selection from large sellers at spread edge
+            # ════════════════════════════════════════════════════════════════
+            if hasattr(buf, 'latest_bids') and hasattr(buf, 'latest_asks'):
+                bids2 = buf.latest_bids[:2] if buf.latest_bids else []
+                asks2 = buf.latest_asks[:2] if buf.latest_asks else []
+                if bids2 and asks2:
+                    bid_vol_top2 = sum(_level_size(b) for b in bids2)
+                    ask_vol_top2 = sum(_level_size(a) for a in asks2)
+                    total_top2 = bid_vol_top2 + ask_vol_top2
+                    if total_top2 > 0:
+                        micro_obi = (bid_vol_top2 - ask_vol_top2) / total_top2
+                        if direction == "LONG" and micro_obi < 0.15:
+                            self._stats["micro_obi_blocked"] = self._stats.get("micro_obi_blocked", 0) + 1
+                            logger.info("[MICRO-OBI] BLOCKED LONG for %s: micro_obi=%.3f < 0.15 (top-2 asks dominate)",
+                                        symbol, micro_obi)
+                            return None
+                        if direction == "SHORT" and micro_obi > -0.15:
+                            self._stats["micro_obi_blocked"] = self._stats.get("micro_obi_blocked", 0) + 1
+                            logger.info("[MICRO-OBI] BLOCKED SHORT for %s: micro_obi=%.3f > -0.15 (top-2 bids dominate)",
+                                        symbol, micro_obi)
+                            return None
 
         # Trap Head: now in LOGGING mode — reduce position size instead of blocking
         TRAP_THRESHOLD = float(os.getenv("TRAP_THRESHOLD", "0.60"))

@@ -56,6 +56,54 @@ func AggressiveMakerEntry(
 	}
 }
 
+// MicroBufferEntry places PostOnly limits DEEPER into the book (away from the spread edge).
+// Prevents adverse selection from large aggressive orders pushing through the book.
+// LONG → best bid − offset (deeper into bid side, only filled on pullbacks)
+// SHORT → best ask + offset (deeper into ask side, only filled on rallies)
+func MicroBufferEntry(
+	direction string,
+	ob models.OrderbookSnapshot,
+	tickSize float64,
+	microTicks int,
+) float64 {
+	if microTicks <= 0 {
+		return 0
+	}
+	if tickSize <= 0 {
+		tickSize = 0.0001
+	}
+	offset := float64(microTicks) * tickSize
+	bid := liquidity.BestBid(ob)
+	ask := liquidity.BestAsk(ob)
+
+	switch direction {
+	case "LONG":
+		if bid <= 0 {
+			return 0
+		}
+		// Place buy limit BELOW best bid (deeper into the book)
+		// Only filled on micro-pullbacks, not on aggressive sell-throughs
+		price := bid - offset
+		if price <= 0 {
+			price = bid
+		}
+		return roundToTick(price, tickSize)
+	case "SHORT":
+		if ask <= 0 {
+			return 0
+		}
+		// Place sell limit ABOVE best ask (deeper into the book)
+		// Only filled on micro-rallies, not on aggressive buy-throughs
+		price := ask + offset
+		if price <= 0 {
+			price = ask
+		}
+		return roundToTick(price, tickSize)
+	default:
+		return 0
+	}
+}
+
 // PassiveMakerExitPrice returns a reduce-only PostOnly-friendly price at the spread edge.
 // LONG close (Sell): best ask − ticks. SHORT close (Buy): best bid + ticks.
 func PassiveMakerExitPrice(

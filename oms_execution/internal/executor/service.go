@@ -1027,10 +1027,17 @@ func (s *Service) placeNewEntry(ctx context.Context, signal models.TradeSignal, 
 		}
 
 		var chasePrice float64
-		if plan.Direction == "LONG" {
-			chasePrice = liquidity.BestBid(chaseOb)
+		// Micro-buffer: place limit deeper into the book (away from spread edge)
+		// Prevents adverse selection from large aggressive orders
+		const MicroBufferTicks = 2
+		if microPrice := grid.MicroBufferEntry(plan.Direction, chaseOb, inst.TickSize, MicroBufferTicks); microPrice > 0 {
+			chasePrice = microPrice
 		} else {
-			chasePrice = liquidity.BestAsk(chaseOb)
+			if plan.Direction == "LONG" {
+				chasePrice = liquidity.BestBid(chaseOb)
+			} else {
+				chasePrice = liquidity.BestAsk(chaseOb)
+			}
 		}
 		if chasePrice <= 0 {
 			chasePrice = grid.MidPrice(chaseOb)
