@@ -373,6 +373,11 @@ func (s *Service) handleSignal(ctx context.Context, signal models.TradeSignal, r
 	_, hasPending := s.pending[signal.Symbol]
 	s.mu.Unlock()
 
+	if s.cfg.BlacklistSymbols[signal.Symbol] {
+		s.logger.Debug("signal rejected — blacklisted", "symbol", signal.Symbol)
+		return nil
+	}
+
 	if signal.SetupAction == "abort_setup" {
 		s.mu.Lock()
 		p, ok := s.pending[signal.Symbol]
@@ -1675,9 +1680,9 @@ func (s *Service) evaluatePosition(ctx context.Context, symbol string) {
 	hftTimeStop := s.cfg.HFTTimeStopSec
 	// Dynamic: high-confidence signals get 600s, low-confidence get 180s
 	if pos.Signal.Confidence >= 0.90 {
-		normalTimeStop = 480
+		normalTimeStop = 600
 	} else {
-		normalTimeStop = 240
+		normalTimeStop = 300
 	}
 	hardTimeStopSec := risk.ModeTimeStopSec(mode, normalTimeStop, hftTimeStop)
 	const MakerFillTimeoutSec = 30
