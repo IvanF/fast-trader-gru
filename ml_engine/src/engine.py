@@ -1464,83 +1464,99 @@ class MLEngine:
     def _collect_gatekeeper_features(self, symbol: str, confidence: float,
                                      pred_pnl: float, buf, corr: float,
                                      regime) -> Dict[str, float]:
-        """Collect 20 features for Gatekeeper prediction."""
-        mid = buf.last_mid() if hasattr(buf, 'last_mid') else 0.0
-        features = {
-            "confidence": confidence,
-            "pred_pnl": pred_pnl,
-            "spread_pct": 0.0,
-            "obi": 0.0,
-            "volume_ratio": 1.0,
-            "momentum": 0.0,
-            "price_velocity": 0.0,
-            "atr_pct": 0.0,
-            "funding_rate": self._funding_rates.get(symbol, 0.0),
-            "btc_correlation": corr,
-            "volatility_multiplier": 1.0,
-            "symbol_wr": 0.5,
-            "symbol_pnl_sum": 0.0,
-            "symbol_consec_losses": 0,
-            "symbol_trades_24h": 0,
-            "hour_of_day": time.time() % 86400 / 3600,
-            "open_positions_count": 0,
-            "recent_wr_20": 0.5,
-        }
+        """Collect 20 features for Gatekeeper from real market data."""
+        mid = buf.last_mid() if hasattr(buf, 'last_mid') and buf.last_mid() else 0.0
 
-        # Spread from orderbook
+        # === Spread from orderbook ===
+        spread_pct = 0.0
+        obi = 0.0
+        volume_ratio = 1.0
         if hasattr(buf, 'latest_bids') and hasattr(buf, 'latest_asks'):
             bids = buf.latest_bids
             asks = buf.latest_asks
-            if bids and asks:
+            if bids and asks and len(bids) > 0 and len(asks) > 0:
                 try:
                     best_bid = float(bids[0][0])
                     best_ask = float(asks[0][0])
                     if best_bid > 0:
-                        features["spread_pct"] = (best_ask - best_bid) / best_bid
+                        spread_pct = (best_ask - best_bid) / best_bid
                 except (IndexError, ValueError, TypeError):
                     pass
 
-        # OBI from last orderbook snapshot
-        if hasattr(buf, 'latest_bids') and hasattr(buf, 'latest_asks'):
-            bids = buf.latest_bids
-            asks = buf.latest_asks
-            bid_vol = sum(float(b[1]) for b in bids[:5]) if bids else 0
-            ask_vol = sum(float(a[1]) for a in asks[:5]) if asks else 0
-            total = bid_vol + ask_vol
-            if total > 0:
-                features["obi"] = (bid_vol - ask_vol) / total
+                # OBI (top-5 levels)
+                bid_vol = sum(float(b[1]) for b in bids[:5]) if bids else 0
+                ask_vol = sum(float(a[1]) for a in asks[:5]) if asks else 0
+                total = bid_vol + ask_vol
+                if total > 0:
+                    obi = (bid_vol - ask_vol) / total
 
-        # Volume ratio
-        features["volume_ratio"] = self._get_volume_ratio(symbol)
+                # Volume ratio (current vs SMA)
+                if hasattr(buf, '_volume_history'):
+                    vol_hist = getattr(buf, '_volume_history', [])
+                    if vol_hist:
+                        sma = sum(vol_hist[-20:]) / max(len(vol_hist[-20:]), 1)
+                        current_vol = bid_vol + ask_vol
+                        if sma > 0:
+                            volume_ratio = current_vol / sma
 
-        # Momentum from OBI reversal
-        features["momentum"] = buf._obi_reversal() if hasattr(buf, '_obi_reversal') else 0.0
+        # === Momentum from OBI reversal ===
+        momentum = 0.0
+        if hasattr(buf, '_obi_reversal'):
+            momentum = buf._obi_reversal()
 
-        # Price velocity
-        if mid > 0 and hasattr(buf, '_obi_reversal'):
-            features["price_velocity"] = buf._obi_reversal()
+        # === Price velocity (5s move) ===
+        price_velocity = 0.0
+        if hasattr(buf, '_price_history'):
+            ph = getattr(buf, '_price_history', [])
+            if len(ph) >= 10:
+                p_now = ph[-1]
+                p_before = ph[-10]
+                if p_before > 0:
+                    price_velocity = (p_now - p_before) / p_before
 
-        # ATR percentage
-        features["atr_pct"] = self._get_atr_pct(symbol, mid)
+        # === ATR percentage ===
+        atr_pct = 0.0
+        if mid > 0 and hasattr(self, 'priceHistory') and symbol in self.priceHistory:
+            hist = self.priceHistory[symbol]
+            if len(hist) >= 14:
+                import numpy as np
+                arr = np.array(hist[-14:], dtype=np.float64)
+                atr_val = np.mean(np.abs(np.diff(arr)))
+                atr_pct = atr_val / mid if mid > 0 else 0.0
 
-        # Symbol stats
+        # === Symbol stats ===
         st = self._symbol_trades.get(symbol, {})
-        total = st.get("wins", 0) + st.get("losses", 0)
-        features["symbol_wr"] = st.get("wins", 0) / max(total, 1)
-        features["symbol_consec_losses"] = self._online_learner.pattern_memory._consec_losses.get(symbol, 0)
-        features["symbol_trades_24h"] = total
+        total_trades = st.get("wins", 0) + st.get("losses", 0)
+        symbol_wr = st.get("wins", 0) / max(total_trades, 1)
+        symbol_pnl_sum = st.get("pnl_sum", 0.0)
+        symbol_consec_losses = st.get("consec_losses", 0)
 
-        # Recent WR
-        features["recent_wr_20"] = self._gatekeeper._trade_buffer[-1]["label"] if self._gatekeeper._trade_buffer else 0.5
+        # === Recent WR (last 20 trades from buffer) ===
+        recent_wr_20 = 0.5
+        if self._gatekeeper._trade_buffer:
+            recent = self._gatekeeper._trade_buffer[-20:]
+            if recent:
+                recent_wr_20 = sum(1 for t in recent if t.get("label", 0) == 1) / len(recent)
+
+        features = {
+            "confidence": confidence,
+            "pred_pnl": pred_pnl,
+            "spread_pct": spread_pct,
+            "obi": obi,
+            "volume_ratio": volume_ratio,
+            "momentum": momentum,
+            "price_velocity": price_velocity,
+            "atr_pct": atr_pct,
+            "funding_rate": self._funding_rates.get(symbol, 0.0),
+            "btc_correlation": corr,
+            "volatility_multiplier": 1.0,
+            "symbol_wr": symbol_wr,
+            "symbol_pnl_sum": symbol_pnl_sum,
+            "symbol_consec_losses": symbol_consec_losses,
+            "symbol_trades_24h": total_trades,
+            "hour_of_day": time.time() % 86400 / 3600,
+            "open_positions_count": len(self._open_positions),
+            "recent_wr_20": recent_wr_20,
+        }
 
         return features
-
-    def _get_volume_ratio(self, symbol: str) -> float:
-        """Get current volume / SMA volume ratio."""
-        # Placeholder — use buffer if available
-        return 1.0
-
-    def _get_atr_pct(self, symbol: str, mid: float) -> float:
-        """Get ATR as percentage of price."""
-        # Use signal atr_14_pct if available
-        return 0.01
